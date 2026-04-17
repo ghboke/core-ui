@@ -6,6 +6,10 @@
   <a href="./README-en.md">English</a> · <b>中文</b>
 </p>
 
+**UI Core** 是一个现代化的 Windows 桌面 UI 框架，从零重新设计以匹配 Microsoft **Fluent 2** 视觉语言，同时保持**原生级的性能**与**极小的分发体积**。底层基于 **Direct2D / Direct3D 11** 硬件加速渲染，把从按钮、文本框到 SplitView、Flyout、Expander 的 25+ 个内置控件统一在一套**纯 C API（187+ 函数）**之下——Rust、Go、Python、C#、Delphi 乃至 Lua 都能直接调用，不需要写 C++ 绑定层。
+
+推荐用类 XAML 的 **`.ui` 标记文件**描述界面，支持 CSS 风格的样式选择器、数据绑定、国际化、**热重载**——写 UI 不再是堆代码，而是像写 HTML 一样声明一棵节点树。项目还专门为 **AI 协作**而设计：一份自包含的速查文档（[`docs/ai-guide.md`](./docs/ai-guide.md)）让 LLM 一次读完就能生成完整的可运行应用，真正做到"描述需求 → 得到界面"的极速原型闭环。
+
 > **8.4 MB 一个 DLL，就能写出跟 Office / VSCode 同一设计语言的 Windows 桌面应用。**
 > 不要 Chromium、不要 .NET、不要 Qt 几十兆的 moc/uic——一个 C 头文件，一份 `.ui` 标记文件，搞定。
 
@@ -89,7 +93,6 @@ cmake --build build         （编译器兜底，LLM 不用自己验证）
 - **8.4 MB 全量 DLL**，静态编译后 demo exe 仅 **1 MB**，可装进 U 盘跑
 - **Direct2D + Direct3D 11** 全硬件加速，Per-Monitor DPI V2 一次画对
 - **冷启动 < 200ms**，对标记文件路径点一下就能看到窗口
-- GIF 播放最近一版：**内存降 10 倍、打开速度提升 18 倍**（按需解码架构）
 
 ### 🎨 颜值即正义
 

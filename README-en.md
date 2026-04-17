@@ -6,6 +6,10 @@
   <b>English</b> · <a href="./README.md">中文</a>
 </p>
 
+**UI Core** is a modern Windows desktop UI framework, rebuilt from the ground up to match Microsoft's **Fluent 2** visual language while keeping **native-level performance** and a **tiny distribution footprint**. Rendering runs on **Direct2D / Direct3D 11** hardware acceleration, and every widget — from buttons and text fields to SplitView, Flyout, and Expander — is exposed through a single **pure C API (187+ functions)**, so Rust, Go, Python, C#, Delphi, and even Lua can bind it directly without writing a C++ shim.
+
+UIs are best described in **`.ui` markup files** — a XAML-like declarative format with CSS-style selectors, data binding, internationalization, and **hot reload** — so building a UI feels more like writing HTML than wiring up widgets. The project is also purpose-built for **AI-driven development**: a single self-contained cheatsheet ([`docs/ai-guide.md`](./docs/ai-guide.md)) lets an LLM read it once and emit a complete, runnable app, turning "describe what you want" into "see it running" in a single loop.
+
 > **An 8.4 MB single DLL that ships Office / VS Code-grade UI on Windows.**
 > No Chromium. No .NET. No 40 MB of Qt DLLs and moc/uic preprocessors. One C header, one `.ui` markup file — done.
 
@@ -89,7 +93,6 @@ Constraints:
 - **8.4 MB full DLL**, or a **1 MB statically-linked exe** — it fits on a USB stick
 - **Direct2D + Direct3D 11** full hardware acceleration, Per-Monitor DPI V2 out of the box
 - **Cold start < 200 ms** — click and the window is already there
-- Latest GIF playback rewrite: **10× less memory, 18× faster open** (on-demand decode pipeline)
 
 ### 🎨 Looks that sell
 
