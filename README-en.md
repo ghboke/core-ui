@@ -4,6 +4,8 @@
 
 <p align="center">
   <b>English</b> · <a href="./README.md">中文</a>
+  &nbsp;·&nbsp;
+  <a href="https://ghboke.github.io/core-ui/"><b>📖 Online Docs</b></a>
 </p>
 
 **UI Core** is a modern Windows desktop UI framework, rebuilt from the ground up to match Microsoft's **Fluent 2** visual language while keeping **native-level performance** and a **tiny distribution footprint**. Rendering runs on **Direct2D / Direct3D 11** hardware acceleration, and every widget — from buttons and text fields to SplitView, Flyout, and Expander — is exposed through a single **pure C API (187+ functions)**, so Rust, Go, Python, C#, Delphi, and even Lua can bind it directly without writing a C++ shim.

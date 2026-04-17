@@ -4,6 +4,8 @@
 
 <p align="center">
   <a href="./README-en.md">English</a> · <b>中文</b>
+  &nbsp;·&nbsp;
+  <a href="https://ghboke.github.io/core-ui/"><b>📖 在线文档</b></a>
 </p>
 
 **UI Core** 是一个现代化的 Windows 桌面 UI 框架，从零重新设计以匹配 Microsoft **Fluent 2** 视觉语言，同时保持**原生级的性能**与**极小的分发体积**。底层基于 **Direct2D / Direct3D 11** 硬件加速渲染，把从按钮、文本框到 SplitView、Flyout、Expander 的 25+ 个内置控件统一在一套 **纯 C API** 之下（共 187+ 个导出函数）——Rust、Go、Python、C#、Delphi 乃至 Lua 都能直接调用，不需要写 C++ 绑定层。

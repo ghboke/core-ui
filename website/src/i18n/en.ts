@@ -1,0 +1,294 @@
+export default {
+  // Search
+  "search.label": "Search",
+  "search.placeholder": "Search controls, API, docs...",
+  "search.noResults": "No results found",
+  "search.hint": "Type to search controls, API functions, or doc pages",
+
+  // CodeBlock
+  "code.copy": "Copy",
+  "code.copied": "Copied",
+
+  // Header
+  "header.lightMode": "Light mode",
+  "header.darkMode": "Dark mode",
+  "header.github": "GitHub",
+  "header.switchLang": "切换到中文",
+
+  // Sidebar
+  "nav.home": "Home",
+  "nav.docs": "Documentation",
+  "nav.gettingStarted": "Getting Started",
+  "nav.controls": "Controls",
+  "nav.controlsOverview": "Overview",
+  "nav.designSystem": "Design System",
+
+  // Home - Hero
+  "home.badge": "Windows Desktop UI Framework",
+  "home.title": "Build beautiful native apps with UI Core",
+  "home.subtitle": "Direct2D hardware-accelerated rendering, Fluent 2 design system, 29+ built-in controls, declarative .ui markup, and a pure C API — all in a single DLL.",
+  "home.getStarted": "Get Started",
+  "home.viewGithub": "View on GitHub",
+
+  // Home - Stats
+  "home.stats.controls": "Controls",
+  "home.stats.apiFunctions": "C API Functions",
+  "home.stats.gpuAccelerated": "GPU Accelerated",
+  "home.stats.perMonitor": "Per-Monitor V2",
+
+  // Home - Features
+  "home.whyTitle": "Why UI Core?",
+  "home.whySubtitle": "A modern approach to Windows desktop development — no bloated frameworks, no managed runtime.",
+
+  // Home - Code
+  "home.codeTitle": "Two ways to build",
+  "home.codeSubtitle": "Use the C API for full control, or declarative .ui markup for rapid prototyping — or mix both.",
+
+  // Features
+  "feature.gpu.title": "Direct2D Hardware Accelerated",
+  "feature.gpu.desc": "All rendering powered by Direct2D + Direct3D 11. Smooth 60fps animations with GPU compositing.",
+  "feature.design.title": "Fluent 2 Design System",
+  "feature.design.desc": "Aligned with Microsoft WinUI 3 specifications. Complete token set for colors, typography, spacing, shadows, and motion.",
+  "feature.markup.title": "Declarative .ui Markup",
+  "feature.markup.desc": "XML-based declarative syntax similar to XAML/QML. Hot-reloadable with data binding and event handling.",
+  "feature.api.title": "Pure C API",
+  "feature.api.desc": "187 exported functions with opaque handle-based design. Callable from any language — no C++ exposure.",
+  "feature.controls.title": "29+ Built-in Controls",
+  "feature.controls.desc": "From Button, CheckBox, Slider to ImageView, SplitView, ContextMenu. Ready for production apps.",
+  "feature.dpi.title": "Per-Monitor DPI V2",
+  "feature.dpi.desc": "Automatic DPI scaling across multi-monitor setups. Crisp rendering at every scale factor.",
+
+  // Getting Started
+  "gs.title": "Getting Started",
+  "gs.subtitle": "Build and integrate UI Core into your Windows application in minutes.",
+  "gs.requirements": "UI Core requires Windows 10 or later, CMake 3.20+, and MSVC or MinGW with C++17 support.",
+  "gs.buildTitle": "Build from source",
+  "gs.cmakeTitle": "CMake integration",
+  "gs.cmakeDesc": "Link against ui-core in your CMake project:",
+  "gs.minimalTitle": "Minimal example — C API",
+  "gs.minimalDesc": "Create a window with a label and a button using the pure C API. All 187 functions use opaque uint64_t handles — no C++ headers needed.",
+  "gs.markupTitle": "Declarative way — .ui Markup",
+  "gs.markupDesc": "Build the same UI with XML-based .ui files. Supports data binding, event handlers, hot reload, and style classes.",
+  "gs.distTitle": "Distribution",
+  "gs.distDynamic": "Dynamic (default):",
+  "gs.distDynamicDesc": "Ship ui-core.dll alongside your .exe",
+  "gs.distStatic": "Static:",
+  "gs.distStaticDesc": "Build with -DUI_CORE_STATIC=ON for a single .exe with no DLL dependency",
+  "gs.depsTitle": "System dependencies",
+  "gs.depsDesc": "UI Core depends only on Windows system libraries — no external runtime is needed:",
+
+  // Controls
+  "controls.title": "Controls",
+  "controls.subtitle": "29+ built-in controls covering containers, input, display, and navigation. All controls follow Fluent 2 design specifications with theme-aware rendering.",
+  "controls.searchPlaceholder": "Search controls...",
+  "controls.count_one": "{{count}} control",
+  "controls.count_other": "{{count}} controls",
+  "controls.category.all": "All",
+  "controls.category.container": "Containers",
+  "controls.category.input": "Input",
+  "controls.category.display": "Display",
+  "controls.category.navigation": "Navigation",
+
+  // Sidebar extra
+  "nav.markup": ".ui Markup",
+  "nav.layout": "Layout",
+  "nav.cApi": "C API Reference",
+
+  // API Reference
+  "api.title": "C API Reference",
+  "api.subtitle": "UI Core exports {{count}} pure C functions, organized by category. All functions use opaque uint64_t handles.",
+  "api.searchPlaceholder": "Search functions...",
+  "api.functions": "functions",
+
+  // Control Detail
+  "controlDetail.preview": "Preview",
+  "controlDetail.example": "Code Example",
+  "controlDetail.relatedApi": "Related API",
+
+  // Markup
+  "markup.title": ".ui Markup Syntax",
+  "markup.subtitle": "Build UI declaratively with XML syntax similar to XAML/QML. Supports style classes, data binding, event handling, and hot reload.",
+  "markup.basicTitle": "Basic Syntax",
+  "markup.basicDesc": "Each XML tag corresponds to a control, with attributes mapping to properties. Tag names match control class names.",
+  "markup.styleTitle": "Style System",
+  "markup.styleDesc": "Supports class selectors, tag selectors, and pseudo-states (:hover, :pressed, :disabled). Styles can be defined inline in <Style> tags.",
+  "markup.bindingTitle": "Data Binding",
+  "markup.bindingDesc": "Use {variable} syntax to bind data. Push updates from C++ code via SetText/SetFloat/SetBool calls.",
+  "markup.includeTitle": "Component Inclusion",
+  "markup.includeDesc": "Use <Include> tags to reference other .ui files, passing attributes as parameters.",
+  "markup.repeaterTitle": "List Rendering",
+  "markup.repeaterDesc": "Use <Repeater> to dynamically generate child controls from a data model.",
+  "markup.hotReloadTitle": "Hot Reload",
+  "markup.hotReloadDesc": "In debug builds, changes to .ui files take effect immediately on save — no recompilation needed.",
+
+  // Layout
+  "layout.title": "Layout System",
+  "layout.subtitle": "UI Core provides flexible layout containers: VBox/HBox (flexbox), Grid, Stack, SplitView (navigation pane), Splitter (draggable divider), and ScrollView.",
+  "layout.flexDesc": "VBox arranges children vertically, HBox horizontally. Supports padding, gap, align (start/center/end/stretch), and justify properties.",
+  "layout.flexTitle": "Flex Expansion",
+  "layout.flexExpandDesc": "Set expand=true to make a widget fill remaining space in its parent. Multiple expanded widgets share space equally.",
+  "layout.gridDesc": "Grid arranges children in columns, supporting colGap, rowGap, colspan, and rowspan.",
+  "layout.splitViewDesc": "SplitView implements WinUI NavigationView-style sidebar navigation with 4 display modes: overlay, inline, compactOverlay, compactInline.",
+  "layout.splitterDesc": "Splitter places a draggable divider between two panels, with configurable initial ratio and direction.",
+  "layout.vboxHboxTitle": "VBox / HBox (Flexbox)",
+  "layout.gridTitle": "Grid",
+  "layout.splitViewTitle": "SplitView",
+  "layout.splitterTitle": "Splitter",
+  "layout.scrollTitle": "ScrollView",
+  "layout.scrollDesc": "ScrollView provides automatic scrollbars (4px thin WinUI 3 style) with mouse wheel support.",
+
+  // ControlPreview
+  "controlDetail.noPreview": "No interactive preview available for this control. See the code example below.",
+
+  // Search page names
+  "search.page.gettingStarted": "Getting Started",
+  "search.page.markup": ".ui Markup",
+  "search.page.layout": "Layout",
+  "search.page.controls": "Controls",
+  "search.page.cApi": "C API Reference",
+  "search.page.designSystem": "Design System",
+  "search.page.ai": "AI Integration Guide",
+
+  // Sidebar
+  "nav.aiGuide": "AI Integration",
+
+  // AI Guide
+  "ai.title": "AI Integration Guide",
+  "ai.subtitle": "This guide is for AI coding assistants (Claude, GPT, Copilot, etc.) — how to call UI Core's C API, build interfaces, debug the widget tree, and verify rendering results.",
+  "ai.tip": "AI can generate UI via either the C API or .ui markup. Recommend starting with .ui markup for rapid prototyping, then using the C API for fine control. Use dump_tree + screenshot for closed-loop verification.",
+
+  "ai.usageTitle": "How to Use",
+  "ai.usageDesc": "Below is the complete UI Core AI Skill file. Add it to your AI assistant's knowledge base, and it can directly call UI Core's C API or generate .ui markup files to build Windows desktop apps.",
+  "ai.step1": "Click \"Copy\" to copy the full content, or \"Download\" to save as .md file",
+  "ai.step2": "Paste the content into your AI's system prompt, CLAUDE.md, or project knowledge base",
+  "ai.step3": "Tell the AI what interface to build, and it will reference the Skill file to generate code",
+  "ai.step4": "Use ui_debug_screenshot + ui_debug_dump_tree to verify the AI-generated result",
+  "ai.download": "Download .md",
+  "ai.lines": "lines",
+
+  "ai.handleTitle": "Core Concept: Opaque Handles",
+  "ai.handleDesc": "All UI Core objects (windows, widgets, menus) are represented as uint64_t handles. AI doesn't need to understand internals — just call API functions with handles. Handles are created, configured via setters/getters, and assembled into a tree via add_child.",
+
+  "ai.quickStartTitle": "Option 1: Generate UI via C API",
+  "ai.quickStartDesc": "AI can generate C code that includes ui_core.h. The basic pattern: init → create window → build widget tree → set root → show window → enter message loop.",
+
+  "ai.markupTitle": "Option 2: Generate .ui Markup Files",
+  "ai.markupDesc": "AI can also generate XML-based .ui files that hot-reload without recompilation. Tag names match control class names, attributes map directly to properties. Great for generating complex layouts quickly.",
+
+  "ai.callbackTitle": "Event Callback Pattern",
+  "ai.callbackDesc": "All interactions use C callback functions. Callbacks have a uniform signature: (widget handle, userdata). When generating code, note that userdata is commonly used to pass window or other widget handles via uintptr_t casts.",
+
+  "ai.layoutTitle": "Layout Cheat Sheet",
+  "ai.layoutDesc": "The most commonly used functions when AI generates layouts. VBox/HBox are the primary containers, expand controls flex filling, find_by_id is used for subsequent widget lookup.",
+
+  "ai.themeTitle": "Theme Switching",
+
+  "ai.debugTitle": "Debug API Overview",
+  "ai.debugDesc": "UI Core provides 4 debug functions that AI can use to inspect the widget tree, locate layout issues, and verify rendering results.",
+  "ai.debugTablePurpose": "Purpose",
+  "ai.debugTableUse": "AI Usage",
+  "ai.debugDumpTree": "Export full widget tree as JSON",
+  "ai.debugDumpTreeUse": "Verify hierarchy, check IDs exist, validate rects are reasonable",
+  "ai.debugDumpWidget": "Export single widget as JSON",
+  "ai.debugDumpWidgetUse": "Inspect specific widget properties",
+  "ai.debugHighlight": "Red-border highlight a widget",
+  "ai.debugHighlightUse": "Combined with screenshot to locate widget position",
+  "ai.debugScreenshot": "Save window screenshot as PNG",
+  "ai.debugScreenshotUse": "AI reads the PNG file to visually verify rendering",
+
+  "ai.debugVisualTitle": "Highlight + Screenshot + Property Check",
+
+  "ai.verifyTitle": "AI Verification Loop",
+  "ai.verifyDesc": "Recommended AI verification steps: build & run → screenshot → dump widget tree → highlight suspect widgets → check interactions. Each step is programmable, forming an automated verification loop.",
+
+  "ai.pitfallTitle": "Common Pitfalls",
+  "ai.pitfall1": "Strings must use L\"...\" wide character literals, not \"...\"",
+  "ai.pitfall2": "Strings from ui_debug_dump_tree / dump_widget must be freed with ui_debug_free()",
+  "ai.pitfall3": "ui_run() is a blocking message loop — code after it won't execute",
+  "ai.pitfall4": "Handle value 0 (UI_INVALID) means creation failed — check before use",
+  "ai.pitfall5": "Passing handles through callbacks requires (void*)(uintptr_t) double cast",
+  "ai.pitfall6": "ui_widget_set_padding() takes 4 args (left, top, right, bottom) — use ui_widget_set_padding_uniform() for single value",
+
+  "ai.summary": "Summary: AI generates code → compile & run → ui_debug_screenshot → AI visual check → ui_debug_dump_tree structural check → fix and repeat. This is the recommended AI workflow for UI Core.",
+
+  // Controls i18n - Containers
+  "ctrl.VBox.name": "VBox",
+  "ctrl.VBox.desc": "Vertical flexbox layout container",
+  "ctrl.HBox.name": "HBox",
+  "ctrl.HBox.desc": "Horizontal flexbox layout container",
+  "ctrl.Grid.name": "Grid",
+  "ctrl.Grid.desc": "Tabular grid layout",
+  "ctrl.Stack.name": "Stack",
+  "ctrl.Stack.desc": "Tab-like stacking container (shows one child)",
+  "ctrl.ScrollView.name": "ScrollView",
+  "ctrl.ScrollView.desc": "Scrollable container with thin scrollbar",
+  "ctrl.SplitView.name": "SplitView",
+  "ctrl.SplitView.desc": "Sidebar navigation (WinUI NavigationView)",
+  "ctrl.Splitter.name": "Splitter",
+  "ctrl.Splitter.desc": "Draggable divider between two panels",
+  "ctrl.Panel.name": "Panel",
+  "ctrl.Panel.desc": "Background container with solid color",
+  "ctrl.Spacer.name": "Spacer",
+  "ctrl.Spacer.desc": "Spacing or elastic filler",
+  "ctrl.Expander.name": "Expander",
+  "ctrl.Expander.desc": "Collapsible panel with header",
+
+  // Controls i18n - Input
+  "ctrl.Button.name": "Button",
+  "ctrl.Button.desc": "Standard and primary action button",
+  "ctrl.IconButton.name": "IconButton",
+  "ctrl.IconButton.desc": "SVG icon button with ghost mode",
+  "ctrl.CheckBox.name": "CheckBox",
+  "ctrl.CheckBox.desc": "Multi-select checkbox",
+  "ctrl.RadioButton.name": "RadioButton",
+  "ctrl.RadioButton.desc": "Single-select radio button",
+  "ctrl.Toggle.name": "Toggle",
+  "ctrl.Toggle.desc": "On/off switch control",
+  "ctrl.Slider.name": "Slider",
+  "ctrl.Slider.desc": "Value range slider",
+  "ctrl.TextInput.name": "TextInput",
+  "ctrl.TextInput.desc": "Single-line text input",
+  "ctrl.TextArea.name": "TextArea",
+  "ctrl.TextArea.desc": "Multi-line text area",
+  "ctrl.NumberBox.name": "NumberBox",
+  "ctrl.NumberBox.desc": "Number spinner with increment/decrement",
+  "ctrl.ComboBox.name": "ComboBox",
+  "ctrl.ComboBox.desc": "Dropdown select list",
+
+  // Controls i18n - Display
+  "ctrl.Label.name": "Label",
+  "ctrl.Label.desc": "Text display with formatting",
+  "ctrl.ProgressBar.name": "ProgressBar",
+  "ctrl.ProgressBar.desc": "Determinate and indeterminate progress",
+  "ctrl.ImageView.name": "ImageView",
+  "ctrl.ImageView.desc": "Image viewer with zoom/pan/rotation",
+  "ctrl.Separator.name": "Separator",
+  "ctrl.Separator.desc": "Horizontal or vertical divider line",
+
+  // Controls i18n - Navigation
+  "ctrl.TitleBar.name": "TitleBar",
+  "ctrl.TitleBar.desc": "Custom borderless window title bar",
+  "ctrl.NavItem.name": "NavItem",
+  "ctrl.NavItem.desc": "Sidebar navigation item with icon",
+  "ctrl.TabControl.name": "TabControl",
+  "ctrl.TabControl.desc": "Tab-based page navigation",
+  "ctrl.Dialog.name": "Dialog",
+  "ctrl.Dialog.desc": "Modal dialog with confirm/cancel",
+  "ctrl.Toast.name": "Toast",
+  "ctrl.Toast.desc": "Notification popup message",
+  "ctrl.ContextMenu.name": "ContextMenu",
+  "ctrl.ContextMenu.desc": "Right-click context menu",
+  "ctrl.Flyout.name": "Flyout",
+  "ctrl.Flyout.desc": "Popup overlay attached to anchor",
+
+  // Design System
+  "ds.title": "Design System",
+  "ds.subtitle": "UI Core implements Microsoft's Fluent 2 design tokens — the same system used in WinUI 3. Colors, typography, spacing, radius, shadows, and motion are all token-based.",
+  "ds.brandColors": "Brand Color Ramp",
+  "ds.statusColors": "Status Colors",
+  "ds.typography": "Typography — Segoe UI",
+  "ds.spacing": "Spacing Scale",
+  "ds.radius": "Border Radius",
+  "ds.shadow": "Elevation / Shadow",
+  "ds.shadowDesc": "6 levels of elevation using ambient + key shadow layers.",
+};
