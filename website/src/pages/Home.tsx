@@ -220,8 +220,8 @@ export function Home() {
               icon={<ArrowRightRegular />}
               iconPosition="after"
               className={styles.primaryBtn}
+              // @ts-expect-error Fluent UI 'as' prop vs react-router Link
               as={Link}
-              // @ts-expect-error Link props
               to="/docs/getting-started"
             >
               {t("home.getStarted")}

@@ -480,7 +480,11 @@ export function ControlDetail() {
     <div className={styles.page}>
       <Breadcrumb>
         <BreadcrumbItem>
-          <BreadcrumbButton as={Link} to="/docs/controls">
+          <BreadcrumbButton
+            // @ts-expect-error Fluent UI 'as' prop vs react-router Link
+            as={Link}
+            to="/docs/controls"
+          >
             {t("nav.controls")}
           </BreadcrumbButton>
         </BreadcrumbItem>
