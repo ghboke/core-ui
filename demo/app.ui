@@ -1,0 +1,334 @@
+<ui version="1" width="1060" height="700" resizable="true" title="UI Core Demo">
+  <style>
+    .pageTitle    { fontSize: 28; bold: true; }
+    .pageDesc     { fontSize: 14; }
+    .section      { fontSize: 16; bold: true; }
+    .caption      { fontSize: 12; }
+    .sidebar      { bgColor: theme.sidebarBg; }
+
+    /* Descendant selector: all Labels inside .sidebar inherit smaller font */
+    .sidebar Label { fontSize: 13; }
+  </style>
+
+  <VBox gap="0" expand="true">
+    <TitleBar title="UI Core Demo" />
+
+    <SplitView id="mainSplit" mode="compactInline" openPaneLength="220" compactPaneLength="48" open="true" expand="true">
+
+      <!-- ======== Pane ======== -->
+      <VBox class="sidebar" gap="2" padding="4,4,4,4">
+        <NavItem id="nav_toggle" text="" svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z'/&gt;&lt;/svg&gt;" onClick="onTogglePane" />
+        <Spacer size="4" />
+        <NavItem id="nav_home"     text="@nav_home"      svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z'/&gt;&lt;/svg&gt;"  onClick="onNav0" selected="true" />
+        <NavItem id="nav_button"   text="@nav_button"    svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M19 6H5a2 2 0 00-2 2v8a2 2 0 002 2h14a2 2 0 002-2V8a2 2 0 00-2-2zm0 10H5V8h14v8z'/&gt;&lt;/svg&gt;"  onClick="onNav1" />
+        <NavItem id="nav_check"    text="@nav_selection"  svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M19 3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2V5a2 2 0 00-2-2zm-9 14l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z'/&gt;&lt;/svg&gt;"  onClick="onNav2" />
+        <NavItem id="nav_input"    text="@nav_input"     svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M2.5 4v3h5v12h3V7h5V4h-13zm19 5h-9v3h3v7h3v-7h3V9z'/&gt;&lt;/svg&gt;"  onClick="onNav3" />
+        <NavItem id="nav_range"    text="@nav_range"     svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z'/&gt;&lt;/svg&gt;"  onClick="onNav4" />
+        <NavItem id="nav_status"   text="@nav_status"    svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M19 4H5a2 2 0 00-2 2v12a2 2 0 002 2h14a2 2 0 002-2V6a2 2 0 00-2-2zm0 14H5V6h14v12zM6 10h8v4H6z'/&gt;&lt;/svg&gt;"  onClick="onNav5" />
+        <NavItem id="nav_layout"   text="@nav_layout"    svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M3 3h8v8H3V3zm10 0h8v8h-8V3zM3 13h8v8H3v-8zm10 0h8v8h-8v-8z'/&gt;&lt;/svg&gt;"  onClick="onNav6" />
+        <NavItem id="nav_crop"     text="@nav_crop"      svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M17 15h2V7a2 2 0 00-2-2H9v2h8v8zM7 17V1H5v4H1v2h4v10a2 2 0 002 2h10v4h2v-4h4v-2H7z'/&gt;&lt;/svg&gt;"  onClick="onNav7" />
+        <Spacer expand="true" />
+        <Separator />
+        <NavItem id="nav_settings" text="@nav_settings"  svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.6 3.6 0 0112 15.6z'/&gt;&lt;/svg&gt;"  onClick="onNav8" />
+      </VBox>
+
+      <!-- ======== Content ======== -->
+      <Stack id="pages" active="0" expand="true">
+
+        <!-- ===== Page 0: Home ===== -->
+        <ScrollView expand="true">
+          <VBox padding="40,32,40,32" gap="20">
+            <Label text="@app_title" class="pageTitle" />
+            <Label text="@app_desc" class="pageDesc" />
+            <Separator />
+            <HBox gap="16">
+              <VBox expand="true" padding="20" gap="8" bgColor="theme.cardBg">
+                <Label text="@card_controls" class="section" />
+                <Label text="@card_controls_desc" class="caption" wrap="true" />
+              </VBox>
+              <VBox expand="true" padding="20" gap="8" bgColor="theme.cardBg">
+                <Label text="@card_layout" class="section" />
+                <Label text="@card_layout_desc" class="caption" wrap="true" />
+              </VBox>
+            </HBox>
+            <HBox gap="16">
+              <VBox expand="true" padding="20" gap="8" bgColor="theme.cardBg">
+                <Label text="@card_nav" class="section" />
+                <Label text="@card_nav_desc" class="caption" wrap="true" />
+              </VBox>
+              <VBox expand="true" padding="20" gap="8" bgColor="theme.cardBg">
+                <Label text="@card_theme" class="section" />
+                <Label text="@card_theme_desc" class="caption" wrap="true" />
+              </VBox>
+            </HBox>
+          </VBox>
+        </ScrollView>
+
+        <!-- ===== Page 1: Button ===== -->
+        <ScrollView expand="true">
+          <VBox padding="40,32,40,32" gap="16">
+            <Label text="@btn_title" class="pageTitle" />
+            <Label text="@btn_desc" class="pageDesc" />
+            <Separator />
+            <Label text="@btn_standard_primary" class="section" />
+            <HBox gap="8" height="36">
+              <Button text="@btn_default" width="100" />
+              <Button text="@btn_primary" type="primary" width="100" />
+              <Button text="@btn_disabled" width="100" enabled="false" />
+            </HBox>
+            <Spacer size="4" />
+            <Label text="@btn_custom_colors" class="section" />
+            <HBox gap="8" height="36">
+              <Button text="@btn_red" width="80" bgColor="0.85,0.18,0.15,1" textColor="1,1,1,1" />
+              <Button text="@btn_green" width="80" bgColor="0.13,0.59,0.33,1" textColor="1,1,1,1" />
+              <Button text="@btn_orange" width="90" bgColor="0.92,0.55,0.07,1" textColor="1,1,1,1" />
+              <Button text="@btn_purple" width="80" bgColor="0.5,0.25,0.7,1" textColor="1,1,1,1" />
+            </HBox>
+            <Spacer size="4" />
+            <Label text="@btn_icon_buttons" class="section" />
+            <HBox gap="8" height="36">
+              <IconButton svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z'/&gt;&lt;/svg&gt;" ghost="false" width="36" height="36" />
+              <IconButton svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M15.5 14h-.79l-.28-.27A6.47 6.47 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zM9.5 14C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z'/&gt;&lt;/svg&gt;" ghost="true" width="36" height="36" />
+              <IconButton svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z'/&gt;&lt;/svg&gt;" ghost="true" width="36" height="36" />
+              <IconButton svg="&lt;svg viewBox='0 0 24 24'&gt;&lt;path d='M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z'/&gt;&lt;/svg&gt;" ghost="false" width="36" height="36" />
+            </HBox>
+          </VBox>
+        </ScrollView>
+
+        <!-- ===== Page 2: Selection ===== -->
+        <ScrollView expand="true">
+          <VBox padding="40,32,40,32" gap="16">
+            <Label text="@sel_title" class="pageTitle" />
+            <Label text="@sel_desc" class="pageDesc" />
+            <Separator />
+            <Label text="@sel_checkbox" class="section" />
+            <CheckBox text="@sel_checked" checked="true" />
+            <CheckBox text="@sel_unchecked" />
+            <CheckBox text="@sel_disabled_checked" checked="true" enabled="false" />
+            <Spacer size="8" />
+            <Label text="@sel_radio" class="section" />
+            <RadioButton text="@sel_small" group="size" />
+            <RadioButton text="@sel_medium" group="size" selected="true" />
+            <RadioButton text="@sel_large" group="size" />
+            <Spacer size="8" />
+            <Label text="@sel_toggle" class="section" />
+            <Toggle text="@sel_wifi" on="true" />
+            <Toggle text="@sel_bluetooth" />
+            <Toggle text="@sel_notifications" on="true" />
+            <Spacer size="8" />
+            <Label text="@sel_combo" class="section" />
+            <HBox gap="8" height="32">
+              <Label text="Color:" width="80" />
+              <ComboBox items="Blue,Green,Red,Yellow,Purple" width="200" />
+            </HBox>
+          </VBox>
+        </ScrollView>
+
+        <!-- ===== Page 3: Text Input ===== -->
+        <ScrollView expand="true">
+          <VBox padding="40,32,40,32" gap="16">
+            <Label text="@input_title" class="pageTitle" />
+            <Label text="@input_desc" class="pageDesc" />
+            <Separator />
+            <Label text="@input_single" class="section" />
+            <Grid cols="2" colGap="12" rowGap="8">
+              <Label text="@input_name" />
+              <TextInput placeholder="@input_name_ph" />
+              <Label text="@input_email" />
+              <TextInput placeholder="@input_email_ph" />
+              <Label text="@input_password" />
+              <TextInput placeholder="@input_password_ph" />
+            </Grid>
+            <Spacer size="4" />
+            <Label text="Read-only / Disabled" class="section" />
+            <Grid cols="2" colGap="12" rowGap="8">
+              <Label text="Read-only" />
+              <TextInput text="Cannot edit this" readOnly="true" />
+              <Label text="Disabled" />
+              <TextInput placeholder="Disabled input" enabled="false" />
+            </Grid>
+            <Spacer size="12" />
+            <Label text="@input_multi" class="section" />
+            <TextArea placeholder="@input_multi_ph" height="140" />
+          </VBox>
+        </ScrollView>
+
+        <!-- ===== Page 4: Range ===== -->
+        <ScrollView expand="true">
+          <VBox padding="40,32,40,32" gap="16">
+            <Label text="@range_title" class="pageTitle" />
+            <Label text="@range_desc" class="pageDesc" />
+            <Separator />
+            <Label text="@range_slider" class="section" />
+            <HBox gap="8" height="32">
+              <Label text="@range_volume" width="100" />
+              <Slider min="0" max="100" value="65" expand="true" />
+            </HBox>
+            <HBox gap="8" height="32">
+              <Label text="@range_brightness" width="100" />
+              <Slider min="0" max="100" value="80" expand="true" />
+            </HBox>
+            <HBox gap="8" height="32">
+              <Label text="@range_zoom" width="100" />
+              <Slider min="10" max="200" value="100" expand="true" />
+            </HBox>
+          </VBox>
+        </ScrollView>
+
+        <!-- ===== Page 5: Status ===== -->
+        <ScrollView expand="true">
+          <VBox padding="40,32,40,32" gap="16">
+            <Label text="@status_title" class="pageTitle" />
+            <Label text="@status_desc" class="pageDesc" />
+            <Separator />
+            <Label text="@status_determinate" class="section" />
+            <HBox gap="8" height="24">
+              <Label text="@status_download" width="100" />
+              <ProgressBar min="0" max="100" value="73" expand="true" />
+            </HBox>
+            <HBox gap="8" height="24">
+              <Label text="@status_upload" width="100" />
+              <ProgressBar min="0" max="100" value="45" expand="true" />
+            </HBox>
+            <HBox gap="8" height="24">
+              <Label text="@status_complete" width="100" />
+              <ProgressBar min="0" max="100" value="100" expand="true" />
+            </HBox>
+            <Spacer size="12" />
+            <Label text="@status_indeterminate" class="section" />
+            <HBox gap="8" height="24">
+              <Label text="@status_loading" width="100" />
+              <ProgressBar indeterminate="true" expand="true" />
+            </HBox>
+          </VBox>
+        </ScrollView>
+
+        <!-- ===== Page 6: Layout ===== -->
+        <ScrollView expand="true">
+          <VBox padding="40,32,40,32" gap="16">
+            <Label text="@layout_title" class="pageTitle" />
+            <Label text="@layout_desc" class="pageDesc" />
+            <Separator />
+            <Label text="@layout_hbox" class="section" />
+            <HBox gap="8" height="36">
+              <Button text="@layout_left" width="80" />
+              <Spacer expand="true" />
+              <Button text="@layout_center" width="80" />
+              <Spacer expand="true" />
+              <Button text="@layout_right" width="80" />
+            </HBox>
+            <Spacer size="8" />
+            <Label text="@layout_grid" class="section" />
+            <Grid cols="2" colGap="12" rowGap="8">
+              <Button text="@layout_cell 1" />
+              <Button text="@layout_cell 2" />
+              <Button text="@layout_cell 3" type="primary" />
+              <Button text="@layout_cell 4" type="primary" />
+            </Grid>
+            <Spacer size="8" />
+            <Label text="@layout_separator" class="section" />
+            <Separator />
+            <HBox gap="8" height="30">
+              <Label text="@layout_left" width="80" />
+              <Separator vertical="true" />
+              <Label text="@layout_center" expand="true" />
+              <Separator vertical="true" />
+              <Label text="@layout_right" width="80" />
+            </HBox>
+            <Separator />
+
+            <Spacer size="8" />
+            <Label text="Expander" class="section" />
+            <Expander id="expander1" header="Advanced Options" expanded="true">
+              <CheckBox text="Enable feature A" checked="true" />
+              <CheckBox text="Enable feature B" />
+              <Toggle text="Experimental" />
+            </Expander>
+            <Expander header="More Settings" expanded="false">
+              <Label text="Hidden content here" />
+              <Slider min="0" max="100" value="50" />
+            </Expander>
+
+            <Spacer size="8" />
+            <Label text="NumberBox" class="section" />
+            <HBox gap="12" height="32">
+              <Label text="Integer:" width="80" />
+              <NumberBox min="0" max="100" value="42" step="1" width="120" />
+            </HBox>
+            <HBox gap="12" height="32">
+              <Label text="Decimal:" width="80" />
+              <NumberBox min="0" max="1" value="0.5" step="0.1" decimals="2" width="120" />
+            </HBox>
+
+            <Spacer size="8" />
+            <Label text="Percentage Sizing" class="section" />
+            <HBox gap="8" height="40">
+              <Button text="25%" width="25%" bgColor="0.2,0.5,0.8,1" textColor="1,1,1,1" />
+              <Button text="50%" width="50%" bgColor="0.13,0.59,0.33,1" textColor="1,1,1,1" />
+              <Button text="25%" width="25%" bgColor="0.85,0.18,0.15,1" textColor="1,1,1,1" />
+            </HBox>
+
+            <Spacer size="8" />
+            <Label text="Absolute Positioning" class="section" />
+            <Panel height="80" bgColor="theme.cardBg">
+              <Label text="Top-Left" position="absolute" left="8" top="8" fontSize="12" />
+              <Label text="Top-Right" position="absolute" right="8" top="8" fontSize="12" />
+              <Label text="Bottom-Left" position="absolute" left="8" bottom="8" fontSize="12" />
+              <Label text="Bottom-Right" position="absolute" right="8" bottom="8" fontSize="12" />
+              <Label text="Center" position="absolute" left="200" top="28" fontSize="14" bold="true" />
+            </Panel>
+
+            <Spacer size="8" />
+            <Label text="Flyout" class="section" />
+            <HBox gap="8" height="36">
+              <Button id="flyoutBtn" text="Show Flyout" type="primary" width="130" onClick="onShowFlyout" />
+            </HBox>
+          </VBox>
+        </ScrollView>
+
+        <!-- ===== Page 7: Image Crop ===== -->
+        <VBox gap="0" expand="true">
+          <HBox gap="8" padding="8" height="44" bgColor="theme.toolbarBg">
+            <Button id="btn_crop_toggle" text="@crop_toggle" type="primary" width="110" onClick="onCropToggle" />
+            <Separator vertical="true" />
+            <Label text="Ratio:" width="50" />
+            <ComboBox id="crop_ratio" items="Free,1:1,4:3,16:9,3:2" width="100" onChanged="onCropRatio" />
+            <Spacer expand="true" />
+            <Label id="crop_info" text="@crop_drop_hint" />
+          </HBox>
+          <ImageView id="cropImage" expand="true" />
+        </VBox>
+
+        <!-- ===== Page 8: Settings ===== -->
+        <ScrollView expand="true">
+          <VBox padding="40,32,40,32" gap="16">
+            <Label text="@settings_title" class="pageTitle" />
+            <Separator />
+            <Label text="@settings_appearance" class="section" />
+            <Toggle id="tg_theme" text="@settings_dark_mode" onChanged="onDarkMode" />
+            <Spacer size="8" />
+            <Label text="@settings_language" class="section" />
+            <HBox gap="8" height="32">
+              <ComboBox id="lang_combo" items="中文,English" width="160" onChanged="onLanguage" />
+            </HBox>
+            <Spacer size="12" />
+            <Label text="@settings_about" class="section" />
+            <Label text="UI Core Demo" />
+            <Label text="@settings_about_desc" class="caption" />
+            <Label text="@settings_about_tech" class="caption" />
+          </VBox>
+        </ScrollView>
+
+      </Stack>
+    </SplitView>
+
+    <!-- Flyout (at root level so it's not clipped by ScrollView) -->
+    <Flyout id="demoFlyout" placement="bottom">
+      <VBox gap="8" padding="4">
+        <Label text="Flyout Content" bold="true" />
+        <Label text="Click outside to dismiss" fontSize="12" />
+        <Button text="Dismiss" width="100" onClick="onDismissFlyout" />
+      </VBox>
+    </Flyout>
+  </VBox>
+</ui>

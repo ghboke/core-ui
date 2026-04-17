@@ -1,0 +1,40 @@
+# UI Core
+
+> An 8.4 MB single-DLL Windows desktop UI framework with a pure C API (187+ functions) and a declarative `.ui` markup language. Purpose-built to be driven by LLMs and AI agents: all public types are plain C (uint64_t handles, POD structs), all UI can be described as XML, and a single file (`docs/ai-guide.md`) contains everything an AI needs to generate a complete application.
+
+Why this matters for AI code generation:
+
+- **Pure C ABI** — no C++ templates, no std::*, no inheritance; LLMs rarely hallucinate type errors.
+- **Declarative `.ui` XML** — UI = a tree of tagged elements with attributes; trivially generable.
+- **One-file cheatsheet** — `docs/ai-guide.md` is the only file an agent needs to fetch.
+- **Hot reload** — agents can iterate on `.ui` files without rebuilding.
+- **Stable naming** — `ui_<noun>_<verb>` / `Ui<Noun>` patterns; predictable and greppable.
+
+## For AI agents (start here)
+
+- [AI Quick Start (complete cheatsheet)](docs/ai-guide.md): single-file, self-contained guide with the full control list, markup grammar, C API catalog, and 3 complete runnable examples. **Fetch this first.**
+- [API Index](UI_CORE_API.md): full list of exported C functions, grouped by module.
+- [C API Reference](docs/c-api.md): parameter-level detail for every function.
+- [Markup Reference](docs/markup.md): `.ui` XML grammar, all tags and attributes.
+
+## Docs
+
+- [Getting Started](docs/getting-started.md): integration guide (CMake, MSVC, MinGW).
+- [Controls](docs/controls.md): per-control spec (properties, events, defaults).
+- [Layout](docs/layout.md): VBox / HBox / Grid / Stack / percentage / absolute positioning.
+- [Design System](docs/design-system.md): Fluent 2 color tokens, spacing, typography.
+- [Internationalization](docs/i18n.md): `.lang` files and `@key` references.
+- [Changelog](CHANGELOG.md): version history (`MAJOR.MINOR.PATCH.BUILD`).
+
+## Examples
+
+- [Demo source](demo/app.cpp): event handling, menus, dialogs, theming.
+- [Demo markup](demo/app.ui): 9-page application with SplitView navigation.
+- [Language packs](demo/lang/): `zh-CN.lang` and `en.lang` samples.
+
+## Meta
+
+- Platform: Windows 10 and later (x86_64).
+- Build: CMake 3.20+ with MSVC 2019+ or MinGW-w64 (C++17).
+- License: MIT.
+- Version: 1.0.0.1 (see [VERSION](VERSION)).

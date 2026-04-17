@@ -1,0 +1,114 @@
+# UI Core Demo — 简体中文
+app_title=UI Core 演示
+app_desc=基于 Direct2D 的 UI 框架，采用 Fluent 2 设计系统，通过 .ui 标记文件构建界面。
+
+# Navigation
+nav_home=首页
+nav_button=按钮
+nav_selection=选择控件
+nav_input=文本输入
+nav_range=范围控件
+nav_status=状态
+nav_layout=布局
+nav_crop=图片裁剪
+nav_settings=设置
+
+# Home page
+card_controls=控件
+card_controls_desc=Button、CheckBox、RadioButton、Toggle、Slider、ComboBox、TextInput、TextArea、ProgressBar
+card_layout=布局
+card_layout_desc=VBox、HBox、Grid、Stack、ScrollView、Splitter、SplitView、Panel、Spacer
+card_nav=导航
+card_nav_desc=SplitView 侧边栏、NavItem 导航项、TitleBar 标题栏、TabControl 选项卡
+card_theme=主题
+card_theme_desc=Fluent 2 设计令牌，深色/浅色自动切换，WinUI 3 控件样式
+
+# Button page
+btn_title=按钮
+btn_desc=触发操作。支持默认、主色（accent）和自定义颜色样式。
+btn_standard_primary=标准 & 主色
+btn_custom_colors=自定义颜色
+btn_icon_buttons=图标按钮
+btn_default=默认
+btn_primary=主色
+btn_disabled=禁用
+btn_red=红色
+btn_green=绿色
+btn_orange=橙色
+btn_purple=紫色
+
+# Selection page
+sel_title=选择控件
+sel_desc=CheckBox、RadioButton、Toggle 和 ComboBox，用于选择值。
+sel_checkbox=复选框
+sel_checked=默认选中
+sel_unchecked=未选中
+sel_disabled_checked=禁用已选
+sel_radio=单选按钮
+sel_small=小
+sel_medium=中
+sel_large=大
+sel_toggle=开关
+sel_wifi=无线网络
+sel_bluetooth=蓝牙
+sel_notifications=通知
+sel_combo=下拉框
+
+# Input page
+input_title=文本输入
+input_desc=单行和多行文本输入框。聚焦时显示 2px accent 底线。
+input_single=单行输入 (TextInput)
+input_multi=多行输入 (TextArea)
+input_name=姓名
+input_email=邮箱
+input_password=密码
+input_name_ph=请输入姓名...
+input_email_ph=user@example.com
+input_password_ph=********
+input_multi_ph=在此输入多行文本...
+
+# Range page
+range_title=范围控件
+range_desc=滑块，用于选择数值。悬停/按下时滑块有缩放动画。
+range_slider=滑块
+range_volume=音量:
+range_brightness=亮度:
+range_zoom=缩放:
+
+# Status page
+status_title=状态 & 进度
+status_desc=ProgressBar 显示任务完成度或正在进行的工作。
+status_determinate=确定进度
+status_indeterminate=不确定进度
+status_download=下载:
+status_upload=上传:
+status_complete=完成:
+status_loading=加载中:
+
+# Layout page
+layout_title=布局
+layout_desc=弹性盒布局、网格和分隔线组件。
+layout_hbox=水平布局 (HBox)
+layout_grid=网格 (2列)
+layout_separator=分隔线
+layout_left=左
+layout_center=中
+layout_right=右
+layout_cell=单元格
+
+# Crop page
+crop_toggle=裁剪开关
+crop_drop_hint=拖入图片开始
+
+# Settings page
+settings_title=设置
+settings_appearance=外观
+settings_dark_mode=深色模式
+settings_about=关于
+settings_about_desc=Fluent 2 设计系统 — WinUI 3 风格控件
+settings_about_tech=Direct2D 渲染，.ui 标记文件，C/C++ API
+settings_language=语言
+
+# Layout extras
+layout_expander=折叠面板
+layout_numberbox=数字输入框

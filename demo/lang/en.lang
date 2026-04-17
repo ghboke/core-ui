@@ -1,0 +1,114 @@
+# UI Core Demo — English
+app_title=UI Core Demo
+app_desc=A Direct2D UI framework with Fluent 2 design, driven by .ui markup files.
+
+# Navigation
+nav_home=Home
+nav_button=Button
+nav_selection=Selection
+nav_input=Text Input
+nav_range=Range
+nav_status=Status
+nav_layout=Layout
+nav_crop=Image Crop
+nav_settings=Settings
+
+# Home page
+card_controls=Controls
+card_controls_desc=Button, CheckBox, RadioButton, Toggle, Slider, ComboBox, TextInput, TextArea, ProgressBar
+card_layout=Layout
+card_layout_desc=VBox, HBox, Grid, Stack, ScrollView, Splitter, SplitView, Panel, Spacer
+card_nav=Navigation
+card_nav_desc=SplitView sidebar, NavItem with accent indicator, TitleBar, TabControl
+card_theme=Theme
+card_theme_desc=Fluent 2 tokens, dark/light auto-switch, WinUI 3 control styles
+
+# Button page
+btn_title=Button
+btn_desc=Triggers an action. Supports default, primary (accent), and custom color styles.
+btn_standard_primary=Standard & Primary
+btn_custom_colors=Custom Colors
+btn_icon_buttons=Icon Buttons
+btn_default=Default
+btn_primary=Primary
+btn_disabled=Disabled
+btn_red=Red
+btn_green=Green
+btn_orange=Orange
+btn_purple=Purple
+
+# Selection page
+sel_title=Selection Controls
+sel_desc=CheckBox, RadioButton, Toggle, and ComboBox for selecting values.
+sel_checkbox=CheckBox
+sel_checked=Checked by default
+sel_unchecked=Unchecked
+sel_disabled_checked=Disabled checked
+sel_radio=RadioButton
+sel_small=Small
+sel_medium=Medium
+sel_large=Large
+sel_toggle=Toggle Switch
+sel_wifi=Wi-Fi
+sel_bluetooth=Bluetooth
+sel_notifications=Notifications
+sel_combo=ComboBox
+
+# Input page
+input_title=Text Input
+input_desc=Single-line and multi-line text fields. Focus shows a 2px accent bottom line.
+input_single=Single-line (TextInput)
+input_multi=Multi-line (TextArea)
+input_name=Name
+input_email=Email
+input_password=Password
+input_name_ph=Enter your name...
+input_email_ph=user@example.com
+input_password_ph=********
+input_multi_ph=Type multiple lines of text here...
+
+# Range page
+range_title=Range Controls
+range_desc=Slider for picking values. Thumb animates on hover/press.
+range_slider=Slider
+range_volume=Volume:
+range_brightness=Brightness:
+range_zoom=Zoom:
+
+# Status page
+status_title=Status & Progress
+status_desc=ProgressBar for showing task completion or ongoing work.
+status_determinate=Determinate
+status_indeterminate=Indeterminate
+status_download=Download:
+status_upload=Upload:
+status_complete=Complete:
+status_loading=Loading:
+
+# Layout page
+layout_title=Layout
+layout_desc=Flexible box layout, grid, and separator components.
+layout_hbox=HBox (horizontal)
+layout_grid=Grid (2 columns)
+layout_separator=Separator
+layout_left=Left
+layout_center=Center
+layout_right=Right
+layout_cell=Cell
+
+# Crop page
+crop_toggle=Toggle Crop
+crop_drop_hint=Drop an image to start
+
+# Settings page
+settings_title=Settings
+settings_appearance=Appearance
+settings_dark_mode=Dark mode
+settings_about=About
+settings_about_desc=Fluent 2 Design System — WinUI 3 aligned controls
+settings_about_tech=Direct2D rendering, .ui markup, C/C++ API
+settings_language=Language
+
+# Layout extras
+layout_expander=Expander
+layout_numberbox=NumberBox
