@@ -1,24 +1,24 @@
 cmake_minimum_required(VERSION 3.20)
 
-set(UI_CORE_VERSION "1.0.0")
-set(UI_CORE_INTERNAL_VERSION "1")
-project(ui-core-project VERSION ${UI_CORE_VERSION} LANGUAGES CXX)
+set(UI_CORE_VERSION "1.1.0")
+set(UI_CORE_INTERNAL_VERSION "2")
+project(core-ui-project VERSION ${UI_CORE_VERSION} LANGUAGES CXX)
 
 set(UI_CORE_VERSION_TAG "v${PROJECT_VERSION}")
-set(UI_CORE_RELEASE_DIR_NAME "ui-core-${UI_CORE_VERSION_TAG}")
+set(UI_CORE_RELEASE_DIR_NAME "core-ui-${UI_CORE_VERSION_TAG}")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(UI_CORE_STATIC "Build ui-core as static library (single exe, no DLL)" OFF)
+option(UI_CORE_STATIC "Build core-ui as static library (single exe, no DLL)" OFF)
 
 # MinGW 默认会把 libstdc++/libgcc 作为动态依赖输出，导致目标机缺少 DLL。
-# 这里改为静态链接运行时，便于仅分发 libui-core.dll + ui-demo.exe。
+# 这里改为静态链接运行时，便于仅分发 libcore-ui.dll + ui-demo.exe。
 if(MINGW)
     add_link_options(-static-libstdc++ -static-libgcc -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic)
 endif()
 
-# ---- UI Core sources ----
+# ---- Core UI sources ----
 set(UI_CORE_SOURCES
     src/ui/renderer.cpp
     src/ui/widget.cpp
@@ -54,25 +54,25 @@ if(WIN32)
 endif()
 
 if(UI_CORE_STATIC)
-    # ---- Static library: ui-core.lib (linked into exe) ----
-    add_library(ui-core STATIC ${UI_CORE_SOURCES})
-    target_compile_definitions(ui-core
+    # ---- Static library: core-ui.lib (linked into exe) ----
+    add_library(core-ui STATIC ${UI_CORE_SOURCES})
+    target_compile_definitions(core-ui
         PUBLIC  UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX UI_CORE_STATIC
         PRIVATE UI_CORE_BUILDING
     )
-    target_link_libraries(ui-core PUBLIC ${UI_CORE_SYSTEM_LIBS})
+    target_link_libraries(core-ui PUBLIC ${UI_CORE_SYSTEM_LIBS})
 else()
-    # ---- Shared library: ui-core.dll ----
-    add_library(ui-core SHARED ${UI_CORE_SOURCES})
-    set_target_properties(ui-core PROPERTIES PREFIX "")  # MinGW: ui-core.dll not libui-core.dll
-    target_compile_definitions(ui-core
+    # ---- Shared library: core-ui.dll ----
+    add_library(core-ui SHARED ${UI_CORE_SOURCES})
+    set_target_properties(core-ui PROPERTIES PREFIX "")  # MinGW: core-ui.dll not libcore-ui.dll
+    target_compile_definitions(core-ui
         PUBLIC  UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
         PRIVATE UI_CORE_BUILDING
     )
-    target_link_libraries(ui-core PRIVATE ${UI_CORE_SYSTEM_LIBS})
+    target_link_libraries(core-ui PRIVATE ${UI_CORE_SYSTEM_LIBS})
 endif()
 
-target_include_directories(ui-core
+target_include_directories(core-ui
     PUBLIC  include
     PRIVATE src/ui
 )
@@ -81,7 +81,7 @@ target_include_directories(ui-core
 add_executable(ui-demo WIN32
     demo/app.cpp
 )
-target_link_libraries(ui-demo PRIVATE ui-core)
+target_link_libraries(ui-demo PRIVATE core-ui)
 target_include_directories(ui-demo PRIVATE src/ui include)
 
 # POST_BUILD: 把 MinGW 运行时 DLL 拷到 exe 同目录。虽然顶上已经用
@@ -97,7 +97,7 @@ if(MINGW AND NOT UI_CORE_STATIC)
     )
 endif()
 
-target_compile_definitions(ui-core
+target_compile_definitions(core-ui
     PUBLIC
         UI_CORE_VERSION_TAG="${UI_CORE_VERSION_TAG}"
         UI_CORE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
@@ -110,25 +110,25 @@ target_compile_definitions(ui-core
 if(WIN32)
     if(UI_CORE_STATIC)
         ui_core_add_version_resource(
-            ui-core
-            "ui-core static library"
-            "ui-core.lib"
-            "ui-core.lib"
+            core-ui
+            "Core UI static library"
+            "core-ui.lib"
+            "core-ui.lib"
             "VFT_STATIC_LIB"
         )
     else()
         ui_core_add_version_resource(
-            ui-core
-            "ui-core dynamic library"
-            "ui-core.dll"
-            "ui-core.dll"
+            core-ui
+            "Core UI dynamic library"
+            "core-ui.dll"
+            "core-ui.dll"
             "VFT_DLL"
         )
     endif()
 
     ui_core_add_version_resource(
         ui-demo
-        "ui-core demo application"
+        "Core UI demo application"
         "ui-demo.exe"
         "ui-demo.exe"
         "VFT_APP"
@@ -149,12 +149,12 @@ install(
 
 if(UI_CORE_STATIC)
     install(
-        TARGETS ui-core
+        TARGETS core-ui
         ARCHIVE DESTINATION "${UI_CORE_RELEASE_DIR_NAME}/lib/static"
     )
 else()
     install(
-        TARGETS ui-core
+        TARGETS core-ui
         RUNTIME DESTINATION "${UI_CORE_RELEASE_DIR_NAME}/lib/dynamic"
         ARCHIVE DESTINATION "${UI_CORE_RELEASE_DIR_NAME}/lib/dynamic"
     )

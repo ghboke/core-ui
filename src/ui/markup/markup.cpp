@@ -198,6 +198,9 @@ void UiMarkup::ApplyLanguage() {
         if (!w->tooltipI18nKey.empty()) {
             w->tooltip = Tr(w->tooltipI18nKey);
         }
+        if (!w->titleI18nKey.empty()) {
+            if (auto* tb = dynamic_cast<TitleBarWidget*>(w)) tb->SetTitle(Tr(w->titleI18nKey));
+        }
 
         for (auto& child : w->Children()) walk(child.get());
     };

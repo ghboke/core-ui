@@ -1,8 +1,8 @@
 /*
- * ui_core.h — Public C API for the UI Core framework
+ * ui_core.h — Public C API for the Core UI framework
  *
  * Pure C header. No C++ types exposed.
- * Link against ui-core.dll (import library: ui-core.lib).
+ * Link against core-ui.dll (import library: core-ui.lib).
  */
 #ifndef UI_CORE_H
 #define UI_CORE_H
@@ -240,7 +240,7 @@ typedef void (*UiViewportCallback)(UiWidget widget, float zoom, float panX, floa
 UI_API void     ui_image_on_viewport_changed(UiWidget w, UiViewportCallback cb, void* userdata);
 
 /* ImageView mouse down/move 钩子：返回非 0 吞掉事件。
- * mouse_move 钩子吞事件时 ui-core 会顺带结束 pan 状态，
+ * mouse_move 钩子吞事件时 core-ui 会顺带结束 pan 状态，
  * 用于 pan 中途切换到"拖出"等流程。 */
 typedef int (*UiImageMouseDownCallback)(UiWidget widget, float x, float y, int btn, void* userdata);
 typedef int (*UiImageMouseMoveCallback)(UiWidget widget, float x, float y, void* userdata);
@@ -479,6 +479,98 @@ UI_API char*    ui_debug_dump_widget(UiWidget w);
 UI_API void     ui_debug_free(char* ptr);
 UI_API void     ui_debug_highlight(UiWindow win, const char* widget_id);  /* 红框高亮指定控件，NULL 清除 */
 UI_API int      ui_debug_screenshot(UiWindow win, const wchar_t* outPath);  /* 截图保存为 PNG，成功返回 0 */
+
+/* ------------------------------------------------------------------ */
+/* Debug / Simulation — 自动化测试用的事件注入 API                     */
+/* ------------------------------------------------------------------ */
+/*  两类通道：                                                        */
+/*    1) ui_debug_*   —— 直接走 widget 事件路径（同步、触发回调）      */
+/*    2) ui_debug_post_* —— 通过 Win32 PostMessage 走真实消息循环      */
+/*       （需调用 ui_debug_pump 或等待 ui_run 处理）                   */
+/*  所有函数返回 0 成功，非 0 失败；坐标参数为 DIP（逻辑像素）。        */
+
+/* ---- Widget 查询 ---- */
+UI_API int   ui_debug_widget_center(UiWidget w, float* outX, float* outY);
+UI_API int   ui_debug_widget_is_visible(UiWidget w);
+
+/* ---- 鼠标：走内部事件通路（触发命中测试、焦点、回调…） ---- */
+UI_API int   ui_debug_click(UiWindow win, UiWidget w);
+UI_API int   ui_debug_click_at(UiWindow win, float x, float y);
+UI_API int   ui_debug_double_click(UiWindow win, UiWidget w);
+UI_API int   ui_debug_right_click(UiWindow win, UiWidget w);
+UI_API int   ui_debug_right_click_at(UiWindow win, float x, float y);
+UI_API int   ui_debug_hover(UiWindow win, UiWidget w);
+UI_API int   ui_debug_mouse_move(UiWindow win, float x, float y);
+UI_API int   ui_debug_mouse_down(UiWindow win, float x, float y);
+UI_API int   ui_debug_mouse_up(UiWindow win, float x, float y);
+UI_API int   ui_debug_drag(UiWindow win, UiWidget w, float dx, float dy);
+UI_API int   ui_debug_drag_to(UiWindow win, float x1, float y1, float x2, float y2);
+UI_API int   ui_debug_wheel(UiWindow win, UiWidget w, float delta);
+UI_API int   ui_debug_wheel_at(UiWindow win, float x, float y, float delta);
+
+/* ---- 焦点 / 键盘 ---- */
+UI_API int   ui_debug_focus(UiWindow win, UiWidget w);
+UI_API int   ui_debug_blur(UiWindow win);
+UI_API int   ui_debug_key(UiWindow win, int vk);          /* 发给焦点控件 */
+UI_API int   ui_debug_type_char(UiWindow win, unsigned int ch);
+UI_API int   ui_debug_type_text(UiWindow win, const wchar_t* text);
+
+/* ---- 控件高层操作（直接改状态 + 触发 on_changed 回调） ---- */
+UI_API int   ui_debug_checkbox_toggle(UiWindow win, UiWidget w);
+UI_API int   ui_debug_checkbox_set(UiWindow win, UiWidget w, int checked);
+UI_API int   ui_debug_toggle_set(UiWindow win, UiWidget w, int on);
+UI_API int   ui_debug_radio_select(UiWindow win, UiWidget w);
+UI_API int   ui_debug_combo_select(UiWindow win, UiWidget w, int index);
+UI_API int   ui_debug_combo_open(UiWidget w);
+UI_API int   ui_debug_combo_close(UiWidget w);
+UI_API int   ui_debug_slider_set(UiWindow win, UiWidget w, float value);
+UI_API int   ui_debug_number_set(UiWindow win, UiWidget w, float value);
+UI_API int   ui_debug_tab_set(UiWidget w, int index);
+UI_API int   ui_debug_expander_set(UiWidget w, int expanded);
+UI_API int   ui_debug_splitview_set(UiWidget w, int open);
+UI_API int   ui_debug_flyout_show(UiWidget flyout, UiWidget anchor);
+UI_API int   ui_debug_flyout_hide(UiWidget flyout);
+UI_API int   ui_debug_text_set(UiWidget w, const wchar_t* text);
+UI_API int   ui_debug_scroll_set(UiWidget scrollview, float y);
+
+/* ---- Context menu（对当前已打开的 active menu 操作） ---- */
+UI_API int   ui_debug_menu_is_open(UiWindow win);
+UI_API int   ui_debug_menu_item_count(UiWindow win);
+UI_API int   ui_debug_menu_click_index(UiWindow win, int index);
+UI_API int   ui_debug_menu_click_id(UiWindow win, int item_id);
+UI_API int   ui_debug_menu_close(UiWindow win);
+
+/* 子菜单：path 是整数索引数组，如 {2,1} 即"顶层第 2 项的 submenu 中第 1 项"。
+   对只操作顶层的情形，等同 ui_debug_menu_click_index（depth=1）。 */
+UI_API int   ui_debug_menu_item_count_at(UiWindow win, const int* path, int depth);
+UI_API int   ui_debug_menu_item_id_at(UiWindow win, const int* path, int depth);
+UI_API int   ui_debug_menu_has_submenu_at(UiWindow win, const int* path, int depth);
+UI_API int   ui_debug_menu_click_path(UiWindow win, const int* path, int depth);
+
+/* 开关 context menu 的"前台变化即自动关闭"行为。
+   自动化脚本（如 PowerShell 发 pipe 命令）持有前台窗口时，需要调用
+   ui_debug_set_menu_autoclose(0) 关掉自动关闭；否则菜单打开后 50ms 内就被关掉。
+   参数 enabled=0 表示关闭自动关闭，=1 恢复正常。 */
+UI_API void  ui_debug_set_menu_autoclose(int enabled);
+
+/* 在 UI 线程上同步执行 fn(ud)。跨线程调用时内部用 SendMessage 到窗口，
+   已在 UI 线程时直接调用。返回前 fn 必已执行完成。主要给自动化脚本 / 调试 pipe
+   用，保证 widget 访问不跨线程产生数据竞争。 */
+UI_API void  ui_window_invoke_sync(UiWindow win, void (*fn)(void* ud), void* ud);
+
+/* ---- Dialog / Toast ---- */
+UI_API int   ui_debug_dialog_confirm(UiWindow win);
+UI_API int   ui_debug_dialog_cancel(UiWindow win);
+
+/* ---- HWND 通道：通过 Win32 消息循环派发（异步，需 pump） ---- */
+UI_API int   ui_debug_post_click(UiWindow win, float x, float y);
+UI_API int   ui_debug_post_right_click(UiWindow win, float x, float y);
+UI_API int   ui_debug_post_mouse_move(UiWindow win, float x, float y);
+UI_API int   ui_debug_post_key(UiWindow win, int vk);
+UI_API int   ui_debug_post_char(UiWindow win, unsigned int ch);
+
+/* 处理所有已排队的窗口消息（使 Post* 生效）。返回已处理的消息数。 */
+UI_API int   ui_debug_pump(void);
 
 #ifdef __cplusplus
 }

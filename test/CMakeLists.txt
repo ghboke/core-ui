@@ -50,6 +50,6 @@ target_compile_definitions(markup_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_M
 target_include_directories(markup_test PRIVATE ../src ../include)
 # Link the pre-built static lib
 target_link_libraries(markup_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../build-test/libui-core.a
+    ${CMAKE_CURRENT_SOURCE_DIR}/../build-test/libcore-ui.a
     d2d1 d3d11 dxgi dwrite dwmapi uxtheme windowscodecs shlwapi ole32
 )

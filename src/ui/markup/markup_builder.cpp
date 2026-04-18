@@ -1100,6 +1100,14 @@ WidgetPtr BuildWidgetTree(
         }
     }
 
+    // i18n: TitleBar title="@key" — store key so ApplyLanguage can re-translate
+    if (node.tag == "TitleBar") {
+        auto titleIt = attrs.find("title");
+        if (titleIt != attrs.end() && !titleIt->second.empty() && titleIt->second[0] == '@') {
+            widget->titleI18nKey = titleIt->second.substr(1);
+        }
+    }
+
     // Handle children
     if (node.tag == "ScrollView") {
         // ScrollView expects one child as content

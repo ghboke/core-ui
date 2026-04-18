@@ -1,4 +1,4 @@
-export const AI_SKILL_CONTENT = `# UI Core — AI Coding Skill
+export const AI_SKILL_CONTENT = `# Core UI — AI Coding Skill
 
 > Windows 桌面 UI 框架。Direct2D 硬件加速，Fluent 2 设计系统，纯 C API + 声明式 .ui 标记。
 > 本文件供 AI 编程助手（Claude / GPT / Copilot）使用，包含完整的 API 参考和使用模式。
@@ -12,7 +12,9 @@ export const AI_SKILL_CONTENT = `# UI Core — AI Coding Skill
 - **UI 描述**: 两种方式 — C API 手动构建 或 .ui XML 标记文件
 - **主题**: 深色/浅色自动切换，Fluent 2 语义 Token
 - **DPI**: Per-Monitor DPI V2，多显示器自动缩放
-- **分发**: 单 DLL (ui-core.dll) 或静态链接
+- **分发**: 单 DLL (core-ui.dll) 或静态链接
+- **自动化 / 调试**: 约 60 个 \`ui_debug_*\` 事件注入 API（since 1.1.0），AI 可自行完成
+  "生成 → 运行 → 点击 → 截图 → 验证 → 修改"闭环（详见 §14）
 
 ## 2. 项目结构
 
@@ -22,18 +24,18 @@ my_app/
   app.ui            — 界面布局（声明式）
   lang/zh-CN.lang   — 语言包（可选）
   ui_core.h         — 头文件
-  ui-core.dll       — 运行时库
-  ui-core.lib       — 导入库
+  core-ui.dll       — 运行时库
+  core-ui.lib       — 导入库
 \`\`\`
 
 CMake 集成:
 \`\`\`cmake
 add_executable(my_app WIN32 main.cpp)
-target_include_directories(my_app PRIVATE third_party/ui-core/include)
-target_link_libraries(my_app PRIVATE \${CMAKE_SOURCE_DIR}/third_party/ui-core/ui-core.lib)
+target_include_directories(my_app PRIVATE third_party/core-ui/include)
+target_link_libraries(my_app PRIVATE \${CMAKE_SOURCE_DIR}/third_party/core-ui/core-ui.lib)
 add_custom_command(TARGET my_app POST_BUILD
     COMMAND \${CMAKE_COMMAND} -E copy_if_different
-        \${CMAKE_SOURCE_DIR}/third_party/ui-core/ui-core.dll $<TARGET_FILE_DIR:my_app>)
+        \${CMAKE_SOURCE_DIR}/third_party/core-ui/core-ui.dll $<TARGET_FILE_DIR:my_app>)
 \`\`\`
 
 ## 3. 生命周期
@@ -117,6 +119,8 @@ ui_window_on_menu(win, cb, ud);         // void cb(UiWindow, int item_id, void*)
 
 ## 6. 控件创建
 
+### 有 C API factory 的控件（可纯 C 代码创建）
+
 | 函数 | 说明 |
 |------|------|
 | \`ui_vbox()\` / \`ui_hbox()\` | 垂直/水平布局容器 |
@@ -142,6 +146,29 @@ ui_window_on_menu(win, cb, ud);         // void cb(UiWindow, int item_id, void*)
 | \`ui_dialog()\` | 模态对话框 |
 | \`ui_custom()\` | 自定义绘制控件 |
 | \`ui_menu_create()\` | 右键菜单 |
+
+### 仅通过 .ui 标记创建（**没有** C API factory）
+
+以下控件**只能**通过 \`.ui\` 文件声明创建，用 \`ui_widget_find_by_id(root, "id")\` 或
+\`g_layout.FindAs<ui::XxxWidget>("id")\` 获取句柄；状态变更用 \`ui_debug_*\`（自动化场景）
+或 C++ 方法（应用代码场景）：
+
+| 控件 | markup 标签 | 状态 API |
+|------|------------|---------|
+| Grid | \`<Grid cols colGap rowGap>...</Grid>\` | — |
+| Stack | \`<Stack id active>...</Stack>\` | C++ \`SetActiveIndex\` |
+| NumberBox | \`<NumberBox min max value step decimals />\` | \`ui_debug_number_set(win, w, v)\` / C++ \`SetValue\` |
+| Expander | \`<Expander header expanded>...</Expander>\` | \`ui_debug_expander_set(w, 1)\` / \`SetExpanded\` |
+| Flyout | \`<Flyout id placement>...</Flyout>\` | \`ui_debug_flyout_show(fw, anchor)\` / \`Show/Hide\` |
+| SplitView | \`<SplitView mode open>Pane Content</SplitView>\` | \`ui_debug_splitview_set(w, 1)\` / \`SetPaneOpen\` |
+| NavItem | \`<NavItem text svg selected onClick />\`（SplitView Pane 里用） | \`SetSelected\` |
+| Splitter | \`<Splitter ratio vertical>L R</Splitter>\` | C++ \`SetRatio\` |
+| MenuBar | \`<MenuBar><Menu text>...</Menu></MenuBar>\` | 事件通过 \`onMenuItemClick\` |
+| ToolTip | 不是独立控件，用任意控件的 \`tooltip="..."\` 属性 | — |
+
+markup-only 的原因：这些控件的配置参数太多（NumberBox 有 min/max/step/decimals，SplitView
+有 4 种模式），用 C API 写一堆 setter 反而比 XML 繁琐；用 markup 声明 + 事件回调才是
+推荐模式。
 
 ## 7. 控件树与通用属性
 
@@ -505,7 +532,20 @@ mode: overlay | inline | compactOverlay | compactInline
 <Flyout id="flyout" placement="bottom">
   <VBox padding="8"><Label text="Content" /></VBox>
 </Flyout>
+<MenuBar>
+  <Menu text="File">
+    <MenuItem id="101" text="New" shortcut="Ctrl+N" onClick="onNew" />
+    <MenuItem id="102" text="Open" shortcut="Ctrl+O" />
+    <Separator />
+    <MenuItem id="103" text="Exit" />
+  </Menu>
+  <Menu text="Edit">
+    <MenuItem id="201" text="Undo" shortcut="Ctrl+Z" />
+  </Menu>
+</MenuBar>
 \`\`\`
+MenuBar 的 item 点击统一走 \`ui_window_on_menu(win, cb, ud)\` 注册的回调，回调
+参数是 MenuItem 的 \`id\`。若 MenuItem 自带 \`onClick\`，则两者都会触发。
 
 ### 数据绑定
 \`\`\`xml
@@ -596,7 +636,7 @@ g_layout.SetText("label", L"Done");
 g_layout.Reload();  // 热重载 .ui 文件
 \`\`\`
 
-## 13. 调试 API
+## 13. 调试 Inspector API
 
 \`\`\`c
 // 导出控件树为 JSON（包含类型、ID、位置、尺寸）
@@ -616,34 +656,149 @@ ui_debug_highlight(win, NULL);  // 清除
 int ok = ui_debug_screenshot(win, L"screenshot.png");  // 0=成功
 \`\`\`
 
-## 14. AI 验证流程
+## 14. 事件注入 / 自动化 API（since 1.1.0）
 
-推荐工作流: 生成代码 → 编译运行 → 截图 → 检查 → 修正
+**关键能力**：无需真实鼠标键盘即可驱动任意控件，让 AI 自己完成"生成 → 运行 →
+点击 → 截图 → 验证 → 修改"闭环。约 60 个 \`ui_debug_*\` 函数，返回 0 成功，
+坐标全部用 DIP（逻辑像素）。
+
+### 鼠标
+\`\`\`c
+ui_debug_click(win, w);                     // 完整 MouseDown+Up，触发 onClick
+ui_debug_click_at(win, x, y);               // 按坐标
+ui_debug_double_click(win, w);
+ui_debug_right_click(win, w);               // 或 _at(win,x,y)：等同 WM_RBUTTONUP
+ui_debug_hover(win, w);                     // 移动到控件中心
+ui_debug_mouse_move(win, x, y);
+ui_debug_drag(win, w, dx, dy);              // 相对拖；drag_to(x1,y1,x2,y2) 绝对
+ui_debug_wheel(win, w, delta);              // 滚轮，会自动向上找 ScrollView
+\`\`\`
+
+### 键盘 / 焦点
+\`\`\`c
+ui_debug_focus(win, w);                     // 设焦点并显示焦点环
+ui_debug_blur(win);
+ui_debug_key(win, VK_RETURN);               // 走 WndProc 同一套分发（Tab/Enter/方向键等）
+ui_debug_type_char(win, L'A');
+ui_debug_type_text(win, L"hello world");    // 逐字符 WM_CHAR 等效
+\`\`\`
+
+### 控件高层（直接改状态 + 触发回调）
+\`\`\`c
+ui_debug_checkbox_set(win, cb, 1);          // 或 _toggle
+ui_debug_toggle_set(win, tg, 1);            // Switch
+ui_debug_radio_select(win, rb);             // 自动取消同组
+ui_debug_combo_select(win, combo, 2);       // 触发 onSelectionChanged
+ui_debug_slider_set(win, sl, 0.75f);        // 触发 onFloatChanged
+ui_debug_number_set(win, nb, 42.0f);
+ui_debug_tab_set(tab, 1);
+ui_debug_expander_set(ex, 1);               // 展开
+ui_debug_splitview_set(sv, 1);              // 开侧栏
+ui_debug_flyout_show(fw, anchor);           // 或 _hide
+ui_debug_text_set(w, L"new text");          // TextInput / TextArea / Label
+ui_debug_scroll_set(sv, 240.0f);
+\`\`\`
+
+### Context Menu（含任意深度子菜单）
+\`\`\`c
+// 先弹菜单（通常由 onRightClick 回调里 ui_menu_show 创建）
+ui_debug_right_click_at(win, 300, 200);
+
+// 自动化脚本持前台时必须关掉前台轮询，否则 50ms 内菜单被自动关：
+ui_debug_set_menu_autoclose(0);  // 0=禁用自动关闭，1=恢复
+
+// 顶层点击
+ui_debug_menu_click_index(win, 0);         // 按索引
+ui_debug_menu_click_id(win, 1001);         // 按 id
+
+// 子菜单路径点击：path=[2,0] 表示顶层第 2 项的 submenu 里第 0 项
+int path[] = {2, 0};
+ui_debug_menu_click_path(win, path, 2);
+
+// 查询
+int n = ui_debug_menu_item_count_at(win, path, 1);     // 顶层第 2 项 submenu 的项数
+int id = ui_debug_menu_item_id_at(win, path, 2);        // 叶子的 item id
+int has = ui_debug_menu_has_submenu_at(win, path, 1);
+ui_debug_menu_close(win);
+\`\`\`
+
+### Dialog
+\`\`\`c
+ui_debug_dialog_confirm(win);               // 等同按 Enter
+ui_debug_dialog_cancel(win);                // 等同按 Esc
+\`\`\`
+
+### HWND 通道（走真实 Win32 消息循环；异步）
+\`\`\`c
+ui_debug_post_click(win, x, y);             // PostMessage WM_LBUTTONDOWN/UP
+ui_debug_post_right_click(win, x, y);
+ui_debug_post_key(win, VK_TAB);
+ui_debug_post_char(win, L'A');
+ui_debug_pump();                            // 处理消息队列，让 post_* 生效
+\`\`\`
+
+### 线程安全
+\`\`\`c
+// ui_debug_* 和 widget mutation 必须在 UI 线程上执行。
+// 工作线程里访问前先 marshal：
+ui_window_invoke_sync(win, my_fn, userdata);
+\`\`\`
+
+### 查询帮手
+\`\`\`c
+float cx, cy;
+ui_debug_widget_center(w, &cx, &cy);        // 取 widget 中心 DIP 坐标
+int visible = ui_debug_widget_is_visible(w);
+\`\`\`
+
+## 14b. AI 验证闭环（推荐工作流）
 
 \`\`\`
 Step 1: 编译运行
-  cmake --build build && ./build/Release/app.exe
+  cmake --build build && start ./build/app.exe
 
-Step 2: 截图验证
-  ui_debug_screenshot(win, L"verify.png");
-  → 视觉检查布局是否正确
+Step 2: 定位目标控件
+  UiWidget btn = ui_widget_find_by_id(root, "submit");
+  // 或者从 ui_debug_dump_tree 返回的 JSON 里解析 id + rect
 
-Step 3: 结构验证
+Step 3: 模拟交互
+  ui_debug_focus(win, inputEmail);
+  ui_debug_type_text(win, L"user@example.com");
+  ui_debug_click(win, btn);                 // 触发 onClick
+
+Step 4: 截图 + 结构双重验证
+  ui_debug_screenshot(win, L"step3.png");
   char* tree = ui_debug_dump_tree(win);
-  → 解析 JSON，检查:
-    - 控件层级是否正确
-    - 所有 ID 是否存在
-    - rect 尺寸是否合理（非零、未重叠）
+  // 解析 JSON 检查：
+  //  - 预期 Label/Toast 是否出现
+  //  - Flyout/Dialog.open 是否 true
+  //  - ComboBox.selectedIndex 是否正确
   ui_debug_free(tree);
 
-Step 4: 定位问题
+Step 5: 右键 + 子菜单验证
+  ui_debug_right_click_at(win, 400, 300);
+  ui_debug_screenshot(win, L"menu.png");    // 确认菜单弹出
+  int path[] = {2, 0};
+  ui_debug_menu_click_path(win, path, 2);
+  // onMenuItemClick 被触发，对应 side effect 应出现
+
+Step 6: 定位问题（如果失败）
   ui_debug_highlight(win, "suspect_id");
   ui_debug_screenshot(win, L"highlight.png");
-
-Step 5: 交互验证
-  const wchar_t* text = ui_text_input_get_text(input);
-  int checked = ui_checkbox_get_checked(cb);
 \`\`\`
+
+### 外部脚本驱动（可选）
+
+demo 自带 Named Pipe \`\\\\.\\pipe\\ui_core_debug\`，PowerShell / Python 一行可驱动：
+\`\`\`powershell
+# PowerShell 示例
+\$p = New-Object System.IO.Pipes.NamedPipeClientStream '.', 'ui_core_debug', 'InOut'
+\$p.Connect(2000)
+\$b = [System.Text.Encoding]::UTF8.GetBytes('click submitBtn')
+\$p.Write(\$b, 0, \$b.Length); \$p.Flush()
+# 读响应 ...
+\`\`\`
+命令清单见 \`docs/debug-simulation.md\` 或发 \`help\` 给 pipe。
 
 ## 15. 设计系统速查
 
@@ -699,7 +854,7 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR, int) {
     ui_widget_set_padding_uniform(root, 24);
     ui_widget_set_gap(root, 12);
 
-    UiWidget title = ui_label(L"Hello, UI Core!");
+    UiWidget title = ui_label(L"Hello, Core UI!");
     ui_label_set_font_size(title, 24);
     ui_label_set_bold(title, 1);
     ui_widget_add_child(root, title);
@@ -725,7 +880,7 @@ int WINAPI wWinMain(HINSTANCE h, HINSTANCE, LPWSTR, int) {
   <VBox gap="0" expand="true">
     <TitleBar title="Demo" />
     <VBox padding="24" gap="12" expand="true">
-      <Label text="Hello, UI Core!" fontSize="24" bold="true" />
+      <Label text="Hello, Core UI!" fontSize="24" bold="true" />
       <Button id="btn" text="Click Me" type="primary" width="120" onClick="onBtnClick" />
       <Label id="status" text="Ready" />
     </VBox>

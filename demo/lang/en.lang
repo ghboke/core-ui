@@ -1,5 +1,5 @@
-# UI Core Demo — English
-app_title=UI Core Demo
+# Core UI Demo — English
+app_title=Core UI Demo
 app_desc=A Direct2D UI framework with Fluent 2 design, driven by .ui markup files.
 
 # Navigation

@@ -25,7 +25,7 @@ export default {
 
   // Home - Hero
   "home.badge": "Windows Desktop UI Framework",
-  "home.title": "Build beautiful native apps with UI Core",
+  "home.title": "Build beautiful native apps with Core UI",
   "home.subtitle": "Direct2D hardware-accelerated rendering, Fluent 2 design system, 29+ built-in controls, declarative .ui markup, and a pure C API — all in a single DLL.",
   "home.getStarted": "Get Started",
   "home.viewGithub": "View on GitHub",
@@ -37,7 +37,7 @@ export default {
   "home.stats.perMonitor": "Per-Monitor V2",
 
   // Home - Features
-  "home.whyTitle": "Why UI Core?",
+  "home.whyTitle": "Why Core UI?",
   "home.whySubtitle": "A modern approach to Windows desktop development — no bloated frameworks, no managed runtime.",
 
   // Home - Code
@@ -60,22 +60,22 @@ export default {
 
   // Getting Started
   "gs.title": "Getting Started",
-  "gs.subtitle": "Build and integrate UI Core into your Windows application in minutes.",
-  "gs.requirements": "UI Core requires Windows 10 or later, CMake 3.20+, and MSVC or MinGW with C++17 support.",
+  "gs.subtitle": "Build and integrate Core UI into your Windows application in minutes.",
+  "gs.requirements": "Core UI requires Windows 10 or later, CMake 3.20+, and MSVC or MinGW with C++17 support.",
   "gs.buildTitle": "Build from source",
   "gs.cmakeTitle": "CMake integration",
-  "gs.cmakeDesc": "Link against ui-core in your CMake project:",
+  "gs.cmakeDesc": "Link against core-ui in your CMake project:",
   "gs.minimalTitle": "Minimal example — C API",
   "gs.minimalDesc": "Create a window with a label and a button using the pure C API. All 187 functions use opaque uint64_t handles — no C++ headers needed.",
   "gs.markupTitle": "Declarative way — .ui Markup",
   "gs.markupDesc": "Build the same UI with XML-based .ui files. Supports data binding, event handlers, hot reload, and style classes.",
   "gs.distTitle": "Distribution",
   "gs.distDynamic": "Dynamic (default):",
-  "gs.distDynamicDesc": "Ship ui-core.dll alongside your .exe",
+  "gs.distDynamicDesc": "Ship core-ui.dll alongside your .exe",
   "gs.distStatic": "Static:",
   "gs.distStaticDesc": "Build with -DUI_CORE_STATIC=ON for a single .exe with no DLL dependency",
   "gs.depsTitle": "System dependencies",
-  "gs.depsDesc": "UI Core depends only on Windows system libraries — no external runtime is needed:",
+  "gs.depsDesc": "Core UI depends only on Windows system libraries — no external runtime is needed:",
 
   // Controls
   "controls.title": "Controls",
@@ -96,7 +96,7 @@ export default {
 
   // API Reference
   "api.title": "C API Reference",
-  "api.subtitle": "UI Core exports {{count}} pure C functions, organized by category. All functions use opaque uint64_t handles.",
+  "api.subtitle": "Core UI exports {{count}} pure C functions, organized by category. All functions use opaque uint64_t handles.",
   "api.searchPlaceholder": "Search functions...",
   "api.functions": "functions",
 
@@ -123,7 +123,7 @@ export default {
 
   // Layout
   "layout.title": "Layout System",
-  "layout.subtitle": "UI Core provides flexible layout containers: VBox/HBox (flexbox), Grid, Stack, SplitView (navigation pane), Splitter (draggable divider), and ScrollView.",
+  "layout.subtitle": "Core UI provides flexible layout containers: VBox/HBox (flexbox), Grid, Stack, SplitView (navigation pane), Splitter (draggable divider), and ScrollView.",
   "layout.flexDesc": "VBox arranges children vertically, HBox horizontally. Supports padding, gap, align (start/center/end/stretch), and justify properties.",
   "layout.flexTitle": "Flex Expansion",
   "layout.flexExpandDesc": "Set expand=true to make a widget fill remaining space in its parent. Multiple expanded widgets share space equally.",
@@ -151,14 +151,50 @@ export default {
 
   // Sidebar
   "nav.aiGuide": "AI Integration",
+  "nav.debug": "Debug & Automation",
+  "search.page.debug": "Debug & Automation",
+
+  // Debug page
+  "debug.title": "Debug & Automation",
+  "debug.subtitle": "Shipped in 1.1.0 — a full event-injection API for automated tests, AI agents driving UIs, and scripted regressions. Every interactive control can be triggered programmatically without a real mouse or keyboard.",
+  "debug.tip": "All ui_debug_* functions return 0 on success. Coordinates are DIPs (device-independent logical pixels). The internal channel is synchronous and fires the same callbacks as real events; the HWND channel via PostMessage is asynchronous and needs a pump.",
+  "debug.channelsTitle": "Three channels",
+  "debug.channelsDesc": "Pick whichever fits your scenario — all three drive the same widget tree:",
+  "debug.channelInternal": "Internal ui_debug_*:",
+  "debug.channelInternalDesc": "Synchronous, fires onClick / onValueChanged. Recommended for in-process tests.",
+  "debug.channelHwnd": "HWND ui_debug_post_*:",
+  "debug.channelHwndDesc": "Asynchronous via Win32 PostMessage. Matches real user input, includes SetCursor / capture / tooltip timers.",
+  "debug.channelPipe": "Named Pipe \\\\.\\pipe\\ui_core_debug:",
+  "debug.channelPipeDesc": "45+ text commands. Drive from PowerShell / Python / any language that can speak named pipes.",
+  "debug.cApiTitle": "End-to-end example (C)",
+  "debug.cApiDesc": "Focus an input, type, click submit, pop a context menu, click a submenu leaf, and take a screenshot — all from code:",
+  "debug.apiRefTitle": "C API reference",
+  "debug.mouseGroup": "Mouse",
+  "debug.keyboardGroup": "Keyboard & Focus",
+  "debug.controlGroup": "High-level control operations",
+  "debug.menuGroup": "Context Menu (with submenu paths)",
+  "debug.hwndGroup": "HWND channel & threading",
+  "debug.colSig": "Signature",
+  "debug.colDesc": "Description",
+  "debug.colCmd": "Command",
+  "debug.colExample": "Example",
+  "debug.pipeTitle": "Named Pipe protocol",
+  "debug.pipeDesc": "Connect to \\\\.\\pipe\\ui_core_debug, write one text command, read one JSON response. Success returns {\"ok\":true, ...}, failure returns {\"error\":\"...\"}.",
+  "debug.threadTitle": "Thread safety",
+  "debug.threadDesc": "ui_debug_* and widget mutations must run on the UI thread. Use ui_window_invoke_sync to marshal calls from worker threads — the demo's pipe handler does exactly this.",
+  "debug.limitsTitle": "Known limitations",
+  "debug.limit1": "Submenu clicks via menu_click_path don't visually open the submenu HWND — they post the leaf id directly to the root menu's parent window.",
+  "debug.limit2": "Ctrl/Alt keyboard shortcuts via ui_debug_key depend on real modifier state (GetKeyState). Use the registered shortcut callback directly if you need pure script injection.",
+  "debug.limit3": "File-drop (WM_DROPFILES) is not covered by the injection API — use a separate drag-drop automation approach.",
+  "debug.fullRef": "Full reference:",
 
   // AI Guide
   "ai.title": "AI Integration Guide",
-  "ai.subtitle": "This guide is for AI coding assistants (Claude, GPT, Copilot, etc.) — how to call UI Core's C API, build interfaces, debug the widget tree, and verify rendering results.",
+  "ai.subtitle": "This guide is for AI coding assistants (Claude, GPT, Copilot, etc.) — how to call Core UI's C API, build interfaces, debug the widget tree, and verify rendering results.",
   "ai.tip": "AI can generate UI via either the C API or .ui markup. Recommend starting with .ui markup for rapid prototyping, then using the C API for fine control. Use dump_tree + screenshot for closed-loop verification.",
 
   "ai.usageTitle": "How to Use",
-  "ai.usageDesc": "Below is the complete UI Core AI Skill file. Add it to your AI assistant's knowledge base, and it can directly call UI Core's C API or generate .ui markup files to build Windows desktop apps.",
+  "ai.usageDesc": "Below is the complete Core UI AI Skill file. Add it to your AI assistant's knowledge base, and it can directly call Core UI's C API or generate .ui markup files to build Windows desktop apps.",
   "ai.step1": "Click \"Copy\" to copy the full content, or \"Download\" to save as .md file",
   "ai.step2": "Paste the content into your AI's system prompt, CLAUDE.md, or project knowledge base",
   "ai.step3": "Tell the AI what interface to build, and it will reference the Skill file to generate code",
@@ -167,7 +203,7 @@ export default {
   "ai.lines": "lines",
 
   "ai.handleTitle": "Core Concept: Opaque Handles",
-  "ai.handleDesc": "All UI Core objects (windows, widgets, menus) are represented as uint64_t handles. AI doesn't need to understand internals — just call API functions with handles. Handles are created, configured via setters/getters, and assembled into a tree via add_child.",
+  "ai.handleDesc": "All Core UI objects (windows, widgets, menus) are represented as uint64_t handles. AI doesn't need to understand internals — just call API functions with handles. Handles are created, configured via setters/getters, and assembled into a tree via add_child.",
 
   "ai.quickStartTitle": "Option 1: Generate UI via C API",
   "ai.quickStartDesc": "AI can generate C code that includes ui_core.h. The basic pattern: init → create window → build widget tree → set root → show window → enter message loop.",
@@ -184,7 +220,7 @@ export default {
   "ai.themeTitle": "Theme Switching",
 
   "ai.debugTitle": "Debug API Overview",
-  "ai.debugDesc": "UI Core provides 4 debug functions that AI can use to inspect the widget tree, locate layout issues, and verify rendering results.",
+  "ai.debugDesc": "Core UI provides 4 debug functions that AI can use to inspect the widget tree, locate layout issues, and verify rendering results.",
   "ai.debugTablePurpose": "Purpose",
   "ai.debugTableUse": "AI Usage",
   "ai.debugDumpTree": "Export full widget tree as JSON",
@@ -209,7 +245,7 @@ export default {
   "ai.pitfall5": "Passing handles through callbacks requires (void*)(uintptr_t) double cast",
   "ai.pitfall6": "ui_widget_set_padding() takes 4 args (left, top, right, bottom) — use ui_widget_set_padding_uniform() for single value",
 
-  "ai.summary": "Summary: AI generates code → compile & run → ui_debug_screenshot → AI visual check → ui_debug_dump_tree structural check → fix and repeat. This is the recommended AI workflow for UI Core.",
+  "ai.summary": "Summary: AI generates code → compile & run → ui_debug_screenshot → AI visual check → ui_debug_dump_tree structural check → fix and repeat. This is the recommended AI workflow for Core UI.",
 
   // Controls i18n - Containers
   "ctrl.VBox.name": "VBox",
@@ -283,7 +319,7 @@ export default {
 
   // Design System
   "ds.title": "Design System",
-  "ds.subtitle": "UI Core implements Microsoft's Fluent 2 design tokens — the same system used in WinUI 3. Colors, typography, spacing, radius, shadows, and motion are all token-based.",
+  "ds.subtitle": "Core UI implements Microsoft's Fluent 2 design tokens — the same system used in WinUI 3. Colors, typography, spacing, radius, shadows, and motion are all token-based.",
   "ds.brandColors": "Brand Color Ramp",
   "ds.statusColors": "Status Colors",
   "ds.typography": "Typography — Segoe UI",

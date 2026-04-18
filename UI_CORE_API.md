@@ -1,6 +1,6 @@
-# UI Core 使用文档
+# Core UI 使用文档
 
-UI Core 是一个基于 Direct2D 的 Windows 原生 UI 框架，采用 Fluent 2 设计系统（对齐 WinUI 3 源码级规格），编译为 DLL。
+Core UI 是一个基于 Direct2D 的 Windows 原生 UI 框架，采用 Fluent 2 设计系统（对齐 WinUI 3 源码级规格），编译为 DLL。
 
 **推荐使用 `.ui` 标记文件构建界面**（声明式，类似 XAML / QML），C++ 只写逻辑代码。也支持纯 C API 编程。
 

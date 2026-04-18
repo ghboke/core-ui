@@ -108,13 +108,14 @@ export function SearchDialog({ open, onClose }: SearchDialogProps) {
     const results: SearchResult[] = [];
 
     const pages: SearchResult[] = [
-      { type: "page", name: t("search.page.gettingStarted"), description: "Build and integrate UI Core", path: "/docs/getting-started" },
+      { type: "page", name: t("search.page.gettingStarted"), description: "Build and integrate Core UI", path: "/docs/getting-started" },
       { type: "page", name: t("search.page.markup"), description: "Declarative UI markup syntax", path: "/docs/markup" },
       { type: "page", name: t("search.page.layout"), description: "Layout containers and flex system", path: "/docs/layout" },
       { type: "page", name: t("search.page.controls"), description: "29+ built-in controls overview", path: "/docs/controls" },
       { type: "page", name: t("search.page.cApi"), description: "Pure C function reference", path: "/docs/c-api" },
       { type: "page", name: t("search.page.designSystem"), description: "Fluent 2 design tokens", path: "/docs/design-system" },
       { type: "page", name: t("search.page.ai"), description: "AI coding assistant guide", path: "/docs/ai" },
+      { type: "page", name: t("search.page.debug"), description: "Event injection API, pipe protocol, automation scripts", path: "/docs/debug" },
     ];
     results.push(...pages);
 

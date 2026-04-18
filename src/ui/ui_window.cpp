@@ -53,6 +53,12 @@ static inline int GetSystemMetricsForDpi(int index, UINT dpi) {
 
 namespace ui {
 
+// 放在最上方供 WM_APP+120 case 引用（InvokeSync 的 SendMessage 携带的载荷）
+struct UiInvokeReq {
+    void (*fn)(void*);
+    void* ud;
+};
+
 bool UiWindowImpl::classRegistered_ = false;
 
 #ifndef DWMWA_TRANSITIONS_FORCEDISABLED
@@ -290,6 +296,11 @@ void UiWindowImpl::SetIconFromPixels(const uint8_t* rgba, int w, int h) {
 void UiWindowImpl::Show() {
     if (!hwnd_) return;
 
+    /* 外部可能先 ShowWindow(SW_MAXIMIZE) 了 —— 这里检测一次，
+     * 如果已经是最大化，跳过 SetWindowPos 写死尺寸的路径 +
+     * 跳过 slide 动画（动画用 SW_SHOWNOACTIVATE 会把最大化态覆盖掉）。*/
+    bool preMaximized = IsZoomed(hwnd_) != 0;
+
     /* 从当前窗口位置同步 target（外部可能已通过 SetWindowPos 改了位置） */
     {
         RECT wr; GetWindowRect(hwnd_, &wr);
@@ -310,6 +321,21 @@ void UiWindowImpl::Show() {
 
     startupRevealPending_ = false;
     startupRevealPosted_ = false;
+
+    if (preMaximized) {
+        /* 最大化路径：只触发 NCCALCSIZE 让 borderless 客户区生效，不改位置/尺寸 */
+        SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        if (!renderer_.RT()) renderer_.CreateRenderTarget(hwnd_);
+        LayoutRoot();
+        OnPaint();
+        ValidateRect(hwnd_, nullptr);
+        /* 直接以最大化态显示，不走 slide 动画 */
+        SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
+        ShowWindow(hwnd_, SW_SHOWMAXIMIZED);
+        if (!toolWindow_) SetForegroundWindow(hwnd_);
+        return;
+    }
 
     // Force WM_NCCALCSIZE so client rect reflects our borderless override
     SetWindowPos(hwnd_, nullptr, windowTargetX_, windowTargetY_,
@@ -848,110 +874,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_KEYDOWN: {
         int vk = (int)wParam;
-
-        // 0. Active dialog intercepts all keys
-        if (activeDialog_ && activeDialog_->IsActive()) {
-            if (activeDialog_->OnKeyDown(vk)) { Invalidate(); return 0; }
-        }
-
-        // 1. Tab / Shift+Tab → focus traversal (only when enabled)
-        if (vk == VK_TAB && tabNavigationEnabled_) {
-            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            showFocusRing_ = true;
-            ShowFocusRing() = true;
-            FocusNext(shift);
-            Invalidate();
-            return 0;
-        }
-
-        // 2. Shortcuts (Ctrl+Key, Alt+Key)
-        if (!shortcuts_.empty()) {
-            int mods = 0;
-            if (GetKeyState(VK_CONTROL) & 0x8000) mods |= 1;  // MOD_CTRL
-            if (GetKeyState(VK_SHIFT)   & 0x8000) mods |= 2;  // MOD_SHIFT
-            if (GetKeyState(VK_MENU)    & 0x8000) mods |= 4;  // MOD_ALT
-            for (auto& sc : shortcuts_) {
-                if (sc.vk == vk && sc.modifiers == mods) {
-                    sc.callback();
-                    Invalidate();
-                    return 0;
-                }
-            }
-        }
-
-        // 3. Enter / Space → activate focused widget
-        if (focusedWidget_ && (vk == VK_RETURN || vk == VK_SPACE)) {
-            // Space toggles CheckBox/Toggle, Enter/Space clicks Button
-            if (auto* cb = dynamic_cast<CheckBoxWidget*>(focusedWidget_)) {
-                if (vk == VK_SPACE) { cb->SetChecked(!cb->Checked()); if (cb->onValueChanged) cb->onValueChanged(cb->Checked()); UpdateToggleAnimTimer(); Invalidate(); return 0; }
-            }
-            if (auto* tg = dynamic_cast<ToggleWidget*>(focusedWidget_)) {
-                if (vk == VK_SPACE) { tg->SetOn(!tg->On()); if (tg->onValueChanged) tg->onValueChanged(tg->On()); UpdateToggleAnimTimer(); Invalidate(); return 0; }
-            }
-            if (focusedWidget_->onClick) {
-                focusedWidget_->onClick();
-                Invalidate();
-                return 0;
-            }
-        }
-
-        // 4. Arrow keys for Slider (left/right)
-        if (focusedWidget_ && (vk == VK_LEFT || vk == VK_RIGHT)) {
-            if (auto* sl = dynamic_cast<SliderWidget*>(focusedWidget_)) {
-                float step = (vk == VK_RIGHT) ? 1.0f : -1.0f;
-                sl->SetValue(sl->Value() + step);
-                if (sl->onFloatChanged) sl->onFloatChanged(sl->Value());
-                Invalidate();
-                return 0;
-            }
-        }
-
-        // 5. Arrow keys for RadioButton group (up/down)
-        if (focusedWidget_ && (vk == VK_UP || vk == VK_DOWN)) {
-            if (auto* rb = dynamic_cast<RadioButtonWidget*>(focusedWidget_)) {
-                // Find siblings in same group
-                Widget* parent = rb->Parent();
-                if (parent) {
-                    std::vector<RadioButtonWidget*> group;
-                    for (auto& c : parent->Children()) {
-                        auto* r = dynamic_cast<RadioButtonWidget*>(c.get());
-                        if (r && r->Group() == rb->Group()) group.push_back(r);
-                    }
-                    int cur = 0;
-                    for (int i = 0; i < (int)group.size(); i++)
-                        if (group[i] == rb) { cur = i; break; }
-                    int next = vk == VK_DOWN ? (cur + 1) % (int)group.size()
-                                             : (cur - 1 + (int)group.size()) % (int)group.size();
-                    group[next]->SetSelected(true);
-                    if (group[next]->onValueChanged) group[next]->onValueChanged(true);
-                    SetFocus(group[next]);
-                    UpdateToggleAnimTimer();
-                    Invalidate();
-                    return 0;
-                }
-            }
-        }
-
-        // 6. Escape → close ComboBox dropdown
-        if (focusedWidget_ && vk == VK_ESCAPE) {
-            if (auto* combo = dynamic_cast<ComboBoxWidget*>(focusedWidget_)) {
-                if (combo->IsOpen()) { combo->Close(); Invalidate(); return 0; }
-            }
-        }
-
-        // 7. Enter → open/close ComboBox
-        if (focusedWidget_ && vk == VK_RETURN) {
-            if (auto* combo = dynamic_cast<ComboBoxWidget*>(focusedWidget_)) {
-                // Toggle — handled by OnKeyDown if we add it, skip for now
-            }
-        }
-
-        // 8. Forward to focused widget's generic OnKeyDown
-        if (focusedWidget_ && focusedWidget_->OnKeyDown(vk)) {
-            Invalidate();
-            return 0;
-        }
-
+        if (DispatchKeyDown(vk)) return 0;
         if (onKey) onKey(vk);
         break;
     }
@@ -1037,6 +960,12 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         activeMenu_ = nullptr;  // menu already closed itself
         if (onMenuItemClick) onMenuItemClick(itemId);
         Invalidate();
+        return 0;
+    }
+    case WM_APP + 120: {
+        // InvokeSync: 跨线程 SendMessage 来的 "在 UI 线程上执行 fn(ud)" 请求
+        auto* req = reinterpret_cast<UiInvokeReq*>(lParam);
+        if (req && req->fn) req->fn(req->ud);
         return 0;
     }
     case kMsgStartupReveal: {
@@ -1623,6 +1552,160 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
             }
         }
         if (handled) Invalidate();
+    }
+}
+
+// ---- Debug simulation (DIP coords → pixel → existing private handlers) ----
+
+void UiWindowImpl::SimMouseMove(float dipX, float dipY) {
+    OnMouseMove(dipX * dpiScale_, dipY * dpiScale_);
+}
+void UiWindowImpl::SimMouseDown(float dipX, float dipY) {
+    OnMouseDown(dipX * dpiScale_, dipY * dpiScale_);
+}
+void UiWindowImpl::SimMouseUp(float dipX, float dipY) {
+    OnMouseUp(dipX * dpiScale_, dipY * dpiScale_);
+}
+void UiWindowImpl::SimMouseWheel(float dipX, float dipY, float delta) {
+    OnMouseWheel(dipX * dpiScale_, dipY * dpiScale_, (int)delta);
+}
+void UiWindowImpl::SimRightClick(float dipX, float dipY) {
+    // Matches WM_RBUTTONUP: just fires onRightClick callback.
+    if (onRightClick) onRightClick(dipX, dipY);
+    Invalidate();
+}
+void UiWindowImpl::SimKeyDown(int vk) {
+    DispatchKeyDown(vk);
+}
+
+// 共用的 WM_KEYDOWN 分发逻辑。返回 true 表示事件被消费。
+bool UiWindowImpl::DispatchKeyDown(int vk) {
+    // 0. Active dialog intercepts all keys
+    if (activeDialog_ && activeDialog_->IsActive()) {
+        if (activeDialog_->OnKeyDown(vk)) { Invalidate(); return true; }
+    }
+
+    // 1. Tab / Shift+Tab → focus traversal (only when enabled)
+    if (vk == VK_TAB && tabNavigationEnabled_) {
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        showFocusRing_ = true;
+        ShowFocusRing() = true;
+        FocusNext(shift);
+        Invalidate();
+        return true;
+    }
+
+    // 2. Shortcuts (Ctrl+Key, Alt+Key) —— GetKeyState 读真实键盘状态，
+    //    sim 注入时若没有同时按 Ctrl/Alt 这条分支会跳过，这是期望行为。
+    if (!shortcuts_.empty()) {
+        int mods = 0;
+        if (GetKeyState(VK_CONTROL) & 0x8000) mods |= 1;  // MOD_CTRL
+        if (GetKeyState(VK_SHIFT)   & 0x8000) mods |= 2;  // MOD_SHIFT
+        if (GetKeyState(VK_MENU)    & 0x8000) mods |= 4;  // MOD_ALT
+        for (auto& sc : shortcuts_) {
+            if (sc.vk == vk && sc.modifiers == mods) {
+                sc.callback();
+                Invalidate();
+                return true;
+            }
+        }
+    }
+
+    // 3. Enter / Space → activate focused widget
+    if (focusedWidget_ && (vk == VK_RETURN || vk == VK_SPACE)) {
+        if (auto* cb = dynamic_cast<CheckBoxWidget*>(focusedWidget_)) {
+            if (vk == VK_SPACE) {
+                cb->SetChecked(!cb->Checked());
+                if (cb->onValueChanged) cb->onValueChanged(cb->Checked());
+                UpdateToggleAnimTimer();
+                Invalidate();
+                return true;
+            }
+        }
+        if (auto* tg = dynamic_cast<ToggleWidget*>(focusedWidget_)) {
+            if (vk == VK_SPACE) {
+                tg->SetOn(!tg->On());
+                if (tg->onValueChanged) tg->onValueChanged(tg->On());
+                UpdateToggleAnimTimer();
+                Invalidate();
+                return true;
+            }
+        }
+        if (focusedWidget_->onClick) {
+            focusedWidget_->onClick();
+            Invalidate();
+            return true;
+        }
+    }
+
+    // 4. Arrow keys for Slider (left/right)
+    if (focusedWidget_ && (vk == VK_LEFT || vk == VK_RIGHT)) {
+        if (auto* sl = dynamic_cast<SliderWidget*>(focusedWidget_)) {
+            float step = (vk == VK_RIGHT) ? 1.0f : -1.0f;
+            sl->SetValue(sl->Value() + step);
+            if (sl->onFloatChanged) sl->onFloatChanged(sl->Value());
+            Invalidate();
+            return true;
+        }
+    }
+
+    // 5. Arrow keys for RadioButton group (up/down)
+    if (focusedWidget_ && (vk == VK_UP || vk == VK_DOWN)) {
+        if (auto* rb = dynamic_cast<RadioButtonWidget*>(focusedWidget_)) {
+            Widget* parent = rb->Parent();
+            if (parent) {
+                std::vector<RadioButtonWidget*> group;
+                for (auto& c : parent->Children()) {
+                    auto* r = dynamic_cast<RadioButtonWidget*>(c.get());
+                    if (r && r->Group() == rb->Group()) group.push_back(r);
+                }
+                int cur = 0;
+                for (int i = 0; i < (int)group.size(); i++)
+                    if (group[i] == rb) { cur = i; break; }
+                int next = vk == VK_DOWN ? (cur + 1) % (int)group.size()
+                                         : (cur - 1 + (int)group.size()) % (int)group.size();
+                group[next]->SetSelected(true);
+                if (group[next]->onValueChanged) group[next]->onValueChanged(true);
+                SetFocus(group[next]);
+                UpdateToggleAnimTimer();
+                Invalidate();
+                return true;
+            }
+        }
+    }
+
+    // 6. Escape → close ComboBox dropdown
+    if (focusedWidget_ && vk == VK_ESCAPE) {
+        if (auto* combo = dynamic_cast<ComboBoxWidget*>(focusedWidget_)) {
+            if (combo->IsOpen()) { combo->Close(); Invalidate(); return true; }
+        }
+    }
+
+    // 7. Forward to focused widget's generic OnKeyDown
+    if (focusedWidget_ && focusedWidget_->OnKeyDown(vk)) {
+        Invalidate();
+        return true;
+    }
+
+    return false;
+}
+
+// ---- UI thread marshaling ----
+void UiWindowImpl::InvokeSync(void (*fn)(void*), void* ud) {
+    if (!fn) return;
+    if (!hwnd_) { fn(ud); return; }
+    // 若已在 UI 线程（拥有该 HWND 的线程），直接调用——避免 SendMessage 死锁。
+    DWORD hwndTid = GetWindowThreadProcessId(hwnd_, nullptr);
+    if (hwndTid == GetCurrentThreadId()) {
+        fn(ud);
+        return;
+    }
+    UiInvokeReq req{fn, ud};
+    SendMessageW(hwnd_, WM_APP + 120, 0, reinterpret_cast<LPARAM>(&req));
+}
+void UiWindowImpl::SimKeyChar(wchar_t ch) {
+    if (focusedWidget_ && focusedWidget_->OnKeyChar(ch)) {
+        Invalidate();
     }
 }
 

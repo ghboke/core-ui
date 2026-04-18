@@ -17,12 +17,12 @@ BEGIN
     BEGIN
         BLOCK "080404B0"
         BEGIN
-            VALUE "CompanyName", "ui-core\0"
+            VALUE "CompanyName", "Core UI\0"
             VALUE "FileDescription", "@VERSION_FILE_DESCRIPTION@\0"
             VALUE "FileVersion", "@PROJECT_VERSION@.@UI_CORE_INTERNAL_VERSION@\0"
             VALUE "InternalName", "@VERSION_INTERNAL_NAME@\0"
             VALUE "OriginalFilename", "@VERSION_ORIGINAL_FILENAME@\0"
-            VALUE "ProductName", "ui-core\0"
+            VALUE "ProductName", "Core UI\0"
             VALUE "ProductVersion", "@UI_CORE_VERSION_TAG@\0"
         END
     END

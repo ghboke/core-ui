@@ -176,7 +176,7 @@ export function Header({ themeMode, onToggleTheme, onToggleMobileMenu }: HeaderP
         )}
         <Link to="/" className={styles.brand}>
           <div className={styles.brandIcon}>UI</div>
-          <span>UI Core</span>
+          <span>CORE UI</span>
           <span className={styles.version}>v{versionData.version}</span>
         </Link>
         <div className={styles.spacer} />

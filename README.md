@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./logo.svg" alt="UI Core" height="64">
+  <img src="./logo.svg" alt="CORE UI" height="64">
 </p>
 
 <p align="center">
@@ -8,22 +8,22 @@
   <a href="https://ghboke.github.io/core-ui/"><b>📖 在线文档</b></a>
 </p>
 
-**UI Core** 是一个现代化的 Windows 桌面 UI 框架，从零重新设计以匹配 Microsoft **Fluent 2** 视觉语言，同时保持**原生级的性能**与**极小的分发体积**。底层基于 **Direct2D / Direct3D 11** 硬件加速渲染，把从按钮、文本框到 SplitView、Flyout、Expander 的 25+ 个内置控件统一在一套 **纯 C API** 之下（共 187+ 个导出函数）——Rust、Go、Python、C#、Delphi 乃至 Lua 都能直接调用，不需要写 C++ 绑定层。
+**Core UI** 是一个现代化的 Windows 桌面 UI 框架，从零重新设计以匹配 Microsoft **Fluent 2** 视觉语言，同时保持**原生级的性能**与**极小的分发体积**。底层基于 **Direct2D / Direct3D 11** 硬件加速渲染，把从按钮、文本框到 SplitView、Flyout、Expander 的 25+ 个内置控件统一在一套 **纯 C API** 之下（共 250+ 个导出函数）——Rust、Go、Python、C#、Delphi 乃至 Lua 都能直接调用，不需要写 C++ 绑定层。
 
 推荐用类 XAML 的 **`.ui` 标记文件**描述界面，支持 CSS 风格的样式选择器、数据绑定、国际化、**热重载**——写 UI 不再是堆代码，而是像写 HTML 一样声明一棵节点树。项目还专门为 **AI 协作**而设计：一份自包含的速查文档（[`docs/ai-guide.md`](./docs/ai-guide.md)）让 LLM 一次读完就能生成完整的可运行应用，真正做到"描述需求 → 得到界面"的极速原型闭环。
 
 > **8.4 MB 一个 DLL，就能写出跟 Office / VSCode 同一设计语言的 Windows 桌面应用。**
 > 不要 Chromium、不要 .NET、不要 Qt 几十兆的 moc/uic——一个 C 头文件，一份 `.ui` 标记文件，搞定。
 
-![version](https://img.shields.io/badge/version-1.0.0.1-blue)
+![version](https://img.shields.io/badge/version-1.1.0.2-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2B-lightgrey)
 ![size](https://img.shields.io/badge/dll-8.4MB-brightgreen)
-![api](https://img.shields.io/badge/C%20API-187%2B-orange)
+![api](https://img.shields.io/badge/C%20API-250%2B-orange)
 
-## 🎯 为什么选 UI Core
+## 🎯 为什么选 Core UI
 
-| 对比维度 | Electron | WPF / WinUI 3 | Qt | **UI Core** |
+| 对比维度 | Electron | WPF / WinUI 3 | Qt | **Core UI** |
 |---------|----------|---------------|-----|-------------|
 | **分发体积** | 100+ MB | 需要 .NET 运行时 | 40+ MB Qt DLLs | **8.4 MB 单 DLL** |
 | **启动时间** | 1–3 秒 | 0.5–1 秒 | 0.5–1 秒 | **< 200 ms** |
@@ -33,15 +33,15 @@
 | **热重载** | ❌ | ❌ | ❌ | **✅ `.ui` 文件** |
 | **学习曲线** | 大前端生态 | XAML + C# | C++ + Meta 对象 | **C + XML 即上手** |
 
-**一句话总结**：想要 Electron 的开发体验 + 原生的性能 + Fluent 2 的颜值 + Qt 的控件齐全——UI Core 是目前唯一同时打满四格的方案。
+**一句话总结**：想要 Electron 的开发体验 + 原生的性能 + Fluent 2 的颜值 + Qt 的控件齐全——Core UI 是目前唯一同时打满四格的方案。
 
 ## 🤖 AI 时代的快速 UI 开发方案
 
-**UI Core 是为 LLM 和 AI Agent 从零设计的 UI 框架。**
+**Core UI 是为 LLM 和 AI Agent 从零设计的 UI 框架。**
 
 现在大家都让 AI 写代码。你试过让 Claude / GPT / Cursor 写一个 Qt 应用吗？它会告诉你去看 `moc`、帮你 include 一堆用不上的头、还经常搞错信号槽语法。写 WPF？它会把 XAML、C# code-behind、x:Bind 表达式混着编。原因很简单：**这些框架的心智负担不是为 token 预算设计的**。
 
-UI Core 的架构天然让 AI 做对：
+Core UI 的架构天然让 AI 做对：
 
 | 设计决策 | AI 收益 |
 |---------|---------|
@@ -50,7 +50,7 @@ UI Core 的架构天然让 AI 做对：
 | **全部 API 遵循 `ui_<名词>_<动词>`** | 可被精确预测：想禁用按钮？`ui_widget_set_enabled` 几乎一次猜对 |
 | **一份 `docs/ai-guide.md` 自包含速查** | Agent 只需 fetch 这一个文件，就能写出完整应用，不必遍历仓库 |
 | **热重载 `.ui` 文件** | Agent 改完无需重编译即可看效果，闭环更快 |
-| **187+ 导出函数全部进 DLL 符号表** | Agent 可以动态检查 `objdump -p ui-core.dll` 知道当前版本真实 API |
+| **250+ 导出函数全部进 DLL 符号表** | Agent 可以动态检查 `objdump -p core-ui.dll` 知道当前版本真实 API |
 | **所有文本走 `@key` 或 `{bind}`** | Agent 生成的 UI 天然多语言 / 数据驱动，不写死 |
 
 典型工作流：
@@ -73,14 +73,14 @@ cmake --build build         （编译器兜底，LLM 不用自己验证）
 |------|-------|------|
 | **[`llms.txt`](./llms.txt)** | AI Agent 爬虫 | [llmstxt.org](https://llmstxt.org) 标准索引，Agent 第一步 fetch 这个 |
 | **[`docs/ai-guide.md`](./docs/ai-guide.md)** | LLM 编程 | **自包含速查表**：API + 标签 + 属性 + 3 个完整例子 + 常见坑 |
-| **[`UI_CORE_API.md`](./UI_CORE_API.md)** | 深入场景 | 187+ 导出函数完整清单，按模块分组 |
+| **[`UI_CORE_API.md`](./UI_CORE_API.md)** | 深入场景 | 250+ 导出函数完整清单，按模块分组 |
 
 **Cursor / Claude Code / Cline / Continue 等用户推荐把 `docs/ai-guide.md` 加到项目规则里**（Cursor 的 `.cursorrules`、Claude Code 的 `CLAUDE.md`），一次上下文全覆盖。
 
 提示词模板（复制即用）：
 
 ```
-本项目使用 UI Core 框架。调用前先阅读 docs/ai-guide.md。
+本项目使用 Core UI 框架。调用前先阅读 docs/ai-guide.md。
 约束：
   1. 优先使用 .ui 标记文件描述 UI，C++ 只写事件处理和数据绑定。
   2. 所有颜色用 theme.* 引用，不要硬编码。
@@ -108,7 +108,7 @@ cmake --build build         （编译器兜底，LLM 不用自己验证）
 ```xml
 <ui version="1" width="400" height="300">
   <VBox gap="16" padding="32" expand="true">
-    <Label text="Hello, UI Core!" fontSize="24" bold="true" />
+    <Label text="Hello, Core UI!" fontSize="24" bold="true" />
     <Button text="Click Me" type="primary" onClick="onBtn" />
   </VBox>
 </ui>
@@ -132,25 +132,41 @@ ui_widget_on_click(btn, my_cb, NULL);
 // … 从任何能调 DLL 的语言用
 ```
 
-- **187+ 导出函数**，句柄全部 `uint64_t`，没有一个 C++ 类型泄漏
+- **250+ 导出函数**，句柄全部 `uint64_t`，没有一个 C++ 类型泄漏
 - Rust / Go / Python / C# / Delphi / Pascal / Lua 全部能直接绑定
 - 所有控件、窗口、动画、主题、IME、拖放——C API 全覆盖
 
-### 🔍 实时调试直接外挂
+### 🔍 自动化 / 调试：控件可编程驱动
 
-- 内置 **Named Pipe IPC**，外部工具可查询控件树、高亮控件、切换页面
-- `ui-debug` 协议文档化，配合自制工具或 VSCode 扩展做可视化调试
+从 1.1.0 起新增一整套 **`ui_debug_*` 事件注入 API** —— 无需真实鼠标键盘即可
+驱动任意控件，为端到端测试、AI Agent 操作 UI、脚本化回归设计：
+
+```c
+ui_debug_click(win, btn);                    // 完整 mouse down/up，触发 onClick
+ui_debug_combo_select(win, combo, 2);        // 选中第 3 项 + 触发 onChanged
+ui_debug_right_click_at(win, 300, 200);      // 右键弹出注册的 context menu
+int path[] = {2, 0};
+ui_debug_menu_click_path(win, path, 2);      // 点 submenu 里的叶子
+ui_debug_type_text(win, L"hello");           // 逐字符键盘输入
+```
+
+- **60+ 个 `ui_debug_*` 函数**：click / hover / drag / wheel / key / focus / 各控件
+  高层操作 / 子菜单 path 点击 / HWND `PostMessage` 通道 …
+- 内置 **Named Pipe IPC**（`\\.\pipe\ui_core_debug`）45+ 条命令，PowerShell / Python
+  一行能驱动；demo 自带 [`scripts/debug-smoke.ps1`](./scripts/debug-smoke.ps1) 60 步回归脚本
+- **线程安全工具** `ui_window_invoke_sync` 把工作线程的调用 marshal 到 UI 线程
+- 完整参考见 **[`docs/debug-simulation.md`](./docs/debug-simulation.md)**
 
 ## 📊 真实数据
 
 | 指标 | 数值 |
 |------|------|
-| `ui-core.dll` 体积（全功能） | **8.4 MB** |
+| `core-ui.dll` 体积（全功能） | **8.4 MB** |
 | `ui-demo.exe` 体积（静态链接） | **1.0 MB** |
 | 空窗口内存占用 | **< 30 MB** |
 | 冷启动到首帧 | **< 200 ms** |
 | 60 fps 动画 CPU 占用 | **< 3%** |
-| 导出 C 函数数量 | **187+** |
+| 导出 C 函数数量 | **250+** |
 | 内置控件 | **25+** |
 | 支持的文件格式（ImageView） | PNG / JPG / BMP / GIF / WebP |
 
@@ -165,8 +181,8 @@ ui_widget_on_click(btn, my_cb, NULL);
 ### 构建
 
 ```bash
-git clone https://github.com/<your-account>/ui-core.git
-cd ui-core
+git clone https://github.com/<your-account>/core-ui.git
+cd core-ui
 cmake -B build -G Ninja
 cmake --build build
 ```
@@ -175,7 +191,7 @@ cmake --build build
 
 | 文件 | 说明 |
 |------|------|
-| `build/ui-core.dll` | 动态库（带版本号 `1.0.0.1`） |
+| `build/core-ui.dll` | 动态库（带版本号 `1.0.0.1`） |
 | `build/ui-demo.exe` | 演示程序 |
 
 单 exe 分发（无依赖）：
@@ -192,7 +208,7 @@ cmake --build build
 ```xml
 <ui version="1" width="400" height="300" title="Hello">
   <VBox gap="16" padding="32" expand="true">
-    <Label text="Hello, UI Core!" fontSize="24" bold="true" />
+    <Label text="Hello, Core UI!" fontSize="24" bold="true" />
     <Button text="Click Me" type="primary" onClick="onBtn" />
   </VBox>
 </ui>
@@ -305,13 +321,13 @@ int build = ui_core_version_build();        // 1
 const char* v = ui_core_version_string();   // "1.0.0.1"
 ```
 
-- Windows DLL 属性页（右键 `ui-core.dll` → 属性 → 详细信息）会显示 `FileVersion 1.0.0.1`
+- Windows DLL 属性页（右键 `core-ui.dll` → 属性 → 详细信息）会显示 `FileVersion 1.0.0.1`
 - 完整发布历史见 [CHANGELOG.md](./CHANGELOG.md)
 
 ## 📁 项目结构
 
 ```
-ui-core/
+core-ui/
 ├── include/           # 公共头文件 (ui_core.h, plugin_api.h)
 ├── src/
 │   ├── version.rc.in  # Windows 版本资源模板
@@ -355,6 +371,6 @@ ui-core/
 
 ## 📝 许可证
 
-[MIT License](./LICENSE) © ui-core contributors
+[MIT License](./LICENSE) © core-ui contributors
 
 — 如果这个项目让你少写了一个 Electron 应用，**请点一个 Star ⭐**。

@@ -7,20 +7,20 @@ my_app/
   main.cpp          — 入口：加载 .ui 文件 + 注册事件
   app.ui            — 界面布局（声明式）
   ui_core.h         — 头文件
-  ui-core.dll       — 运行时库
+  core-ui.dll       — 运行时库
 ```
 
 ## CMake 集成
 
 ```cmake
 add_executable(my_app WIN32 main.cpp)
-target_include_directories(my_app PRIVATE third_party/ui-core/include)
-target_link_libraries(my_app PRIVATE ${CMAKE_SOURCE_DIR}/third_party/ui-core/ui-core.lib)
+target_include_directories(my_app PRIVATE third_party/core-ui/include)
+target_link_libraries(my_app PRIVATE ${CMAKE_SOURCE_DIR}/third_party/core-ui/core-ui.lib)
 
 # 复制 DLL
 add_custom_command(TARGET my_app POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${CMAKE_SOURCE_DIR}/third_party/ui-core/ui-core.dll
+        ${CMAKE_SOURCE_DIR}/third_party/core-ui/core-ui.dll
         $<TARGET_FILE_DIR:my_app>)
 ```
 
@@ -32,7 +32,7 @@ add_custom_command(TARGET my_app POST_BUILD
   <VBox gap="0" expand="true">
     <TitleBar title="My App" />
     <VBox padding="24" gap="12" expand="true">
-      <Label text="Hello, UI Core!" fontSize="20" bold="true" />
+      <Label text="Hello, Core UI!" fontSize="20" bold="true" />
       <Button id="btn" text="Click Me" width="120" onClick="onBtnClick" />
       <Label id="status" text="Ready" />
     </VBox>

@@ -14,10 +14,11 @@ import { CApi } from "./pages/CApi";
 import { DesignSystem } from "./pages/DesignSystem";
 
 const AiGuide = lazy(() => import("./pages/AiGuide").then(m => ({ default: m.AiGuide })));
+const Debug = lazy(() => import("./pages/Debug").then(m => ({ default: m.Debug })));
 
 type ThemeMode = "light" | "dark";
 
-const THEME_KEY = "ui-core-theme";
+const THEME_KEY = "core-ui-theme";
 
 function App() {
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
@@ -55,6 +56,11 @@ function App() {
             <Route path="docs/ai" element={
               <Suspense fallback={<div style={{ display: "flex", justifyContent: "center", paddingTop: "80px" }}><Spinner size="medium" /></div>}>
                 <AiGuide />
+              </Suspense>
+            } />
+            <Route path="docs/debug" element={
+              <Suspense fallback={<div style={{ display: "flex", justifyContent: "center", paddingTop: "80px" }}><Spinner size="medium" /></div>}>
+                <Debug />
               </Suspense>
             } />
           </Route>

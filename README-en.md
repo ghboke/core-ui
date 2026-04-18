@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./logo.svg" alt="UI Core" height="64">
+  <img src="./logo.svg" alt="CORE UI" height="64">
 </p>
 
 <p align="center">
@@ -8,22 +8,22 @@
   <a href="https://ghboke.github.io/core-ui/"><b>📖 Online Docs</b></a>
 </p>
 
-**UI Core** is a modern Windows desktop UI framework, rebuilt from the ground up to match Microsoft's **Fluent 2** visual language while keeping **native-level performance** and a **tiny distribution footprint**. Rendering runs on **Direct2D / Direct3D 11** hardware acceleration, and every widget — from buttons and text fields to SplitView, Flyout, and Expander — is exposed through a single **pure C API (187+ functions)**, so Rust, Go, Python, C#, Delphi, and even Lua can bind it directly without writing a C++ shim.
+**Core UI** is a modern Windows desktop UI framework, rebuilt from the ground up to match Microsoft's **Fluent 2** visual language while keeping **native-level performance** and a **tiny distribution footprint**. Rendering runs on **Direct2D / Direct3D 11** hardware acceleration, and every widget — from buttons and text fields to SplitView, Flyout, and Expander — is exposed through a single **pure C API (250+ functions)**, so Rust, Go, Python, C#, Delphi, and even Lua can bind it directly without writing a C++ shim.
 
 UIs are best described in **`.ui` markup files** — a XAML-like declarative format with CSS-style selectors, data binding, internationalization, and **hot reload** — so building a UI feels more like writing HTML than wiring up widgets. The project is also purpose-built for **AI-driven development**: a single self-contained cheatsheet ([`docs/ai-guide.md`](./docs/ai-guide.md)) lets an LLM read it once and emit a complete, runnable app, turning "describe what you want" into "see it running" in a single loop.
 
 > **An 8.4 MB single DLL that ships Office / VS Code-grade UI on Windows.**
 > No Chromium. No .NET. No 40 MB of Qt DLLs and moc/uic preprocessors. One C header, one `.ui` markup file — done.
 
-![version](https://img.shields.io/badge/version-1.0.0.1-blue)
+![version](https://img.shields.io/badge/version-1.1.0.2-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2B-lightgrey)
 ![size](https://img.shields.io/badge/dll-8.4MB-brightgreen)
 ![api](https://img.shields.io/badge/C%20API-187%2B-orange)
 
-## 🎯 Why UI Core
+## 🎯 Why Core UI
 
-| Dimension | Electron | WPF / WinUI 3 | Qt | **UI Core** |
+| Dimension | Electron | WPF / WinUI 3 | Qt | **Core UI** |
 |-----------|----------|---------------|-----|-------------|
 | **Distribution size** | 100+ MB | needs .NET runtime | 40+ MB Qt DLLs | **8.4 MB single DLL** |
 | **Startup time** | 1–3 s | 0.5–1 s | 0.5–1 s | **< 200 ms** |
@@ -33,15 +33,15 @@ UIs are best described in **`.ui` markup files** — a XAML-like declarative for
 | **Hot reload** | ❌ | ❌ | ❌ | **✅ `.ui` files** |
 | **Learning curve** | full-stack JS | XAML + C# | C++ + meta object | **C + XML, instant** |
 
-**In one line:** You want Electron's DX + native-level performance + Fluent 2 looks + Qt-level control coverage — UI Core is currently the only option that checks all four boxes.
+**In one line:** You want Electron's DX + native-level performance + Fluent 2 looks + Qt-level control coverage — Core UI is currently the only option that checks all four boxes.
 
 ## 🤖 Fast UI Development for the AI Era
 
-**UI Core is designed from the ground up to be driven by LLMs and AI agents.**
+**Core UI is designed from the ground up to be driven by LLMs and AI agents.**
 
 Everybody is having AI write code now. Try asking Claude / GPT / Cursor to build a Qt app — it'll point you at `moc`, include a pile of unnecessary headers, and misremember signal/slot syntax. Try WPF — it will blend XAML, C# code-behind, and `x:Bind` expressions. The reason is simple: **the cognitive surface of these frameworks was never designed with a token budget in mind.**
 
-UI Core is architected so agents get it right:
+Core UI is architected so agents get it right:
 
 | Design decision | Win for AI |
 |-----------------|-----------|
@@ -50,7 +50,7 @@ UI Core is architected so agents get it right:
 | **Every API follows `ui_<noun>_<verb>`** | Highly predictable: "disable a button" → `ui_widget_set_enabled`, guessed right on the first try |
 | **A single self-contained cheatsheet** | Agents only need to fetch `docs/ai-guide.md`; no repo-wide crawl required |
 | **Hot-reload for `.ui` files** | Agents can iterate on the UI without a rebuild — faster feedback loop |
-| **187+ exports in the DLL symbol table** | Agents can `objdump -p ui-core.dll` to ground-truth the current API surface |
+| **250+ exports in the DLL symbol table** | Agents can `objdump -p core-ui.dll` to ground-truth the current API surface |
 | **All text uses `@key` or `{bind}`** | AI-generated UI is i18n-ready and data-driven by default, not hard-coded |
 
 Typical workflow:
@@ -73,14 +73,14 @@ Tweak .ui, hot-reload to polish  (no re-codegen)
 |-------|----------|-------------|
 | **[`llms.txt`](./llms.txt)** | AI agent crawlers | [llmstxt.org](https://llmstxt.org) standard index — the first file an agent should fetch |
 | **[`docs/ai-guide.md`](./docs/ai-guide.md)** | LLMs writing code | **Self-contained cheatsheet**: API + tags + attributes + 3 runnable examples + gotchas |
-| **[`UI_CORE_API.md`](./UI_CORE_API.md)** | Deep dives | Full list of 187+ exported functions, grouped by module |
+| **[`UI_CORE_API.md`](./UI_CORE_API.md)** | Deep dives | Full list of 250+ exported functions, grouped by module |
 
 **Cursor / Claude Code / Cline / Continue users:** add `docs/ai-guide.md` to your project rules (Cursor's `.cursorrules`, Claude Code's `CLAUDE.md`) for full coverage in a single context.
 
 Copy-paste prompt template:
 
 ```
-This project uses the UI Core framework. Read docs/ai-guide.md before generating code.
+This project uses the Core UI framework. Read docs/ai-guide.md before generating code.
 Constraints:
   1. Prefer .ui markup to describe the UI; use C++ only for event handlers and data binding.
   2. Reference colors via theme.*; never hard-code hex values.
@@ -108,7 +108,7 @@ Constraints:
 ```xml
 <ui version="1" width="400" height="300">
   <VBox gap="16" padding="32" expand="true">
-    <Label text="Hello, UI Core!" fontSize="24" bold="true" />
+    <Label text="Hello, Core UI!" fontSize="24" bold="true" />
     <Button text="Click Me" type="primary" onClick="onBtn" />
   </VBox>
 </ui>
@@ -132,25 +132,44 @@ ui_widget_on_click(btn, my_cb, NULL);
 // … call from any language that can load a DLL
 ```
 
-- **187+ exported functions**, all handles are plain `uint64_t` — zero C++ types leak through
+- **250+ exported functions**, all handles are plain `uint64_t` — zero C++ types leak through
 - Rust / Go / Python / C# / Delphi / Pascal / Lua can all bind directly
 - Windows, widgets, animations, theming, IME, drag-and-drop — everything is in the C API
 
-### 🔍 Live debugging, out-of-process
+### 🔍 Automation / debugging: controls are programmable
 
-- Built-in **Named Pipe IPC**: external tools can query the widget tree, highlight widgets, switch pages
-- The `ui-debug` protocol is documented — pair it with a custom tool or a VS Code extension for visual debugging
+Shipped in 1.1.0: a full **`ui_debug_*` event-injection API** — drive any control
+without real mouse or keyboard. Designed for end-to-end tests, AI agents operating
+UIs, and scripted regressions:
+
+```c
+ui_debug_click(win, btn);                    // full mouse down/up, fires onClick
+ui_debug_combo_select(win, combo, 2);        // select item 2 + fire onChanged
+ui_debug_right_click_at(win, 300, 200);      // pop up the registered context menu
+int path[] = {2, 0};
+ui_debug_menu_click_path(win, path, 2);      // click the leaf in a submenu
+ui_debug_type_text(win, L"hello");           // per-character keyboard input
+```
+
+- **60+ `ui_debug_*` functions**: click / hover / drag / wheel / key / focus,
+  per-widget high-level ops, submenu path click, HWND `PostMessage` channel, etc.
+- Built-in **Named Pipe IPC** (`\\.\pipe\ui_core_debug`) with 45+ commands —
+  drive from PowerShell / Python in one line. The demo ships with
+  [`scripts/debug-smoke.ps1`](./scripts/debug-smoke.ps1), a 60-step regression.
+- **Thread-safety helper** `ui_window_invoke_sync` marshals calls from worker
+  threads onto the UI thread.
+- Full reference in **[`docs/debug-simulation.md`](./docs/debug-simulation.md)**.
 
 ## 📊 Real Numbers
 
 | Metric | Value |
 |--------|-------|
-| `ui-core.dll` size (full feature) | **8.4 MB** |
+| `core-ui.dll` size (full feature) | **8.4 MB** |
 | `ui-demo.exe` size (static link) | **1.0 MB** |
 | Empty window memory | **< 30 MB** |
 | Cold start to first frame | **< 200 ms** |
 | 60 fps animation CPU usage | **< 3%** |
-| Exported C functions | **187+** |
+| Exported C functions | **250+** |
 | Built-in controls | **25+** |
 | Image formats (ImageView) | PNG / JPG / BMP / GIF / WebP |
 
@@ -165,8 +184,8 @@ ui_widget_on_click(btn, my_cb, NULL);
 ### Build
 
 ```bash
-git clone https://github.com/<your-account>/ui-core.git
-cd ui-core
+git clone https://github.com/<your-account>/core-ui.git
+cd core-ui
 cmake -B build -G Ninja
 cmake --build build
 ```
@@ -175,7 +194,7 @@ Artifacts:
 
 | File | Description |
 |------|-------------|
-| `build/ui-core.dll` | Shared library (version `1.0.0.1` embedded) |
+| `build/core-ui.dll` | Shared library (version `1.1.0.2` embedded) |
 | `build/ui-demo.exe` | Demo application |
 
 Single-exe distribution (zero dependencies):
@@ -192,7 +211,7 @@ cmake --build build
 ```xml
 <ui version="1" width="400" height="300" title="Hello">
   <VBox gap="16" padding="32" expand="true">
-    <Label text="Hello, UI Core!" fontSize="24" bold="true" />
+    <Label text="Hello, Core UI!" fontSize="24" bold="true" />
     <Button text="Click Me" type="primary" onClick="onBtn" />
   </VBox>
 </ui>
@@ -293,7 +312,7 @@ theme.contentText / theme.divider / theme.inputBg / theme.inputBorder
 
 ## 🔢 Versioning
 
-Version format: `MAJOR.MINOR.PATCH.BUILD` (currently `1.0.0.1`)
+Version format: `MAJOR.MINOR.PATCH.BUILD` (currently `1.1.0.2`)
 
 - Compile-time macros: `UI_CORE_VERSION_MAJOR/MINOR/PATCH/BUILD` + `UI_CORE_VERSION_STRING`
 - Runtime API:
@@ -302,16 +321,16 @@ Version format: `MAJOR.MINOR.PATCH.BUILD` (currently `1.0.0.1`)
 int major, minor, patch;
 ui_core_version(&major, &minor, &patch);   // 1, 0, 0
 int build = ui_core_version_build();        // 1
-const char* v = ui_core_version_string();   // "1.0.0.1"
+const char* v = ui_core_version_string();   // "1.1.0.2"
 ```
 
-- Windows DLL properties (right-click `ui-core.dll` → Properties → Details) show `FileVersion 1.0.0.1`
+- Windows DLL properties (right-click `core-ui.dll` → Properties → Details) show `FileVersion 1.1.0.2`
 - Full release history in [CHANGELOG.md](./CHANGELOG.md)
 
 ## 📁 Project Layout
 
 ```
-ui-core/
+core-ui/
 ├── include/           # Public headers (ui_core.h, plugin_api.h)
 ├── src/
 │   ├── version.rc.in  # Windows version resource template
@@ -357,6 +376,6 @@ ui-core/
 
 ## 📝 License
 
-[MIT License](./LICENSE) © ui-core contributors
+[MIT License](./LICENSE) © core-ui contributors
 
 — If this project saved you from shipping another Electron app, **please drop a Star ⭐**.

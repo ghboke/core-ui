@@ -811,7 +811,11 @@ UI_API UiWidget ui_widget_find_by_id(UiWidget root, const char* id) {
     if (!r || !id) return UI_INVALID;
     auto* found = r->FindById(id);
     if (!found) return UI_INVALID;
-    return Ctx().handles.FindHandle(found);
+    // 若已在 handle table 里就复用；否则新插入一个句柄（markup 构建的
+    // widget 默认不在 handle table 里，直接 FindHandle 会返回 0）。
+    uint64_t h = Ctx().handles.FindHandle(found);
+    if (h) return h;
+    return Ctx().handles.Insert(found->shared_from_this());
 }
 
 // ================================================================
@@ -1356,6 +1360,439 @@ UI_API int ui_debug_screenshot(UiWindow win, const wchar_t* outPath) {
     auto* w = Win(win);
     if (!w) return -1;
     return w->Screenshot(outPath);
+}
+
+// ================================================================
+// Debug / Simulation — event injection
+// ================================================================
+
+static bool WidgetCenter(ui::Widget* w, float& x, float& y) {
+    if (!w) return false;
+    const auto& r = w->rect;
+    if (r.right <= r.left || r.bottom <= r.top) return false;
+    x = (r.left + r.right) * 0.5f;
+    y = (r.top + r.bottom) * 0.5f;
+    return true;
+}
+
+UI_API int ui_debug_widget_center(UiWidget w, float* outX, float* outY) {
+    auto* p = W(w); if (!p) return -1;
+    float cx, cy;
+    if (!WidgetCenter(p, cx, cy)) return -1;
+    if (outX) *outX = cx;
+    if (outY) *outY = cy;
+    return 0;
+}
+
+UI_API int ui_debug_widget_is_visible(UiWidget w) {
+    auto* p = W(w);
+    return (p && p->visible) ? 1 : 0;
+}
+
+// ---- Mouse ----
+
+UI_API int ui_debug_click_at(UiWindow win, float x, float y) {
+    auto* wi = Win(win); if (!wi) return -1;
+    wi->SimMouseMove(x, y);
+    wi->SimMouseDown(x, y);
+    wi->SimMouseUp(x, y);
+    wi->Invalidate();
+    return 0;
+}
+
+UI_API int ui_debug_click(UiWindow win, UiWidget w) {
+    auto* wi = Win(win); if (!wi) return -1;
+    auto* p = W(w); if (!p) return -1;
+    float cx, cy;
+    if (!WidgetCenter(p, cx, cy)) return -1;
+    return ui_debug_click_at(win, cx, cy);
+}
+
+UI_API int ui_debug_double_click(UiWindow win, UiWidget w) {
+    int r1 = ui_debug_click(win, w);
+    if (r1 != 0) return r1;
+    return ui_debug_click(win, w);
+}
+
+UI_API int ui_debug_right_click_at(UiWindow win, float x, float y) {
+    auto* wi = Win(win); if (!wi) return -1;
+    wi->SimRightClick(x, y);
+    return 0;
+}
+
+UI_API int ui_debug_right_click(UiWindow win, UiWidget w) {
+    auto* p = W(w); if (!p) return -1;
+    float cx, cy;
+    if (!WidgetCenter(p, cx, cy)) return -1;
+    return ui_debug_right_click_at(win, cx, cy);
+}
+
+UI_API int ui_debug_hover(UiWindow win, UiWidget w) {
+    auto* wi = Win(win); if (!wi) return -1;
+    auto* p = W(w); if (!p) return -1;
+    float cx, cy;
+    if (!WidgetCenter(p, cx, cy)) return -1;
+    wi->SimMouseMove(cx, cy);
+    wi->Invalidate();
+    return 0;
+}
+
+UI_API int ui_debug_mouse_move(UiWindow win, float x, float y) {
+    auto* wi = Win(win); if (!wi) return -1;
+    wi->SimMouseMove(x, y);
+    wi->Invalidate();
+    return 0;
+}
+UI_API int ui_debug_mouse_down(UiWindow win, float x, float y) {
+    auto* wi = Win(win); if (!wi) return -1;
+    wi->SimMouseDown(x, y);
+    wi->Invalidate();
+    return 0;
+}
+UI_API int ui_debug_mouse_up(UiWindow win, float x, float y) {
+    auto* wi = Win(win); if (!wi) return -1;
+    wi->SimMouseUp(x, y);
+    wi->Invalidate();
+    return 0;
+}
+
+UI_API int ui_debug_drag_to(UiWindow win, float x1, float y1, float x2, float y2) {
+    auto* wi = Win(win); if (!wi) return -1;
+    wi->SimMouseMove(x1, y1);
+    wi->SimMouseDown(x1, y1);
+    // 几步中间插值，给动画 / slider 一些过程值
+    const int steps = 6;
+    for (int i = 1; i < steps; i++) {
+        float t = (float)i / steps;
+        wi->SimMouseMove(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+    }
+    wi->SimMouseMove(x2, y2);
+    wi->SimMouseUp(x2, y2);
+    wi->Invalidate();
+    return 0;
+}
+
+UI_API int ui_debug_drag(UiWindow win, UiWidget w, float dx, float dy) {
+    auto* p = W(w); if (!p) return -1;
+    float cx, cy;
+    if (!WidgetCenter(p, cx, cy)) return -1;
+    return ui_debug_drag_to(win, cx, cy, cx + dx, cy + dy);
+}
+
+UI_API int ui_debug_wheel_at(UiWindow win, float x, float y, float delta) {
+    auto* wi = Win(win); if (!wi) return -1;
+    wi->SimMouseWheel(x, y, delta);
+    wi->Invalidate();
+    return 0;
+}
+
+UI_API int ui_debug_wheel(UiWindow win, UiWidget w, float delta) {
+    auto* p = W(w); if (!p) return -1;
+    float cx, cy;
+    if (!WidgetCenter(p, cx, cy)) return -1;
+    return ui_debug_wheel_at(win, cx, cy, delta);
+}
+
+// ---- Focus / Keyboard ----
+
+UI_API int ui_debug_focus(UiWindow win, UiWidget w) {
+    auto* wi = Win(win); if (!wi) return -1;
+    auto* p = W(w); if (!p) return -1;
+    wi->SetFocus(p);
+    wi->Invalidate();
+    return 0;
+}
+
+UI_API int ui_debug_blur(UiWindow win) {
+    auto* wi = Win(win); if (!wi) return -1;
+    wi->ClearFocus();
+    wi->Invalidate();
+    return 0;
+}
+
+UI_API int ui_debug_key(UiWindow win, int vk) {
+    auto* wi = Win(win); if (!wi) return -1;
+    wi->SimKeyDown(vk);
+    return 0;
+}
+
+UI_API int ui_debug_type_char(UiWindow win, unsigned int ch) {
+    auto* wi = Win(win); if (!wi) return -1;
+    wi->SimKeyChar((wchar_t)ch);
+    return 0;
+}
+
+UI_API int ui_debug_type_text(UiWindow win, const wchar_t* text) {
+    auto* wi = Win(win); if (!wi || !text) return -1;
+    for (const wchar_t* p = text; *p; p++) {
+        wi->SimKeyChar(*p);
+    }
+    wi->Invalidate();
+    return 0;
+}
+
+// ---- 高层控件操作 ----
+
+static void FireValueChanged(ui::Widget* p, bool v) {
+    if (p && p->onValueChanged) p->onValueChanged(v);
+}
+
+UI_API int ui_debug_checkbox_set(UiWindow win, UiWidget w, int checked) {
+    auto* cb = As<ui::CheckBoxWidget>(w); if (!cb) return -1;
+    cb->SetChecked(checked != 0);
+    FireValueChanged(cb, checked != 0);
+    auto* wi = Win(win); if (wi) wi->Invalidate();
+    return 0;
+}
+UI_API int ui_debug_checkbox_toggle(UiWindow win, UiWidget w) {
+    auto* cb = As<ui::CheckBoxWidget>(w); if (!cb) return -1;
+    return ui_debug_checkbox_set(win, w, cb->Checked() ? 0 : 1);
+}
+
+UI_API int ui_debug_toggle_set(UiWindow win, UiWidget w, int on) {
+    auto* tg = As<ui::ToggleWidget>(w); if (!tg) return -1;
+    tg->SetOn(on != 0);
+    FireValueChanged(tg, on != 0);
+    auto* wi = Win(win); if (wi) wi->Invalidate();
+    return 0;
+}
+
+UI_API int ui_debug_radio_select(UiWindow win, UiWidget w) {
+    auto* rb = As<ui::RadioButtonWidget>(w); if (!rb) return -1;
+    rb->SetSelected(true);
+    FireValueChanged(rb, true);
+    auto* wi = Win(win); if (wi) wi->Invalidate();
+    return 0;
+}
+
+UI_API int ui_debug_combo_select(UiWindow win, UiWidget w, int index) {
+    auto* combo = As<ui::ComboBoxWidget>(w); if (!combo) return -1;
+    if (index < 0 || index >= combo->ItemCount()) return -1;
+    combo->SetSelectedIndex(index);
+    if (combo->onSelectionChanged) combo->onSelectionChanged(index);
+    combo->Close();
+    auto* wi = Win(win); if (wi) wi->Invalidate();
+    return 0;
+}
+
+UI_API int ui_debug_combo_open(UiWidget w) {
+    // 直接合成一次 click 效果：通过 SimMouseDown 走正常路径会更贴近真实，
+    // 但这里只需要 open_ 状态。最简单是提供一个专门的 API —— 但 open_ 是 private。
+    // 回退方案：走 widget 事件路径 OnMouseDown。
+    auto* combo = As<ui::ComboBoxWidget>(w); if (!combo) return -1;
+    if (combo->IsOpen()) return 0;
+    ui::MouseEvent e{(combo->rect.left + combo->rect.right) * 0.5f,
+                     (combo->rect.top + combo->rect.bottom) * 0.5f, 0, true};
+    combo->OnMouseDown(e);
+    return 0;
+}
+
+UI_API int ui_debug_combo_close(UiWidget w) {
+    auto* combo = As<ui::ComboBoxWidget>(w); if (!combo) return -1;
+    combo->Close();
+    return 0;
+}
+
+UI_API int ui_debug_slider_set(UiWindow win, UiWidget w, float value) {
+    auto* sl = As<ui::SliderWidget>(w); if (!sl) return -1;
+    sl->SetValue(value);
+    if (sl->onFloatChanged) sl->onFloatChanged(sl->Value());
+    auto* wi = Win(win); if (wi) wi->Invalidate();
+    return 0;
+}
+
+UI_API int ui_debug_number_set(UiWindow win, UiWidget w, float value) {
+    auto* nb = As<ui::NumberBoxWidget>(w); if (!nb) return -1;
+    nb->SetValue(value);
+    if (nb->onFloatChanged) nb->onFloatChanged(nb->Value());
+    auto* wi = Win(win); if (wi) wi->Invalidate();
+    return 0;
+}
+
+UI_API int ui_debug_tab_set(UiWidget w, int index) {
+    auto* tc = As<ui::TabControlWidget>(w); if (!tc) return -1;
+    tc->SetActiveIndex(index);
+    return 0;
+}
+
+UI_API int ui_debug_expander_set(UiWidget w, int expanded) {
+    auto* ex = As<ui::ExpanderWidget>(w); if (!ex) return -1;
+    ex->SetExpanded(expanded != 0);
+    if (ex->onExpandedChanged) ex->onExpandedChanged(expanded != 0);
+    return 0;
+}
+
+UI_API int ui_debug_splitview_set(UiWidget w, int open) {
+    auto* sv = As<ui::SplitViewWidget>(w); if (!sv) return -1;
+    sv->SetPaneOpen(open != 0);
+    if (sv->onPaneChanged) sv->onPaneChanged(open != 0);
+    return 0;
+}
+
+UI_API int ui_debug_flyout_show(UiWidget flyout, UiWidget anchor) {
+    auto* fw = As<ui::FlyoutWidget>(flyout); if (!fw) return -1;
+    auto* a  = W(anchor); if (!a) return -1;
+    fw->Show(a);
+    return 0;
+}
+
+UI_API int ui_debug_flyout_hide(UiWidget flyout) {
+    auto* fw = As<ui::FlyoutWidget>(flyout); if (!fw) return -1;
+    fw->Hide();
+    return 0;
+}
+
+UI_API int ui_debug_text_set(UiWidget w, const wchar_t* text) {
+    if (!text) return -1;
+    if (auto* ti = As<ui::TextInputWidget>(w)) { ti->SetText(text); return 0; }
+    if (auto* ta = As<ui::TextAreaWidget>(w))  { ta->SetText(text); return 0; }
+    if (auto* lbl = As<ui::LabelWidget>(w))    { lbl->SetText(text); return 0; }
+    return -1;
+}
+
+UI_API int ui_debug_scroll_set(UiWidget w, float y) {
+    auto* sv = As<ui::ScrollViewWidget>(w); if (!sv) return -1;
+    sv->SetScrollY(y);
+    sv->DoLayout();
+    return 0;
+}
+
+// ---- Context menu ----
+
+UI_API int ui_debug_menu_is_open(UiWindow win) {
+    auto* wi = Win(win); if (!wi) return 0;
+    auto m = wi->ActiveMenu();
+    return (m && m->IsVisible()) ? 1 : 0;
+}
+
+UI_API int ui_debug_menu_item_count(UiWindow win) {
+    auto* wi = Win(win); if (!wi) return -1;
+    auto m = wi->ActiveMenu(); if (!m) return -1;
+    return m->ItemCount();
+}
+
+UI_API int ui_debug_menu_click_index(UiWindow win, int index) {
+    auto* wi = Win(win); if (!wi) return -1;
+    auto m = wi->ActiveMenu(); if (!m) return -1;
+    return m->SimulateClickIndex(index) ? 0 : -1;
+}
+
+UI_API int ui_debug_menu_click_id(UiWindow win, int item_id) {
+    auto* wi = Win(win); if (!wi) return -1;
+    auto m = wi->ActiveMenu(); if (!m) return -1;
+    int idx = m->FindIndexById(item_id);
+    if (idx < 0) return -1;
+    return m->SimulateClickIndex(idx) ? 0 : -1;
+}
+
+UI_API int ui_debug_menu_close(UiWindow win) {
+    auto* wi = Win(win); if (!wi) return -1;
+    wi->CloseMenu();
+    return 0;
+}
+
+UI_API int ui_debug_menu_item_count_at(UiWindow win, const int* path, int depth) {
+    auto* wi = Win(win); if (!wi) return -1;
+    auto m = wi->ActiveMenu(); if (!m) return -1;
+    return m->ItemCountAtPath(path, depth);
+}
+
+UI_API int ui_debug_menu_item_id_at(UiWindow win, const int* path, int depth) {
+    auto* wi = Win(win); if (!wi) return -1;
+    auto m = wi->ActiveMenu(); if (!m) return -1;
+    return m->ItemIdAtPath(path, depth);
+}
+
+UI_API int ui_debug_menu_has_submenu_at(UiWindow win, const int* path, int depth) {
+    auto* wi = Win(win); if (!wi) return 0;
+    auto m = wi->ActiveMenu(); if (!m) return 0;
+    return m->HasSubmenuAtPath(path, depth) ? 1 : 0;
+}
+
+UI_API int ui_debug_menu_click_path(UiWindow win, const int* path, int depth) {
+    auto* wi = Win(win); if (!wi) return -1;
+    auto m = wi->ActiveMenu(); if (!m) return -1;
+    return m->SimulateClickPath(path, depth) ? 0 : -1;
+}
+
+UI_API void ui_debug_set_menu_autoclose(int enabled) {
+    // enabled=0 → 抑制自动关闭；=非0 → 恢复默认
+    ui::ContextMenu::g_debugSuppressAutoClose = (enabled == 0);
+}
+
+UI_API void ui_window_invoke_sync(UiWindow win, void (*fn)(void* ud), void* ud) {
+    auto* wi = Win(win); if (!wi || !fn) return;
+    wi->InvokeSync(fn, ud);
+}
+
+// ---- Dialog ----
+
+UI_API int ui_debug_dialog_confirm(UiWindow win) {
+    auto* wi = Win(win); if (!wi) return -1;
+    auto* dlg = wi->activeDialog_; if (!dlg || !dlg->IsActive()) return -1;
+    return dlg->OnKeyDown(VK_RETURN) ? 0 : -1;
+}
+
+UI_API int ui_debug_dialog_cancel(UiWindow win) {
+    auto* wi = Win(win); if (!wi) return -1;
+    auto* dlg = wi->activeDialog_; if (!dlg || !dlg->IsActive()) return -1;
+    return dlg->OnKeyDown(VK_ESCAPE) ? 0 : -1;
+}
+
+// ---- HWND channel (Win32 PostMessage) ----
+
+static HWND WinHwnd(UiWindow win) {
+    auto* wi = Win(win);
+    return wi ? wi->Handle() : nullptr;
+}
+
+static LPARAM PackXY(float x, float y, float dpiScale) {
+    int px = (int)(x * dpiScale);
+    int py = (int)(y * dpiScale);
+    return MAKELPARAM(px & 0xFFFF, py & 0xFFFF);
+}
+
+UI_API int ui_debug_post_click(UiWindow win, float x, float y) {
+    auto* wi = Win(win); if (!wi || !wi->Handle()) return -1;
+    LPARAM lp = PackXY(x, y, wi->DpiScale());
+    PostMessageW(wi->Handle(), WM_LBUTTONDOWN, MK_LBUTTON, lp);
+    PostMessageW(wi->Handle(), WM_LBUTTONUP,   0,          lp);
+    return 0;
+}
+UI_API int ui_debug_post_right_click(UiWindow win, float x, float y) {
+    auto* wi = Win(win); if (!wi || !wi->Handle()) return -1;
+    LPARAM lp = PackXY(x, y, wi->DpiScale());
+    PostMessageW(wi->Handle(), WM_RBUTTONDOWN, MK_RBUTTON, lp);
+    PostMessageW(wi->Handle(), WM_RBUTTONUP,   0,          lp);
+    return 0;
+}
+UI_API int ui_debug_post_mouse_move(UiWindow win, float x, float y) {
+    auto* wi = Win(win); if (!wi || !wi->Handle()) return -1;
+    LPARAM lp = PackXY(x, y, wi->DpiScale());
+    PostMessageW(wi->Handle(), WM_MOUSEMOVE, 0, lp);
+    return 0;
+}
+UI_API int ui_debug_post_key(UiWindow win, int vk) {
+    HWND h = WinHwnd(win); if (!h) return -1;
+    PostMessageW(h, WM_KEYDOWN, (WPARAM)vk, 0);
+    PostMessageW(h, WM_KEYUP,   (WPARAM)vk, 0);
+    return 0;
+}
+UI_API int ui_debug_post_char(UiWindow win, unsigned int ch) {
+    HWND h = WinHwnd(win); if (!h) return -1;
+    PostMessageW(h, WM_CHAR, (WPARAM)ch, 0);
+    return 0;
+}
+
+UI_API int ui_debug_pump(void) {
+    int count = 0;
+    MSG msg{};
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        count++;
+    }
+    return count;
 }
 
 } // extern "C"

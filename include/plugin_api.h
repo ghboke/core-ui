@@ -1,5 +1,5 @@
 /*
- * plugin_api.h — Plugin interface for UI Core host applications
+ * plugin_api.h — Plugin interface for Core UI host applications
  *
  * Each plugin is a DLL that exports plugin_init / plugin_shutdown.
  * The host loads plugins and provides a UiHostAPI for them to use.

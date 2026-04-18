@@ -73,6 +73,7 @@ static const char* widgetTypeName(Widget* w) {
     if (dynamic_cast<SliderWidget*>(w))      return "Slider";
     if (dynamic_cast<ProgressBarWidget*>(w)) return "ProgressBar";
     if (dynamic_cast<ComboBoxWidget*>(w))    return "ComboBox";
+    if (dynamic_cast<NumberBoxWidget*>(w))   return "NumberBox";
     if (dynamic_cast<TextInputWidget*>(w))   return "TextInput";
     if (dynamic_cast<TextAreaWidget*>(w))    return "TextArea";
     if (dynamic_cast<TabControlWidget*>(w))  return "TabControl";
@@ -82,6 +83,10 @@ static const char* widgetTypeName(Widget* w) {
     if (dynamic_cast<OverlayWidget*>(w))     return "Overlay";
     if (dynamic_cast<MenuBarWidget*>(w))     return "MenuBar";
     if (dynamic_cast<SplitterWidget*>(w))    return "Splitter";
+    if (dynamic_cast<ExpanderWidget*>(w))    return "Expander";
+    if (dynamic_cast<FlyoutWidget*>(w))      return "Flyout";
+    if (dynamic_cast<SplitViewWidget*>(w))   return "SplitView";
+    if (dynamic_cast<NavItemWidget*>(w))     return "NavItem";
     if (dynamic_cast<GridWidget*>(w))        return "Grid";
     if (dynamic_cast<StackWidget*>(w))       return "Stack";
     if (dynamic_cast<LabelWidget*>(w))       return "Label";
@@ -181,6 +186,28 @@ static void appendTypeProps(std::ostringstream& ss, Widget* w, int d, Renderer* 
     }
     else if (auto* stk = dynamic_cast<StackWidget*>(w)) {
         ss << ",\n" << ind << "\"activeIndex\": " << stk->ActiveIndex();
+    }
+    else if (auto* fw = dynamic_cast<FlyoutWidget*>(w)) {
+        ss << ",\n" << ind << "\"open\": " << (fw->IsOpen() ? "true" : "false");
+    }
+    else if (auto* ex = dynamic_cast<ExpanderWidget*>(w)) {
+        ss << ",\n" << ind << "\"expanded\": " << (ex->IsExpanded() ? "true" : "false");
+    }
+    else if (auto* spv = dynamic_cast<SplitViewWidget*>(w)) {
+        ss << ",\n" << ind << "\"paneOpen\": " << (spv->IsPaneOpen() ? "true" : "false");
+    }
+    else if (auto* nb = dynamic_cast<NumberBoxWidget*>(w)) {
+        ss << ",\n" << ind << "\"value\": " << jsonFloat(nb->Value());
+    }
+    else if (auto* ti = dynamic_cast<TextInputWidget*>(w)) {
+        ss << ",\n" << ind << "\"text\": " << jsonStr(ti->Text());
+    }
+    else if (auto* ta = dynamic_cast<TextAreaWidget*>(w)) {
+        ss << ",\n" << ind << "\"text\": " << jsonStr(ta->Text());
+    }
+    else if (auto* nav = dynamic_cast<NavItemWidget*>(w)) {
+        ss << ",\n" << ind << "\"text\": " << jsonStr(nav->Text());
+        ss << ",\n" << ind << "\"selected\": " << (nav->IsSelected() ? "true" : "false");
     }
 
     // VBox/HBox gap

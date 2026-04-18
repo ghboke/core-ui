@@ -155,7 +155,7 @@ int main() {
     ui_init();
 
     UiWindowConfig cfg = {
-        .title = L"Hello UI Core",
+        .title = L"Hello Core UI",
         .width = 800, .height = 600
     };
     UiWindow win = ui_window_create(&cfg);

@@ -186,6 +186,34 @@ public:
     std::string debugHighlightId_;
     void SetDebugHighlight(const char* widgetId);
     int  Screenshot(const wchar_t* outPath);
+
+    /* ---- Debug event simulation (DIP coordinates) ---- */
+    /* 这些方法走和真实 Win32 消息一样的路径（命中测试、焦点、下拉、Flyout…）， */
+    /* 用于自动化测试和 pipe 命令；内部会把 DIP 乘以 dpiScale_ 后调用私有 handler。 */
+    void SimMouseMove(float dipX, float dipY);
+    void SimMouseDown(float dipX, float dipY);
+    void SimMouseUp(float dipX, float dipY);
+    void SimMouseWheel(float dipX, float dipY, float delta);
+    void SimRightClick(float dipX, float dipY);
+    void SimKeyDown(int vk);
+    void SimKeyChar(wchar_t ch);
+
+    /* 共用的键盘分发（Tab / 快捷键 / Enter/Space 激活 / 方向键 Slider/Radio / Esc 关 ComboBox）
+       返回 true 表示事件被消费。WM_KEYDOWN 和 SimKeyDown 都走这里。 */
+    bool DispatchKeyDown(int vk);
+
+    /* 在 UI 线程上同步执行 fn(ud)。跨线程调用时内部用 SendMessageW；
+       已在 UI 线程时直接调用。返回前 fn 必已执行完成。 */
+    void InvokeSync(void (*fn)(void* ud), void* ud);
+
+    /* Active context menu popup (nullptr if none open) */
+    ContextMenuPtr ActiveMenu() const { return activeMenu_; }
+
+    /* Focused widget accessor for debug API */
+    Widget* FocusedWidget() const { return focusedWidget_; }
+
+    /* DPI scale for coordinate conversion */
+    float DpiScale() const { return dpiScale_; }
 };
 
 } // namespace ui

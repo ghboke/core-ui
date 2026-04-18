@@ -17,6 +17,8 @@ import {
   PlugConnectedFilled,
   BotRegular,
   BotFilled,
+  BugRegular,
+  BugFilled,
   ChevronDownRegular,
   ChevronRightRegular,
   bundleIcon,
@@ -33,6 +35,7 @@ const AppsIcon = bundleIcon(AppsFilled, AppsRegular);
 const ApiIcon = bundleIcon(PlugConnectedFilled, PlugConnectedRegular);
 const ColorIcon = bundleIcon(ColorFilled, ColorRegular);
 const AiIcon = bundleIcon(BotFilled, BotRegular);
+const DebugIcon = bundleIcon(BugFilled, BugRegular);
 
 const useStyles = makeStyles({
   sidebar: {
@@ -290,6 +293,7 @@ export function Sidebar({ mobile, onNavigate }: SidebarProps) {
       {renderLink("/docs/c-api", t("nav.cApi"), <ApiIcon />)}
       {renderLink("/docs/design-system", t("nav.designSystem"), <ColorIcon />)}
       {renderLink("/docs/ai", t("nav.aiGuide"), <AiIcon />)}
+      {renderLink("/docs/debug", t("nav.debug"), <DebugIcon />)}
     </nav>
   );
 }

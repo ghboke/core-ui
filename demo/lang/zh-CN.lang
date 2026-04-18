@@ -1,5 +1,5 @@
-# UI Core Demo — 简体中文
-app_title=UI Core 演示
+# Core UI Demo — 简体中文
+app_title=Core UI 演示
 app_desc=基于 Direct2D 的 UI 框架，采用 Fluent 2 设计系统，通过 .ui 标记文件构建界面。
 
 # Navigation

@@ -1,6 +1,6 @@
-# UI Core
+# CORE UI
 
-> An 8.4 MB single-DLL Windows desktop UI framework with a pure C API (187+ functions) and a declarative `.ui` markup language. Purpose-built to be driven by LLMs and AI agents: all public types are plain C (uint64_t handles, POD structs), all UI can be described as XML, and a single file (`docs/ai-guide.md`) contains everything an AI needs to generate a complete application.
+> An 8.4 MB single-DLL Windows desktop UI framework with a pure C API (250+ functions) and a declarative `.ui` markup language. Purpose-built to be driven by LLMs and AI agents: all public types are plain C (uint64_t handles, POD structs), all UI can be described as XML, and a single file (`docs/ai-guide.md`) contains everything an AI needs to generate a complete application. Since 1.1.0, a full event-injection API (`ui_debug_*`, 60+ functions) lets agents operate any control without real mouse / keyboard, enabling closed-loop UI generation: emit code → build → click / type / screenshot → self-verify.
 
 Why this matters for AI code generation:
 
@@ -13,6 +13,7 @@ Why this matters for AI code generation:
 ## For AI agents (start here)
 
 - [AI Quick Start (complete cheatsheet)](docs/ai-guide.md): single-file, self-contained guide with the full control list, markup grammar, C API catalog, and 3 complete runnable examples. **Fetch this first.**
+- [Debug & Automation](docs/debug-simulation.md): event-injection API — how an agent can click / type / select menu items / screenshot programmatically to verify its own generated UI.
 - [API Index](UI_CORE_API.md): full list of exported C functions, grouped by module.
 - [C API Reference](docs/c-api.md): parameter-level detail for every function.
 - [Markup Reference](docs/markup.md): `.ui` XML grammar, all tags and attributes.
@@ -37,4 +38,4 @@ Why this matters for AI code generation:
 - Platform: Windows 10 and later (x86_64).
 - Build: CMake 3.20+ with MSVC 2019+ or MinGW-w64 (C++17).
 - License: MIT.
-- Version: 1.0.0.1 (see [VERSION](VERSION)).
+- Version: 1.1.0.2 (see [VERSION](VERSION)).

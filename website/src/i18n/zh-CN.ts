@@ -25,7 +25,7 @@ export default {
 
   // Home - Hero
   "home.badge": "Windows 桌面 UI 框架",
-  "home.title": "用 UI Core 构建精美的原生应用",
+  "home.title": "用 Core UI 构建精美的原生应用",
   "home.subtitle": "Direct2D 硬件加速渲染、Fluent 2 设计系统、29+ 内置控件、声明式 .ui 标记语言和纯 C API — 全部打包在一个 DLL 中。",
   "home.getStarted": "快速开始",
   "home.viewGithub": "在 GitHub 查看",
@@ -37,7 +37,7 @@ export default {
   "home.stats.perMonitor": "逐显示器 V2",
 
   // Home - Features
-  "home.whyTitle": "为什么选择 UI Core？",
+  "home.whyTitle": "为什么选择 Core UI？",
   "home.whySubtitle": "现代化的 Windows 桌面开发方案 — 无臃肿框架，无托管运行时。",
 
   // Home - Code
@@ -60,22 +60,22 @@ export default {
 
   // Getting Started
   "gs.title": "快速开始",
-  "gs.subtitle": "几分钟内构建并集成 UI Core 到你的 Windows 应用中。",
-  "gs.requirements": "UI Core 需要 Windows 10 或更高版本、CMake 3.20+ 以及支持 C++17 的 MSVC 或 MinGW。",
+  "gs.subtitle": "几分钟内构建并集成 Core UI 到你的 Windows 应用中。",
+  "gs.requirements": "Core UI 需要 Windows 10 或更高版本、CMake 3.20+ 以及支持 C++17 的 MSVC 或 MinGW。",
   "gs.buildTitle": "从源码构建",
   "gs.cmakeTitle": "CMake 集成",
-  "gs.cmakeDesc": "在你的 CMake 项目中链接 ui-core：",
+  "gs.cmakeDesc": "在你的 CMake 项目中链接 core-ui：",
   "gs.minimalTitle": "最小示例 — C API",
   "gs.minimalDesc": "使用纯 C API 创建一个包含标签和按钮的窗口。所有 187 个函数使用不透明的 uint64_t 句柄 — 不需要 C++ 头文件。",
   "gs.markupTitle": "声明式方式 — .ui 标记",
   "gs.markupDesc": "用基于 XML 的 .ui 文件构建相同的 UI。支持数据绑定、事件处理、热重载和样式类。",
   "gs.distTitle": "分发方式",
   "gs.distDynamic": "动态（默认）：",
-  "gs.distDynamicDesc": "将 ui-core.dll 与 .exe 一起发布",
+  "gs.distDynamicDesc": "将 core-ui.dll 与 .exe 一起发布",
   "gs.distStatic": "静态：",
   "gs.distStaticDesc": "使用 -DUI_CORE_STATIC=ON 构建单个 .exe，无 DLL 依赖",
   "gs.depsTitle": "系统依赖",
-  "gs.depsDesc": "UI Core 仅依赖 Windows 系统库 — 无需外部运行时：",
+  "gs.depsDesc": "Core UI 仅依赖 Windows 系统库 — 无需外部运行时：",
 
   // Controls
   "controls.title": "控件",
@@ -96,7 +96,7 @@ export default {
 
   // API Reference
   "api.title": "C API 参考",
-  "api.subtitle": "UI Core 导出 {{count}} 个纯 C 函数，按功能分组。所有函数使用不透明 uint64_t 句柄。",
+  "api.subtitle": "Core UI 导出 {{count}} 个纯 C 函数，按功能分组。所有函数使用不透明 uint64_t 句柄。",
   "api.searchPlaceholder": "搜索函数…",
   "api.functions": "个函数",
 
@@ -123,7 +123,7 @@ export default {
 
   // Layout
   "layout.title": "布局系统",
-  "layout.subtitle": "UI Core 提供灵活的布局容器：VBox/HBox（弹性盒）、Grid（网格）、Stack（层叠）、SplitView（导航分栏）、Splitter（可拖拽分割）和 ScrollView（滚动容器）。",
+  "layout.subtitle": "Core UI 提供灵活的布局容器：VBox/HBox（弹性盒）、Grid（网格）、Stack（层叠）、SplitView（导航分栏）、Splitter（可拖拽分割）和 ScrollView（滚动容器）。",
   "layout.flexDesc": "VBox 垂直排列子控件，HBox 水平排列。支持 padding、gap、align（start/center/end/stretch）和 justify 属性。",
   "layout.flexTitle": "弹性扩展",
   "layout.flexExpandDesc": "设置 expand=true 使控件填充父容器剩余空间。多个展开控件平分空间。",
@@ -151,14 +151,50 @@ export default {
 
   // Sidebar
   "nav.aiGuide": "AI 集成指南",
+  "nav.debug": "调试与自动化",
+  "search.page.debug": "调试与自动化",
+
+  // Debug page
+  "debug.title": "调试与自动化",
+  "debug.subtitle": "自 1.1.0 起提供一整套事件注入 API —— 无需真实鼠标键盘即可驱动任意控件，面向自动化测试、AI 代理操作 UI、脚本化回归等场景。",
+  "debug.tip": "所有 ui_debug_* 函数返回 0 成功，非 0 失败。坐标参数均为 DIP（逻辑像素）。内部通路是同步的，会触发和真实事件一样的回调；HWND 通路通过 PostMessage 异步，需要 pump。",
+  "debug.channelsTitle": "三条通道",
+  "debug.channelsDesc": "按需选用，三者最终都作用于同一棵 widget 树：",
+  "debug.channelInternal": "Internal ui_debug_*:",
+  "debug.channelInternalDesc": "同步执行，触发 onClick / onValueChanged 等回调，推荐进程内测试使用。",
+  "debug.channelHwnd": "HWND ui_debug_post_*:",
+  "debug.channelHwndDesc": "通过 Win32 PostMessage 异步注入，走和真实用户一样的路径，包含 SetCursor / capture / tooltip 计时器等全部副作用。",
+  "debug.channelPipe": "Named Pipe \\\\.\\pipe\\ui_core_debug:",
+  "debug.channelPipeDesc": "45+ 条文本命令。PowerShell / Python / 任何能调 named pipe 的语言都能直接驱动。",
+  "debug.cApiTitle": "端到端示例（C）",
+  "debug.cApiDesc": "聚焦输入框、键盘输入、点击提交、右键弹菜单、点子菜单叶子、截图——全代码驱动：",
+  "debug.apiRefTitle": "C API 参考",
+  "debug.mouseGroup": "鼠标",
+  "debug.keyboardGroup": "键盘 / 焦点",
+  "debug.controlGroup": "控件高层操作",
+  "debug.menuGroup": "上下文菜单（支持子菜单路径）",
+  "debug.hwndGroup": "HWND 通道 / 线程工具",
+  "debug.colSig": "函数签名",
+  "debug.colDesc": "说明",
+  "debug.colCmd": "命令",
+  "debug.colExample": "示例",
+  "debug.pipeTitle": "命名管道协议",
+  "debug.pipeDesc": "连接 \\\\.\\pipe\\ui_core_debug，写入一行文本命令，读取一段 JSON 响应。成功返回 {\"ok\":true, ...}，失败返回 {\"error\":\"...\"}。",
+  "debug.threadTitle": "线程安全",
+  "debug.threadDesc": "ui_debug_* 和 widget mutation 必须在 UI 线程上执行。跨线程调用用 ui_window_invoke_sync 做 marshal —— demo 的 pipe 处理器正是这样写的。",
+  "debug.limitsTitle": "已知限制",
+  "debug.limit1": "menu_click_path 不会「可见地」展开子菜单弹窗，只是直接把叶子的 id 回传给 root 菜单的父窗口。",
+  "debug.limit2": "ui_debug_key 注入 Ctrl/Alt 组合快捷键依赖真实修饰键状态（GetKeyState）。需要纯脚本注入时建议直接调用 register_shortcut 绑定的回调。",
+  "debug.limit3": "WM_DROPFILES 文件拖入不在本 API 覆盖范围内，需要用其他拖放自动化方案。",
+  "debug.fullRef": "完整参考:",
 
   // AI Guide
   "ai.title": "AI 集成指南",
-  "ai.subtitle": "本指南面向 AI 编程助手（Claude、GPT、Copilot 等），说明如何调用 UI Core 的 C API 构建界面、调试控件树和验证渲染结果。",
+  "ai.subtitle": "本指南面向 AI 编程助手（Claude、GPT、Copilot 等），说明如何调用 Core UI 的 C API 构建界面、调试控件树和验证渲染结果。",
   "ai.tip": "AI 可以通过 C API 或 .ui 标记两种方式生成 UI。推荐先用 .ui 标记快速原型，再用 C API 精细控制。调试时使用 dump_tree + screenshot 闭环验证。",
 
   "ai.usageTitle": "如何使用",
-  "ai.usageDesc": "下方是完整的 UI Core AI Skill 文件。将它添加到你的 AI 助手知识库中，AI 就能直接调用 UI Core 的 C API 或生成 .ui 标记文件来构建 Windows 桌面应用。",
+  "ai.usageDesc": "下方是完整的 Core UI AI Skill 文件。将它添加到你的 AI 助手知识库中，AI 就能直接调用 Core UI 的 C API 或生成 .ui 标记文件来构建 Windows 桌面应用。",
   "ai.step1": "点击「复制」将全部内容复制到剪贴板，或点击「下载」保存为 .md 文件",
   "ai.step2": "将文件内容粘贴到 AI 助手的系统提示、CLAUDE.md、或项目知识库中",
   "ai.step3": "告诉 AI 你想构建什么界面，它会参考 Skill 文件生成代码",
@@ -167,7 +203,7 @@ export default {
   "ai.lines": "行",
 
   "ai.handleTitle": "核心概念：不透明句柄",
-  "ai.handleDesc": "UI Core 的所有对象（窗口、控件、菜单）都以 uint64_t 句柄表示。AI 不需要理解内部结构，只需要通过句柄调用 API 函数。句柄创建后通过 setter/getter 操作，通过 add_child 组装成树。",
+  "ai.handleDesc": "Core UI 的所有对象（窗口、控件、菜单）都以 uint64_t 句柄表示。AI 不需要理解内部结构，只需要通过句柄调用 API 函数。句柄创建后通过 setter/getter 操作，通过 add_child 组装成树。",
 
   "ai.quickStartTitle": "方式一：C API 生成 UI",
   "ai.quickStartDesc": "AI 可以直接生成包含 ui_core.h 的 C 代码。基本模式：初始化 → 创建窗口 → 构建控件树 → 设置根控件 → 显示窗口 → 进入消息循环。",
@@ -184,7 +220,7 @@ export default {
   "ai.themeTitle": "主题切换",
 
   "ai.debugTitle": "调试 API 总览",
-  "ai.debugDesc": "UI Core 提供 4 个调试函数，AI 可以用它们检查控件树结构、定位布局问题和验证渲染结果。",
+  "ai.debugDesc": "Core UI 提供 4 个调试函数，AI 可以用它们检查控件树结构、定位布局问题和验证渲染结果。",
   "ai.debugTablePurpose": "功能",
   "ai.debugTableUse": "AI 用途",
   "ai.debugDumpTree": "导出完整控件树为 JSON",
@@ -209,7 +245,7 @@ export default {
   "ai.pitfall5": "回调中传递句柄需要 (void*)(uintptr_t) 双重转换",
   "ai.pitfall6": "ui_widget_set_padding() 是四参数（左上右下），单参数用 ui_widget_set_padding_uniform()",
 
-  "ai.summary": "总结：AI 生成代码 → 编译运行 → ui_debug_screenshot 截图 → AI 视觉检查 → ui_debug_dump_tree 结构检查 → 修正并重复。这是 AI 使用 UI Core 的推荐工作流。",
+  "ai.summary": "总结：AI 生成代码 → 编译运行 → ui_debug_screenshot 截图 → AI 视觉检查 → ui_debug_dump_tree 结构检查 → 修正并重复。这是 AI 使用 Core UI 的推荐工作流。",
 
   // Controls i18n - Containers
   "ctrl.VBox.name": "VBox（垂直布局）",
@@ -283,7 +319,7 @@ export default {
 
   // Design System
   "ds.title": "设计系统",
-  "ds.subtitle": "UI Core 实现了 Microsoft 的 Fluent 2 设计 Token — 与 WinUI 3 使用相同的体系。颜色、字体、间距、圆角、阴影和动效均基于 Token。",
+  "ds.subtitle": "Core UI 实现了 Microsoft 的 Fluent 2 设计 Token — 与 WinUI 3 使用相同的体系。颜色、字体、间距、圆角、阴影和动效均基于 Token。",
   "ds.brandColors": "品牌色阶",
   "ds.statusColors": "状态颜色",
   "ds.typography": "字体 — Segoe UI",

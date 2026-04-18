@@ -89,6 +89,7 @@ public:
     std::wstring tooltip;
     std::string i18nKey;        // i18n: @key reference for text translation
     std::string tooltipI18nKey; // i18n: @key reference for tooltip translation
+    std::string titleI18nKey;   // i18n: @key reference for TitleBar title translation
 
     // ---- Declarative transitions ----
     // Parsed from transition="opacity 200ms ease-out"

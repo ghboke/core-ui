@@ -224,7 +224,9 @@ UiColor text    = ui_theme_text();
 UiColor divider = ui_theme_divider();
 ```
 
-## 调试
+## 调试与事件模拟
+
+### Inspector
 
 ```c
 // 导出控件树 JSON
@@ -239,3 +241,35 @@ ui_debug_highlight(win, NULL);           // 清除高亮
 // 截图（保存当前窗口画面为 PNG）
 ui_debug_screenshot(win, L"screenshot.png");  // 成功返回 0
 ```
+
+### 事件模拟（自 1.1.0）
+
+完整的事件注入 API，用于自动化测试 / AI 代理 / 脚本回归。**详见
+[`docs/debug-simulation.md`](./debug-simulation.md)**。
+
+```c
+// 鼠标 / 键盘
+ui_debug_click(win, btn);                         // 完整 MouseDown+Up，触发 onClick
+ui_debug_right_click_at(win, 300, 200);           // 右键弹菜单
+ui_debug_focus(win, inputBox);
+ui_debug_type_text(win, L"hello");                // 逐字符输入
+
+// 控件高层操作
+ui_debug_checkbox_set(win, cb, 1);                // 勾选 + 触发 onValueChanged
+ui_debug_combo_select(win, combo, 2);             // 选中第 3 项
+ui_debug_slider_set(win, slider, 0.75f);
+
+// Context menu（含子菜单路径）
+int path[] = {2, 0};                              // "Paste Special" -> "Paste as Plain"
+ui_debug_menu_click_path(win, path, 2);
+
+// HWND 通道（走 Win32 消息循环）
+ui_debug_post_click(win, 100, 100);
+ui_debug_pump();                                  // 处理消息队列
+
+// 线程安全：工作线程里访问 widget 前先 marshal 到 UI 线程
+ui_window_invoke_sync(win, my_fn, userdata);
+```
+
+共 60+ 个 `ui_debug_*` 函数。demo 还内置了 `\\.\pipe\ui_core_debug` 命名管道，
+用 PowerShell / Python 一行就能驱动，参考 `scripts/debug-smoke.ps1`。

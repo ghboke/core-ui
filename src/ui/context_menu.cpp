@@ -27,6 +27,7 @@ static inline UINT GetDpiForWindow(HWND hwnd) {
 namespace ui {
 
 bool ContextMenu::popupClassRegistered_ = false;
+bool ContextMenu::g_debugSuppressAutoClose = false;
 
 // ---- Build ----
 
@@ -123,6 +124,109 @@ void ContextMenu::Close() {
     }
     openSubmenuIndex_ = -1;
     DestroyPopupWindow();
+}
+
+// ---- Debug / simulation accessors ----
+
+int ContextMenu::ItemIdAt(int index) const {
+    if (index < 0 || index >= (int)items_.size()) return -1;
+    if (items_[index].isSeparator) return -1;
+    return items_[index].id;
+}
+
+bool ContextMenu::ItemEnabled(int index) const {
+    if (index < 0 || index >= (int)items_.size()) return false;
+    return items_[index].enabled && !items_[index].isSeparator;
+}
+
+bool ContextMenu::ItemIsSeparator(int index) const {
+    if (index < 0 || index >= (int)items_.size()) return false;
+    return items_[index].isSeparator;
+}
+
+int ContextMenu::FindIndexById(int id) const {
+    for (int i = 0; i < (int)items_.size(); i++) {
+        if (!items_[i].isSeparator && items_[i].id == id) return i;
+    }
+    return -1;
+}
+
+bool ContextMenu::SimulateClickIndex(int index) {
+    if (index < 0 || index >= (int)items_.size()) return false;
+    const MenuItem& it = items_[index];
+    if (it.isSeparator || !it.enabled) return false;
+    clickedId_ = it.id;
+    // 复刻 PopupWndProc 里 WM_LBUTTONUP 的分派路径：把 item id 回传给父窗口
+    if (parentHwnd_) {
+        PostMessageW(parentHwnd_, WM_APP + 100, (WPARAM)it.id, 0);
+    }
+    Close();
+    return true;
+}
+
+ContextMenuPtr ContextMenu::SubmenuAt(int index) const {
+    if (index < 0 || index >= (int)items_.size()) return nullptr;
+    return items_[index].submenu;
+}
+
+// 沿 path 前 depth-1 层走到内层菜单；若路径在中途断裂返回 nullptr。
+// 最后一层不要求是 submenu —— 调用方根据需要自行处理叶子。
+static const ContextMenu* WalkPath(const ContextMenu* root, const int* path, int depth) {
+    if (depth < 0 || (!path && depth > 0)) return nullptr;
+    const ContextMenu* cur = root;
+    for (int i = 0; i < depth - 1; i++) {
+        if (!cur) return nullptr;
+        int idx = path[i];
+        auto sub = cur->SubmenuAt(idx);
+        if (!sub) return nullptr;
+        if (!cur->ItemEnabled(idx)) return nullptr;
+        cur = sub.get();
+    }
+    return cur;
+}
+
+int ContextMenu::ItemCountAtPath(const int* path, int depth) const {
+    const ContextMenu* m = WalkPath(this, path, depth + 1);
+    // 当 depth==0，要返回自身 count；WalkPath(root, path, 1) 走 0 圈后返回自身。OK。
+    return m ? m->ItemCount() : -1;
+}
+
+int ContextMenu::ItemIdAtPath(const int* path, int depth) const {
+    if (depth < 1) return -1;
+    const ContextMenu* m = WalkPath(this, path, depth);
+    if (!m) return -1;
+    return m->ItemIdAt(path[depth - 1]);
+}
+
+bool ContextMenu::HasSubmenuAtPath(const int* path, int depth) const {
+    if (depth < 1) return false;
+    const ContextMenu* m = WalkPath(this, path, depth);
+    if (!m) return false;
+    return m->SubmenuAt(path[depth - 1]) != nullptr;
+}
+
+bool ContextMenu::SimulateClickPath(const int* path, int depth) {
+    if (depth < 1 || !path) return false;
+    // 先一路把 path 走到叶子所在的菜单层。
+    ContextMenu* cur = this;
+    for (int i = 0; i < depth - 1; i++) {
+        int idx = path[i];
+        if (idx < 0 || idx >= (int)cur->items_.size()) return false;
+        const MenuItem& it = cur->items_[idx];
+        if (it.isSeparator || !it.enabled || !it.submenu) return false;
+        cur = it.submenu.get();
+    }
+    int leafIdx = path[depth - 1];
+    if (leafIdx < 0 || leafIdx >= (int)cur->items_.size()) return false;
+    const MenuItem& leaf = cur->items_[leafIdx];
+    if (leaf.isSeparator || !leaf.enabled) return false;
+    cur->clickedId_ = leaf.id;
+    // 回传给 ROOT 菜单的 parentHwnd（主窗口）。
+    if (parentHwnd_) {
+        PostMessageW(parentHwnd_, WM_APP + 100, (WPARAM)leaf.id, 0);
+    }
+    Close();
+    return true;
 }
 
 // ---- Popup Window ----
@@ -271,6 +375,7 @@ LRESULT CALLBACK ContextMenu::PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
     case WM_TIMER:
         // Poll: if mouse is pressed outside menu, close it
         if (wParam == 1) {
+            if (g_debugSuppressAutoClose) return 0;  // 测试模式：不做自动关闭检查
             if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) {
                 POINT pt;
                 GetCursorPos(&pt);

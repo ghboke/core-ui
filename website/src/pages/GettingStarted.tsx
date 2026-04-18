@@ -47,7 +47,7 @@ cd core-ui
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 
-# Output: build/Release/ui-core.dll + ui-core.lib`;
+# Output: build/Release/core-ui.dll + core-ui.lib`;
 
 const minimalExample = `#include "ui_core.h"
 
@@ -71,7 +71,7 @@ int main() {
     ui_widget_set_padding(root, 24);
     ui_widget_set_gap(root, 16);
 
-    UiWidget title = ui_label(L"Welcome to UI Core");
+    UiWidget title = ui_label(L"Welcome to Core UI");
     ui_label_set_font_size(title, 28);
     ui_label_set_bold(title, true);
     ui_widget_add_child(root, title);
@@ -87,7 +87,7 @@ int main() {
 
 const markupWay = `<!-- app.ui -->
 <VBox padding="24" gap="16">
-  <Label text="Welcome to UI Core"
+  <Label text="Welcome to Core UI"
          fontSize="28"
          bold="true" />
 
@@ -102,10 +102,10 @@ const markupWay = `<!-- app.ui -->
 </VBox>`;
 
 const cmakeIntegration = `# CMakeLists.txt
-find_package(ui-core REQUIRED)
+find_package(core-ui REQUIRED)
 
 add_executable(myapp main.cpp)
-target_link_libraries(myapp PRIVATE ui-core::ui-core)`;
+target_link_libraries(myapp PRIVATE core-ui::core-ui)`;
 
 export function GettingStarted() {
   const styles = useStyles();

@@ -742,7 +742,7 @@ public:
     // Callbacks
     std::function<void(float zoom, float panX, float panY)> onViewportChanged;
 
-    /* mouse down/move 钩子：返回 true 吞掉事件（mouse_move 钩子吞事件时 ui-core
+    /* mouse down/move 钩子：返回 true 吞掉事件（mouse_move 钩子吞事件时 core-ui
      * 会同时结束 pan 状态，用于 pan 中途切换到"拖出"等流程）。 */
     std::function<bool(float x, float y, int btn)> onMouseDownHook;
     std::function<bool(float x, float y)>          onMouseMoveHook;

@@ -1,4 +1,4 @@
-<ui version="1" width="1060" height="700" resizable="true" title="UI Core Demo">
+<ui version="1" width="1060" height="700" resizable="true" title="Core UI Demo">
   <style>
     .pageTitle    { fontSize: 28; bold: true; }
     .pageDesc     { fontSize: 14; }
@@ -11,7 +11,7 @@
   </style>
 
   <VBox gap="0" expand="true">
-    <TitleBar title="UI Core Demo" />
+    <TitleBar title="Core UI Demo" />
 
     <SplitView id="mainSplit" mode="compactInline" openPaneLength="220" compactPaneLength="48" open="true" expand="true">
 
@@ -313,7 +313,7 @@
             </HBox>
             <Spacer size="12" />
             <Label text="@settings_about" class="section" />
-            <Label text="UI Core Demo" />
+            <Label text="Core UI Demo" />
             <Label text="@settings_about_desc" class="caption" />
             <Label text="@settings_about_tech" class="caption" />
           </VBox>
