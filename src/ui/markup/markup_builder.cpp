@@ -152,6 +152,7 @@ std::vector<std::wstring> SplitItems(const std::string& s) {
 static const char* kKnownAttrs[] = {
     "id", "width", "height", "minWidth", "minHeight", "maxWidth", "maxHeight",
     "expand", "flex", "padding", "margin", "visible", "if", "enabled", "hitTransparent", "hit-transparent",
+    "dragWindow", "drag-window",
     "focusable", "tabIndex", "tabStop", "colspan", "rowspan", "bgColor",
     "tooltip", "onClick", "onChanged", "onTextChanged", "class", "opacity",
     // Controls
@@ -568,6 +569,9 @@ void ApplyCommonAttrs(Widget* w, const std::map<std::string, std::string>& attrs
         }
         else if (key == "hitTransparent" || key == "hit-transparent") {
             w->hitTransparent = ParseBool(val);
+        }
+        else if (key == "dragWindow" || key == "drag-window") {
+            w->dragWindow = ParseBool(val);
         }
         else if (key == "readOnly") {
             if (auto* ti = dynamic_cast<TextInputWidget*>(w)) ti->readOnly = ParseBool(val);

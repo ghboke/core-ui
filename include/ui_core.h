@@ -558,6 +558,58 @@ UI_API void  ui_debug_set_menu_autoclose(int enabled);
    用，保证 widget 访问不跨线程产生数据竞争。 */
 UI_API void  ui_window_invoke_sync(UiWindow win, void (*fn)(void* ud), void* ud);
 
+/* ------------------------------------------------------------------ */
+/* Frameless canvas mode —— 无边框画布 (since 1.2.0)                  */
+/* ------------------------------------------------------------------ */
+/* 覆盖窗口最小尺寸（DIP）。传 0 恢复默认（theme::kMinWidth/kMinHeight，480×360）。
+   用于无边框画布等场景：窗口随 widget 尺寸动态缩放，需要小于主题默认最小尺寸。 */
+UI_API void  ui_window_set_min_size(UiWindow win, int w_dip, int h_dip);
+
+/* 窗口背景擦除模式：
+     0 = 主题背景色填充（默认，普通窗口）
+     1 = 透明 / 不擦背景（画布模式：widget 自己画满客户区，
+         避免 SetWindowPos 扩大窗口时的背景色闪烁）
+   mode=1 要求 widget 覆盖整个客户区，否则会看到前一帧残留像素。 */
+UI_API void  ui_window_set_background_mode(UiWindow win, int mode);
+
+/* 标记 widget 为"点击即拖动窗口"：命中该 widget 时 WM_NCHITTEST 返回 HTCAPTION，
+   交给系统做窗口拖动。HitTest 返回的是最深层子节点，所以 Panel 里面的 Button
+   等控件不会被这个标记波及（除非它们自己也标了 dragWindow）。
+   典型用法：无边框画布模式给根 Panel 打上这个标，让整个画布都能拖窗口。 */
+UI_API void  ui_widget_set_drag_window(UiWidget w, int enable);
+
+/* ---- 窗口几何（DIP-native） ---- */
+/* x / y 是屏幕物理像素（Win32 惯例）；w_dip / h_dip 是 DIP（按当前 DPI 换算）。
+   每次调用都会触发一次同步重绘（InvalidateRect + UpdateWindow），配合
+   ui_window_set_background_mode(win, 1) 能把扩大窗口时的背景闪减到最小。 */
+UI_API void  ui_window_set_rect(UiWindow win, int x_screen, int y_screen,
+                                 int w_dip, int h_dip);
+UI_API void  ui_window_set_size(UiWindow win, int w_dip, int h_dip);
+UI_API void  ui_window_set_position(UiWindow win, int x_screen, int y_screen);
+UI_API void  ui_window_get_rect_screen(UiWindow win,
+                                        int* out_x, int* out_y,
+                                        int* out_w_dip, int* out_h_dip);
+
+/* 滚轮缩放"光标不动"原语：resize 到 (w_dip, h_dip)，
+   并把新客户区里的 (client_x_dip, client_y_dip) 对齐到屏幕 (screen_x, screen_y)。
+   典型调用：滚轮回调中已知鼠标在屏幕 (sx, sy)、在旧客户区(cx, cy)，
+   缩放比变为 z'/z 后，新客户区中同一图像点位于 (cx * z'/z, cy * z'/z)，
+   传这个点 + 屏幕鼠标坐标，窗口会自动移动使该点保持在鼠标下。
+   注意：仅无边框窗口（system_frame=0）结果准确，有系统边框时 client 区
+   与窗口左上角之间还隔着边框 + 标题栏，会偏移。 */
+UI_API void  ui_window_resize_with_anchor(UiWindow win,
+                                           int w_dip, int h_dip,
+                                           float client_x_dip, float client_y_dip,
+                                           int screen_x, int screen_y);
+
+/* 一键进入 / 退出"无边框画布"模式。开启时等同于：
+     - ui_window_set_min_size(win, 32, 32)
+     - ui_window_set_background_mode(win, 1)
+     - 根 widget.dragWindow = true
+     - 如果根树里有 TitleBar，visible=false
+   关闭时反之。要求窗口在 ui_window_create 时就用 system_frame=0 创建无边框。 */
+UI_API void  ui_window_enable_canvas_mode(UiWindow win, int enable);
+
 /* ---- Dialog / Toast ---- */
 UI_API int   ui_debug_dialog_confirm(UiWindow win);
 UI_API int   ui_debug_dialog_cancel(UiWindow win);

@@ -76,6 +76,7 @@ public:
     // ---- State ----
     bool visible = true;
     bool hitTransparent = false;  /* true 时 HitTest 只看子不返回自身，让事件穿透到下层 */
+    bool dragWindow = false;      /* true 时命中该 widget 触发窗口拖动（WM_NCHITTEST → HTCAPTION） */
     bool enabled = true;
     bool hovered = false;
     bool pressed = false;

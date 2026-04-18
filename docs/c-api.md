@@ -273,3 +273,63 @@ ui_window_invoke_sync(win, my_fn, userdata);
 
 共 60+ 个 `ui_debug_*` 函数。demo 还内置了 `\\.\pipe\ui_core_debug` 命名管道，
 用 PowerShell / Python 一行就能驱动，参考 `scripts/debug-smoke.ps1`。
+
+## 无边框画布模式（自 1.2.0）
+
+用于"整个窗口就是一张画布 + 滚轮缩放 + 按住拖动窗口"类场景：
+
+```c
+/* 1. 创建无边框窗口 */
+UiWindowConfig cfg = {0};
+cfg.system_frame = 0;
+cfg.resizable    = 1;
+cfg.width = 512; cfg.height = 512;
+cfg.title = L"Canvas";
+UiWindow win = ui_window_create(&cfg);
+
+/* 2. 根 widget 用 ImageView（或你自己的 CustomWidget） */
+UiWidget canvas = ui_image_view();
+ui_image_load_file(canvas, win, L"photo.png");
+ui_window_set_root(win, canvas);
+
+/* 3. 一键进入画布模式（=设 min_size=32、bg_mode=1、根.dragWindow=true、
+      隐藏 TitleBar 如有） */
+ui_window_enable_canvas_mode(win, 1);
+ui_window_show(win);
+
+/* 4. 滚轮回调里"光标不动"缩放：
+      用 ui_window_resize_with_anchor 同时改窗口尺寸 + 移动位置，
+      使客户区里的 (new_cx, new_cy) 恰好落在屏幕 (screen_x, screen_y)。 */
+void on_wheel(UiWindow win, float wheel_x, float wheel_y, float delta) {
+    float zoom = ui_image_get_zoom(canvas);
+    float ratio = delta > 0 ? 1.1f : 1.0f / 1.1f;
+    float new_zoom = zoom * ratio;
+    ui_image_set_zoom(canvas, new_zoom);
+
+    /* 获取新窗口尺寸 = 图片尺寸 × 新 zoom */
+    int img_w = ui_image_width(canvas);
+    int img_h = ui_image_height(canvas);
+    int new_w = (int)(img_w * new_zoom);
+    int new_h = (int)(img_h * new_zoom);
+
+    /* 鼠标在客户区 (wheel_x, wheel_y)；在屏幕 (sx, sy)；
+       缩放后同一图像点位于 (wheel_x * ratio, wheel_y * ratio)。
+       让该点钉在屏幕 (sx, sy) 不动： */
+    int sx, sy; /* 自行通过 GetCursorPos 或回调拿到屏幕坐标 */
+    ui_window_resize_with_anchor(win, new_w, new_h,
+                                  wheel_x * ratio, wheel_y * ratio,
+                                  sx, sy);
+}
+```
+
+关键 API：
+
+| 函数 | 用途 |
+|------|------|
+| `ui_window_enable_canvas_mode(win, 1)` | 一键进入画布模式 |
+| `ui_window_set_min_size(win, w, h)` | 覆盖主题默认最小尺寸（480×360） |
+| `ui_window_set_background_mode(win, 1)` | 透明 Clear，避免扩窗口时背景闪 |
+| `ui_widget_set_drag_window(w, 1)` | 命中即拖窗 |
+| `ui_window_set_rect(win, x, y, w, h)` | 原子 SetWindowPos + 同步重绘 |
+| `ui_window_resize_with_anchor(...)` | 滚轮缩放时光标锚点不动 |
+| `ui_window_get_rect_screen(win, ...)` | 读窗口几何 |

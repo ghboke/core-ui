@@ -409,6 +409,86 @@ void UiWindowImpl::Invalidate() {
     if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+// ---- 窗口几何（DIP-native） ----
+
+void UiWindowImpl::SetWindowRect(int xScreen, int yScreen, int wDip, int hDip) {
+    if (!hwnd_) return;
+    int pw = (int)(wDip * dpiScale_);
+    int ph = (int)(hDip * dpiScale_);
+    /* SetWindowPos 之后强制立刻重绘。对画布模式（bgMode=1）很关键 —— 扩大窗口
+     * 时新暴露区域没有 Clear 介入，如果不主动 UpdateWindow 一把，那段时间会看到
+     * 前一帧甚至系统默认色的残留。SWP_NOCOPYBITS 防止 Windows 把旧客户区内容
+     * 整块位移，强迫全量重绘。 */
+    SetWindowPos(hwnd_, nullptr, xScreen, yScreen, pw, ph,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    UpdateWindow(hwnd_);
+}
+
+void UiWindowImpl::SetWindowSize(int wDip, int hDip) {
+    if (!hwnd_) return;
+    RECT r; GetWindowRect(hwnd_, &r);
+    SetWindowRect(r.left, r.top, wDip, hDip);
+}
+
+void UiWindowImpl::SetWindowPosition(int xScreen, int yScreen) {
+    if (!hwnd_) return;
+    /* 只移动不改尺寸 */
+    SetWindowPos(hwnd_, nullptr, xScreen, yScreen, 0, 0,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+}
+
+void UiWindowImpl::GetWindowRectScreen(int* x, int* y, int* wDip, int* hDip) const {
+    if (!hwnd_) return;
+    RECT r; GetWindowRect(hwnd_, &r);
+    if (x) *x = r.left;
+    if (y) *y = r.top;
+    if (wDip) *wDip = (int)((r.right - r.left) / dpiScale_);
+    if (hDip) *hDip = (int)((r.bottom - r.top) / dpiScale_);
+}
+
+void UiWindowImpl::ResizeWithAnchor(int wDip, int hDip,
+                                     float anchorClientXDip, float anchorClientYDip,
+                                     int anchorScreenX, int anchorScreenY) {
+    /* 要让 client(acx, acy) 落在屏幕 (sx, sy)：
+     *   new_window_left = sx - acx * dpiScale
+     *   new_window_top  = sy - acy * dpiScale
+     * 注意：这里假设无边框或 client-area 覆盖整个窗口（画布模式成立）。
+     * 有系统边框的窗口 client 区相对窗口偏移一个标题栏 + 边框，不适用此 API。 */
+    int newLeft = anchorScreenX - (int)(anchorClientXDip * dpiScale_);
+    int newTop  = anchorScreenY - (int)(anchorClientYDip * dpiScale_);
+    SetWindowRect(newLeft, newTop, wDip, hDip);
+}
+
+void UiWindowImpl::EnableCanvasMode(bool enable) {
+    if (enable) {
+        SetMinSize(32, 32);
+        SetBackgroundMode(1);
+        if (root_) root_->dragWindow = true;
+        /* 隐藏根下第一个 TitleBar（如果有） */
+        std::function<bool(Widget*)> hideTitleBar = [&](Widget* w) -> bool {
+            if (!w) return false;
+            if (dynamic_cast<TitleBarWidget*>(w)) { w->visible = false; return true; }
+            for (auto& c : w->Children()) if (hideTitleBar(c.get())) return true;
+            return false;
+        };
+        if (root_) hideTitleBar(root_.get());
+    } else {
+        SetMinSize(0, 0);
+        SetBackgroundMode(0);
+        if (root_) root_->dragWindow = false;
+        /* 恢复 TitleBar visible */
+        std::function<void(Widget*)> showTitleBar = [&](Widget* w) {
+            if (!w) return;
+            if (dynamic_cast<TitleBarWidget*>(w)) { w->visible = true; return; }
+            for (auto& c : w->Children()) showTitleBar(c.get());
+        };
+        if (root_) showTitleBar(root_.get());
+    }
+    if (root_) LayoutRoot();
+    Invalidate();
+}
+
 static void UpdateMaxButtonIcon(Widget* w, bool maximized) {
     if (!w) return;
     auto* tb = dynamic_cast<TitleBarWidget*>(w);
@@ -1051,7 +1131,13 @@ void UiWindowImpl::OnPaint() {
 
     // 正常绘制
     renderer_.BeginDraw();
-    renderer_.Clear(theme::kWindowBg());
+    if (bgMode_ == 0) {
+        renderer_.Clear(theme::kWindowBg());
+    } else {
+        /* 无背景擦除模式：透明清空，依赖 widget 自己画满整个客户区。
+         * SetWindowPos 扩大窗口时不会闪主题色。 */
+        renderer_.Clear({0, 0, 0, 0});
+    }
 
     if (root_) {
         Viewport() = root_->rect;
@@ -1217,7 +1303,11 @@ void UiWindowImpl::CreateDragCache() {
 
     // 绘制窗口内容到兼容渲染目标
     cacheCtx->BeginDraw();
-    cacheCtx->Clear(theme::kWindowBg());
+    if (bgMode_ == 0) {
+        cacheCtx->Clear(theme::kWindowBg());
+    } else {
+        cacheCtx->Clear(D2D1::ColorF(0, 0, 0, 0));
+    }
 
     if (root_) {
         D2D1_RECT_F originalViewport = Viewport();
@@ -1765,6 +1855,11 @@ LRESULT UiWindowImpl::OnNcHitTest(int sx, int sy) {
         auto* hit = root_->HitTest(x, y);
         if (hit && hit != root_.get()) {
             if (dynamic_cast<TitleBarWidget*>(hit)) return HTCAPTION;
+            /* dragWindow 属性：任意 widget 都能标记为"点击即拖动窗口"，
+             * 无边框画布模式下可以给根 Panel 打上这个标让整个画布可拖。
+             * 注意 HitTest 返回的是最深层子节点，所以内部的 Button 等
+             * 交互控件不会被波及（除非它们自己也标了 dragWindow）。 */
+            if (hit->dragWindow) return HTCAPTION;
             return HTCLIENT;
         }
     }
@@ -1775,8 +1870,18 @@ LRESULT UiWindowImpl::OnNcHitTest(int sx, int sy) {
 }
 
 void UiWindowImpl::OnGetMinMaxInfo(MINMAXINFO* mmi) {
-    int minW = (configWidth_ > 0 && configWidth_ < theme::kMinWidth) ? configWidth_ : theme::kMinWidth;
-    int minH = (configHeight_ > 0 && configHeight_ < theme::kMinHeight) ? configHeight_ : theme::kMinHeight;
+    int minW, minH;
+    if (minWOverride_ > 0) {
+        /* 用户显式覆盖（无边框画布等场景，可以小于主题默认） */
+        minW = minWOverride_;
+    } else {
+        minW = (configWidth_ > 0 && configWidth_ < theme::kMinWidth) ? configWidth_ : theme::kMinWidth;
+    }
+    if (minHOverride_ > 0) {
+        minH = minHOverride_;
+    } else {
+        minH = (configHeight_ > 0 && configHeight_ < theme::kMinHeight) ? configHeight_ : theme::kMinHeight;
+    }
     mmi->ptMinTrackSize.x = (LONG)(minW * dpiScale_);
     mmi->ptMinTrackSize.y = (LONG)(minH * dpiScale_);
 

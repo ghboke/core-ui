@@ -38,4 +38,4 @@ Why this matters for AI code generation:
 - Platform: Windows 10 and later (x86_64).
 - Build: CMake 3.20+ with MSVC 2019+ or MinGW-w64 (C++17).
 - License: MIT.
-- Version: 1.1.0.2 (see [VERSION](VERSION)).
+- Version: 1.2.0.3 (see [VERSION](VERSION)).

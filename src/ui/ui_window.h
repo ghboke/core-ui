@@ -120,6 +120,12 @@ private:
     bool        toolWindow_ = false;
     bool        maximized_ = false;
     int         configWidth_ = 0, configHeight_ = 0;
+    /* 用户覆盖的最小窗口尺寸（0 = 用 theme::kMin* 默认值）。
+     * 无边框画布模式下可以小于默认。 */
+    int         minWOverride_ = 0, minHOverride_ = 0;
+    /* 背景模式：0=主题色填充（默认），1=透明/不擦背景（widget 自己全覆盖画）。
+     * 无边框画布模式下设 1，避免 SetWindowPos 扩窗口时的背景闪烁。 */
+    int         bgMode_ = 0;
     UINT        dpi_ = 96;
     float       dpiScale_ = 1.0f;
     std::wstring title_;
@@ -205,6 +211,26 @@ public:
     /* 在 UI 线程上同步执行 fn(ud)。跨线程调用时内部用 SendMessageW；
        已在 UI 线程时直接调用。返回前 fn 必已执行完成。 */
     void InvokeSync(void (*fn)(void* ud), void* ud);
+
+    /* 无边框画布模式相关：覆盖最小尺寸 / 背景擦除行为。0 = 恢复默认。 */
+    void SetMinSize(int wDip, int hDip) { minWOverride_ = wDip; minHOverride_ = hDip; }
+    void SetBackgroundMode(int mode)    { bgMode_ = mode; }
+    int  BackgroundMode() const         { return bgMode_; }
+
+    /* 窗口几何（DIP-native，内部乘 dpiScale_ 转物理像素）。
+     * x/y 是屏幕物理坐标（Win32 惯例）；w/h 是 DIP（按当前 DPI 换算）。
+     * 包含一次 SetWindowPos + InvalidateRect + UpdateWindow，确保 resize 后
+     * 同帧内把 widget 内容画到新尺寸，减少扩大窗口时的背景闪烁。 */
+    void SetWindowRect(int xScreen, int yScreen, int wDip, int hDip);
+    void SetWindowSize(int wDip, int hDip);             /* 保持位置不变 */
+    void SetWindowPosition(int xScreen, int yScreen);   /* 保持尺寸不变 */
+    void GetWindowRectScreen(int* x, int* y, int* wDip, int* hDip) const;
+    /* 以 client(ax_dip, ay_dip) 点与屏幕(sx, sy) 对齐的方式 resize。 */
+    void ResizeWithAnchor(int wDip, int hDip,
+                          float anchorClientXDip, float anchorClientYDip,
+                          int anchorScreenX, int anchorScreenY);
+    /* 一键开/关无边框画布模式（见 ui_core.h 中的 ui_window_enable_canvas_mode）。 */
+    void EnableCanvasMode(bool enable);
 
     /* Active context menu popup (nullptr if none open) */
     ContextMenuPtr ActiveMenu() const { return activeMenu_; }

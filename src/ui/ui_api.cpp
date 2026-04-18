@@ -1725,6 +1725,63 @@ UI_API void ui_window_invoke_sync(UiWindow win, void (*fn)(void* ud), void* ud) 
     wi->InvokeSync(fn, ud);
 }
 
+// ---- Frameless canvas mode ----
+
+UI_API void ui_window_set_min_size(UiWindow win, int w_dip, int h_dip) {
+    auto* wi = Win(win); if (!wi) return;
+    /* 负值当 0 处理（= 恢复默认） */
+    wi->SetMinSize(w_dip < 0 ? 0 : w_dip, h_dip < 0 ? 0 : h_dip);
+}
+
+UI_API void ui_window_set_background_mode(UiWindow win, int mode) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->SetBackgroundMode(mode);
+    wi->Invalidate();
+}
+
+UI_API void ui_widget_set_drag_window(UiWidget w, int enable) {
+    auto* p = W(w); if (!p) return;
+    p->dragWindow = (enable != 0);
+}
+
+// ---- 窗口几何（DIP-native） ----
+
+UI_API void ui_window_set_rect(UiWindow win, int x_screen, int y_screen,
+                                int w_dip, int h_dip) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->SetWindowRect(x_screen, y_screen, w_dip, h_dip);
+}
+
+UI_API void ui_window_set_size(UiWindow win, int w_dip, int h_dip) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->SetWindowSize(w_dip, h_dip);
+}
+
+UI_API void ui_window_set_position(UiWindow win, int x_screen, int y_screen) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->SetWindowPosition(x_screen, y_screen);
+}
+
+UI_API void ui_window_get_rect_screen(UiWindow win,
+                                       int* out_x, int* out_y,
+                                       int* out_w_dip, int* out_h_dip) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->GetWindowRectScreen(out_x, out_y, out_w_dip, out_h_dip);
+}
+
+UI_API void ui_window_resize_with_anchor(UiWindow win,
+                                          int w_dip, int h_dip,
+                                          float client_x_dip, float client_y_dip,
+                                          int screen_x, int screen_y) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->ResizeWithAnchor(w_dip, h_dip, client_x_dip, client_y_dip, screen_x, screen_y);
+}
+
+UI_API void ui_window_enable_canvas_mode(UiWindow win, int enable) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->EnableCanvasMode(enable != 0);
+}
+
 // ---- Dialog ----
 
 UI_API int ui_debug_dialog_confirm(UiWindow win) {

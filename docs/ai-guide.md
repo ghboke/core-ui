@@ -501,7 +501,7 @@ ui_window_invoke_sync(win, my_fn, userdata);
 
 ```yaml
 name: core-ui
-version: 1.1.0.2
+version: 1.2.0.3
 language: c++
 c_abi: true
 platform: windows
