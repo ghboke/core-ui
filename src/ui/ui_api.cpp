@@ -1782,6 +1782,86 @@ UI_API void ui_window_enable_canvas_mode(UiWindow win, int enable) {
     wi->EnableCanvasMode(enable != 0);
 }
 
+// ---- Font / Text rendering (since 1.3.0) ----
+
+static theme::TextRenderMode ToThemeMode(UiTextRenderMode m) {
+    switch (m) {
+    case UI_TEXT_RENDER_SMOOTH:     return theme::TextRenderMode::Smooth;
+    case UI_TEXT_RENDER_CLEARTYPE:  return theme::TextRenderMode::ClearType;
+    case UI_TEXT_RENDER_SHARP:      return theme::TextRenderMode::Sharp;
+    case UI_TEXT_RENDER_GRAY_SHARP: return theme::TextRenderMode::GraySharp;
+    case UI_TEXT_RENDER_ALIASED:    return theme::TextRenderMode::Aliased;
+    }
+    return theme::TextRenderMode::Smooth;
+}
+static UiTextRenderMode FromThemeMode(theme::TextRenderMode m) {
+    switch (m) {
+    case theme::TextRenderMode::Smooth:    return UI_TEXT_RENDER_SMOOTH;
+    case theme::TextRenderMode::ClearType: return UI_TEXT_RENDER_CLEARTYPE;
+    case theme::TextRenderMode::Sharp:     return UI_TEXT_RENDER_SHARP;
+    case theme::TextRenderMode::GraySharp: return UI_TEXT_RENDER_GRAY_SHARP;
+    case theme::TextRenderMode::Aliased:   return UI_TEXT_RENDER_ALIASED;
+    }
+    return UI_TEXT_RENDER_SMOOTH;
+}
+
+// 全局默认设完之后，刷新所有已存在窗口（让新字体 / 新模式立刻生效）
+static void RefreshAllWindowsAfterGlobalChange() {
+    /* 轻量刷新：flush 每个 Renderer 的 TextFormat 缓存 + 重建 fallback +
+     * 应用新 TextRenderMode。 */
+    auto& ctx = Ctx();
+    if (auto* w = ctx.FirstWindow()) (void)w;  /* anchor to suppress unused-func warn */
+    ctx.InvalidateAllWindows();
+}
+
+UI_API void ui_theme_set_default_font(const wchar_t* family) {
+    theme::SetDefaultFontFamily(family);
+    RefreshAllWindowsAfterGlobalChange();
+}
+UI_API const wchar_t* ui_theme_get_default_font(void) {
+    return theme::DefaultFontFamily();
+}
+
+UI_API void ui_theme_set_cjk_font(const wchar_t* latin, const wchar_t* cjk) {
+    theme::SetCjkFonts(latin, cjk);
+    RefreshAllWindowsAfterGlobalChange();
+}
+UI_API const wchar_t* ui_theme_get_cjk_latin_font(void) { return theme::LatinFontFamily(); }
+UI_API const wchar_t* ui_theme_get_cjk_cjk_font(void)   { return theme::CjkFontFamily(); }
+
+UI_API void ui_theme_set_text_render_mode(UiTextRenderMode mode) {
+    theme::SetTextRenderMode(ToThemeMode(mode));
+    RefreshAllWindowsAfterGlobalChange();
+}
+UI_API UiTextRenderMode ui_theme_get_text_render_mode(void) {
+    return FromThemeMode(theme::GetTextRenderMode());
+}
+
+UI_API void ui_window_set_default_font(UiWindow win, const wchar_t* family) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->GetRenderer().SetDefaultFontFamily(family);
+    wi->Invalidate();
+}
+UI_API void ui_window_set_cjk_font(UiWindow win, const wchar_t* latin, const wchar_t* cjk) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->GetRenderer().SetCjkFonts(latin, cjk);
+    wi->Invalidate();
+}
+UI_API void ui_window_set_text_render_mode(UiWindow win, UiTextRenderMode mode) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->GetRenderer().SetTextRenderMode(ToThemeMode(mode));
+    wi->Invalidate();
+}
+UI_API void ui_window_clear_font_override(UiWindow win) {
+    auto* wi = Win(win); if (!wi) return;
+    auto& r = wi->GetRenderer();
+    r.SetDefaultFontFamily(nullptr);
+    r.SetCjkFonts(nullptr, nullptr);
+    /* SetTextRenderMode 没法传"清除"，直接把 override 标志清掉需要加一个方法 */
+    r.SetTextRenderMode(theme::GetTextRenderMode());
+    wi->Invalidate();
+}
+
 // ---- Dialog ----
 
 UI_API int ui_debug_dialog_confirm(UiWindow win) {

@@ -455,11 +455,11 @@ int TextInputWidget::CharIndexFromX(float x) const {
 
     for (int i = 0; i <= (int)text_.size(); i++) {
         std::wstring substr = text_.substr(0, i);
-        float w = cachedRenderer_->MeasureTextWidth(substr, theme::kFontSizeNormal, theme::kFontFamily);
+        float w = cachedRenderer_->MeasureTextWidth(substr, theme::kFontSizeNormal, nullptr);
         float charX = textX + w;
         if (i < (int)text_.size()) {
             std::wstring nextSubstr = text_.substr(0, i + 1);
-            float nextW = cachedRenderer_->MeasureTextWidth(nextSubstr, theme::kFontSizeNormal, theme::kFontFamily);
+            float nextW = cachedRenderer_->MeasureTextWidth(nextSubstr, theme::kFontSizeNormal, nullptr);
             float nextCharX = textX + nextW;
             if (x < (charX + nextCharX) / 2.0f) return i;
         } else {
@@ -482,7 +482,7 @@ void TextInputWidget::EnsureCursorVisible() {
     if (!cachedRenderer_) return;
     float textAreaW = rect.right - rect.left - 22.0f;  // 11px padding each side
     std::wstring before = text_.substr(0, cursorPos_);
-    float cursorX = cachedRenderer_->MeasureTextWidth(before, theme::kFontSizeNormal, theme::kFontFamily);
+    float cursorX = cachedRenderer_->MeasureTextWidth(before, theme::kFontSizeNormal, nullptr);
 
     if (cursorX - scrollX_ < 0) scrollX_ = cursorX;
     else if (cursorX - scrollX_ > textAreaW) scrollX_ = cursorX - textAreaW;
@@ -572,8 +572,8 @@ void TextInputWidget::OnDraw(Renderer& r) {
             int end = std::max(selectionStart_, selectionEnd_);
             std::wstring beforeSel = text_.substr(0, start);
             std::wstring selected = text_.substr(start, end - start);
-            float x1 = textX + r.MeasureTextWidth(beforeSel, theme::kFontSizeNormal, theme::kFontFamily);
-            float x2 = x1 + r.MeasureTextWidth(selected, theme::kFontSizeNormal, theme::kFontFamily);
+            float x1 = textX + r.MeasureTextWidth(beforeSel, theme::kFontSizeNormal, nullptr);
+            float x2 = x1 + r.MeasureTextWidth(selected, theme::kFontSizeNormal, nullptr);
             D2D1_RECT_F selRect = {x1, rect.top + 5, x2, rect.bottom - 6};
             r.FillRect(selRect, theme::kAccent());
         }
@@ -585,7 +585,7 @@ void TextInputWidget::OnDraw(Renderer& r) {
         // Draw cursor
         if (focused && !HasSelection() && ShouldShowCaret()) {
             std::wstring before = text_.substr(0, cursorPos_);
-            float textWidth = r.MeasureTextWidth(before, theme::kFontSizeNormal, theme::kFontFamily);
+            float textWidth = r.MeasureTextWidth(before, theme::kFontSizeNormal, nullptr);
             float cursorX = textX + textWidth;
             float cy1 = rect.top + 5, cy2 = rect.bottom - 5;
             r.DrawLine(cursorX, cy1, cursorX, cy2, theme::kAccent(), 1.5f);
@@ -859,10 +859,10 @@ int TextAreaWidget::CharIndexFromXY(float x, float y) const {
 
     for (int i = 0; i <= (int)lines[line].size(); i++) {
         std::wstring substr = lines[line].substr(0, i);
-        float w = cachedRenderer_->MeasureTextWidth(substr, theme::kFontSizeNormal, theme::kFontFamily);
+        float w = cachedRenderer_->MeasureTextWidth(substr, theme::kFontSizeNormal, nullptr);
         if (i < (int)lines[line].size()) {
             std::wstring nextSubstr = lines[line].substr(0, i + 1);
-            float nextW = cachedRenderer_->MeasureTextWidth(nextSubstr, theme::kFontSizeNormal, theme::kFontFamily);
+            float nextW = cachedRenderer_->MeasureTextWidth(nextSubstr, theme::kFontSizeNormal, nullptr);
             if (x < textX + (w + nextW) / 2.0f) return lineStart + i;
         } else {
             return lineStart + i;
@@ -974,8 +974,8 @@ void TextAreaWidget::OnDraw(Renderer& r) {
 
                 std::wstring before = lines[i].substr(0, colStart);
                 std::wstring selected = lines[i].substr(colStart, colEnd - colStart);
-                float x1 = textX + r.MeasureTextWidth(before, theme::kFontSizeNormal, theme::kFontFamily);
-                float x2 = x1 + r.MeasureTextWidth(selected, theme::kFontSizeNormal, theme::kFontFamily);
+                float x1 = textX + r.MeasureTextWidth(before, theme::kFontSizeNormal, nullptr);
+                float x2 = x1 + r.MeasureTextWidth(selected, theme::kFontSizeNormal, nullptr);
                 float y = textY + i * lineHeight_;
                 D2D1_RECT_F selRect = {x1, y, x2, y + lineHeight_};
                 r.FillRect(selRect, theme::kAccent());
@@ -994,7 +994,7 @@ void TextAreaWidget::OnDraw(Renderer& r) {
             int line, col;
             GetLineCol(cursorPos_, line, col);
             std::wstring beforeCursor = (line < (int)lines.size()) ? lines[line].substr(0, col) : L"";
-            float cursorX = textX + r.MeasureTextWidth(beforeCursor, theme::kFontSizeNormal, theme::kFontFamily);
+            float cursorX = textX + r.MeasureTextWidth(beforeCursor, theme::kFontSizeNormal, nullptr);
             float cursorY = textY + line * lineHeight_;
             r.DrawLine(cursorX, cursorY + 2, cursorX, cursorY + lineHeight_ - 2, theme::kAccent(), 1.5f);
         }
@@ -3782,7 +3782,7 @@ void NumberBoxWidget::OnDraw(Renderer& r) {
         bool showCaret = ((now / 530) % 2) == 0;
         if (showCaret) {
             std::wstring before = editText_.substr(0, cursorPos_);
-            float textW = r.MeasureTextWidth(before, theme::kFontSizeNormal, theme::kFontFamily);
+            float textW = r.MeasureTextWidth(before, theme::kFontSizeNormal, nullptr);
             float caretX = rect.left + 11 + textW;
             float cy1 = rect.top + 6, cy2 = rect.bottom - 6;
             r.DrawLine(caretX, cy1, caretX, cy2, theme::kAccent(), 1.5f);

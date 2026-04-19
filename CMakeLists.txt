@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-set(UI_CORE_VERSION "1.2.0")
-set(UI_CORE_INTERNAL_VERSION "3")
+set(UI_CORE_VERSION "1.3.0")
+set(UI_CORE_INTERNAL_VERSION "4")
 project(core-ui-project VERSION ${UI_CORE_VERSION} LANGUAGES CXX)
 
 set(UI_CORE_VERSION_TAG "v${PROJECT_VERSION}")
@@ -84,6 +84,22 @@ add_executable(ui-demo WIN32
 target_link_libraries(ui-demo PRIVATE core-ui)
 target_include_directories(ui-demo PRIVATE src/ui include)
 
+# ---- Font demo: font-demo.exe ----
+# 文字渲染模式 A/B/C/D 对比（内部低层 Renderer，用于开发对比）
+add_executable(font-demo WIN32
+    demo/font_demo.cpp
+)
+target_link_libraries(font-demo PRIVATE core-ui)
+target_include_directories(font-demo PRIVATE include src/ui)
+
+# ---- Font API demo: font-api-demo.exe ----
+# 1.3.0 公开字体 / 渲染模式 C API 演示
+add_executable(font-api-demo WIN32
+    demo/font_api_demo.cpp
+)
+target_link_libraries(font-api-demo PRIVATE core-ui)
+target_include_directories(font-api-demo PRIVATE include)
+
 # POST_BUILD: 把 MinGW 运行时 DLL 拷到 exe 同目录。虽然顶上已经用
 # -static-libstdc++/-static-libgcc + -Bstatic lwinpthread 试图静态化，
 # 但 MinGW 的 C++ 线程头实际会通过其它路径引入 libwinpthread-1.dll 动态依赖，
@@ -94,6 +110,16 @@ if(MINGW AND NOT UI_CORE_STATIC)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${MINGW_BIN}/libwinpthread-1.dll"
             "$<TARGET_FILE_DIR:ui-demo>/libwinpthread-1.dll"
+    )
+    add_custom_command(TARGET font-demo POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MINGW_BIN}/libwinpthread-1.dll"
+            "$<TARGET_FILE_DIR:font-demo>/libwinpthread-1.dll"
+    )
+    add_custom_command(TARGET font-api-demo POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MINGW_BIN}/libwinpthread-1.dll"
+            "$<TARGET_FILE_DIR:font-api-demo>/libwinpthread-1.dll"
     )
 endif()
 

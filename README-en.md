@@ -15,7 +15,7 @@ UIs are best described in **`.ui` markup files** — a XAML-like declarative for
 > **An 8.4 MB single DLL that ships Office / VS Code-grade UI on Windows.**
 > No Chromium. No .NET. No 40 MB of Qt DLLs and moc/uic preprocessors. One C header, one `.ui` markup file — done.
 
-![version](https://img.shields.io/badge/version-1.1.0.2-blue)
+![version](https://img.shields.io/badge/version-1.3.0.4-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2B-lightgrey)
 ![size](https://img.shields.io/badge/dll-8.4MB-brightgreen)

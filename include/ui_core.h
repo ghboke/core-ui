@@ -610,6 +610,43 @@ UI_API void  ui_window_resize_with_anchor(UiWindow win,
    关闭时反之。要求窗口在 ui_window_create 时就用 system_frame=0 创建无边框。 */
 UI_API void  ui_window_enable_canvas_mode(UiWindow win, int enable);
 
+/* ------------------------------------------------------------------ */
+/* Font / Text rendering (since 1.3.0)                                 */
+/* ------------------------------------------------------------------ */
+/* 文字渲染档位。见 docs/c-api.md 对比图。 */
+typedef enum UiTextRenderMode {
+    UI_TEXT_RENDER_SMOOTH     = 0, /* GRAYSCALE + NATURAL_SYM（默认 / WinUI 风） */
+    UI_TEXT_RENDER_CLEARTYPE  = 1, /* CLEARTYPE + NATURAL（Office/Chrome） */
+    UI_TEXT_RENDER_SHARP      = 2, /* CLEARTYPE + GDI_CLASSIC（记事本最锐） */
+    UI_TEXT_RENDER_GRAY_SHARP = 3, /* GRAYSCALE + GDI_CLASSIC（锐且无彩边） */
+    UI_TEXT_RENDER_ALIASED    = 4, /* 无抗锯齿 / 像素字体 */
+} UiTextRenderMode;
+
+/* ---- 全局默认（进程级，新建窗口的初值；旧窗口已创建也会跟随，只要它自己没 override）---- */
+/* 设置全局默认字体族。NULL = 恢复 "Segoe UI"。
+   常用值: L"Microsoft YaHei UI"（中文应用推荐）/ L"Segoe UI" / L"SimSun"。 */
+UI_API void             ui_theme_set_default_font(const wchar_t* family);
+UI_API const wchar_t*   ui_theme_get_default_font(void);
+
+/* 设置"中英分离"字体：ASCII/拉丁字符用 latin，CJK 字符用 cjk。
+   任一参数为 NULL 表示不覆盖该范围（由 default_font 或系统 fallback 处理）。
+   两者皆 NULL = 关闭中英分离。
+   典型: ui_theme_set_cjk_font(L"Segoe UI", L"Microsoft YaHei UI"). */
+UI_API void             ui_theme_set_cjk_font(const wchar_t* latin, const wchar_t* cjk);
+UI_API const wchar_t*   ui_theme_get_cjk_latin_font(void);
+UI_API const wchar_t*   ui_theme_get_cjk_cjk_font(void);
+
+/* 设置全局默认文字渲染模式。 */
+UI_API void             ui_theme_set_text_render_mode(UiTextRenderMode mode);
+UI_API UiTextRenderMode ui_theme_get_text_render_mode(void);
+
+/* ---- 窗口级覆盖（优先级高于全局） ---- */
+/* NULL / UI_TEXT_RENDER_SMOOTH 不能表达"清除 override"，用 ui_window_clear_font_override 重置。 */
+UI_API void             ui_window_set_default_font(UiWindow win, const wchar_t* family);
+UI_API void             ui_window_set_cjk_font(UiWindow win, const wchar_t* latin, const wchar_t* cjk);
+UI_API void             ui_window_set_text_render_mode(UiWindow win, UiTextRenderMode mode);
+UI_API void             ui_window_clear_font_override(UiWindow win);   /* 清除所有 font/mode 覆盖 */
+
 /* ---- Dialog / Toast ---- */
 UI_API int   ui_debug_dialog_confirm(UiWindow win);
 UI_API int   ui_debug_dialog_cancel(UiWindow win);

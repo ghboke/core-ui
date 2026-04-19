@@ -200,27 +200,15 @@ bool Renderer::CreateRenderTarget(HWND hwnd) {
     /* 5. 设置渲染参数 */
     ctx_->SetDpi((float)dpi, (float)dpi);
     ctx_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    ctx_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
-    /* Grayscale antialias: avoids ClearType RGB fringing on non-opaque backgrounds.
-       Enhanced contrast improves text sharpness. Natural symmetric rendering
-       mode gives smoother glyph shapes (used by WinUI 3 / XAML). */
-    IDWriteRenderingParams* defaultParams = nullptr;
-    IDWriteRenderingParams* customParams  = nullptr;
-    if (SUCCEEDED(dwFactory_->CreateRenderingParams(&defaultParams))) {
-        dwFactory_->CreateCustomRenderingParams(
-            1.8f,                                 // gamma: slightly higher for crisper text
-            0.5f,                                 // enhancedContrast: sharper edges
-            0.0f,                                 // clearTypeLevel: 0 = pure grayscale (no RGB fringing)
-            defaultParams->GetPixelGeometry(),
-            DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,  // smoother glyph rendering (XAML style)
-            &customParams);
-        if (customParams) {
-            ctx_->SetTextRenderingParams(customParams);
-            customParams->Release();
-        }
-        defaultParams->Release();
-    }
+    /* 文字渲染参数：由 theme::TextRenderMode 或 per-window override 决定。
+       ApplyTextRenderMode 会读 TextRenderMode() 并 SetTextAntialiasMode +
+       SetTextRenderingParams。 */
+    ApplyTextRenderMode();
+
+    /* 如果已经有中英分离设置，重建一次 fallback（theme::SetCjkFonts 可能在
+       窗口创建之前就设了） */
+    RebuildFontFallback();
 
     return true;
 }
@@ -305,12 +293,15 @@ ComPtr<ID2D1SolidColorBrush> Renderer::GetBrush(const D2D1_COLOR_F& color) {
 
 ComPtr<IDWriteTextFormat> Renderer::GetTextFormat(float fontSize, const wchar_t* family,
                                                    DWRITE_FONT_WEIGHT weight) {
-    if (!dwFactory_ || !family) return nullptr;
+    if (!dwFactory_) return nullptr;
+    /* family == nullptr → 用本 Renderer 的 default font（per-window > theme > "Segoe UI"） */
+    const wchar_t* resolvedFamily = family ? family : DefaultFontFamily();
+    if (!resolvedFamily) resolvedFamily = L"Segoe UI";
 
     TextFormatKey key;
     key.sizeBits = FloatBits(fontSize);
     key.weight = static_cast<uint32_t>(weight);
-    key.family = family;
+    key.family = resolvedFamily;
 
     auto it = textFormatCache_.find(key);
     if (it != textFormatCache_.end()) {
@@ -319,12 +310,166 @@ ComPtr<IDWriteTextFormat> Renderer::GetTextFormat(float fontSize, const wchar_t*
 
     ComPtr<IDWriteTextFormat> fmt;
     HRESULT hr = dwFactory_->CreateTextFormat(
-        family, nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+        resolvedFamily, nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
         fontSize, ResolveLocaleName(), fmt.GetAddressOf());
     if (SUCCEEDED(hr) && fmt) {
+        /* 如果有中英分离字体回退，attach 到 TextFormat3 上 */
+        if (fontFallback_) {
+            ComPtr<IDWriteTextFormat3> fmt3;
+            if (SUCCEEDED(fmt.As(&fmt3)) && fmt3) {
+                fmt3->SetFontFallback(fontFallback_.Get());
+            }
+        }
         textFormatCache_.emplace(std::move(key), fmt);
     }
     return fmt;
+}
+
+/* ---- Per-window font / render mode 状态 (since 1.3.0) ---- */
+
+const wchar_t* Renderer::DefaultFontFamily() const {
+    if (!defaultFontOverride_.empty()) return defaultFontOverride_.c_str();
+    return theme::DefaultFontFamily();  /* 全局默认 "Segoe UI" */
+}
+
+const wchar_t* Renderer::LatinFontFamily() const {
+    if (!latinFontOverride_.empty()) return latinFontOverride_.c_str();
+    return theme::LatinFontFamily();  /* 可能返回 nullptr */
+}
+
+const wchar_t* Renderer::CjkFontFamily() const {
+    if (!cjkFontOverride_.empty()) return cjkFontOverride_.c_str();
+    return theme::CjkFontFamily();    /* 可能返回 nullptr */
+}
+
+theme::TextRenderMode Renderer::TextRenderMode() const {
+    return hasRenderModeOverride_ ? renderModeOverride_ : theme::GetTextRenderMode();
+}
+
+void Renderer::SetDefaultFontFamily(const wchar_t* family) {
+    defaultFontOverride_ = family ? family : L"";
+    textFormatCache_.clear();  /* 缓存失效 */
+    RebuildFontFallback();
+}
+
+void Renderer::SetCjkFonts(const wchar_t* latin, const wchar_t* cjk) {
+    latinFontOverride_ = latin ? latin : L"";
+    cjkFontOverride_   = cjk   ? cjk   : L"";
+    textFormatCache_.clear();
+    RebuildFontFallback();
+}
+
+void Renderer::SetTextRenderMode(theme::TextRenderMode mode) {
+    hasRenderModeOverride_ = true;
+    renderModeOverride_ = mode;
+    ApplyTextRenderMode();  /* 立刻应用到 ctx_（如已创建） */
+}
+
+void Renderer::ApplyTextRenderMode() {
+    if (!ctx_ || !dwFactory_) return;
+
+    D2D1_TEXT_ANTIALIAS_MODE aa = D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
+    DWRITE_RENDERING_MODE    rm = DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC;
+    float gamma = 1.8f, enhancedContrast = 0.5f, clearTypeLevel = 0.0f;
+
+    switch (TextRenderMode()) {
+    case theme::TextRenderMode::Smooth:
+        aa = D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
+        rm = DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC;
+        gamma = 1.8f; enhancedContrast = 0.5f; clearTypeLevel = 0.0f;
+        break;
+    case theme::TextRenderMode::ClearType:
+        aa = D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE;
+        rm = DWRITE_RENDERING_MODE_NATURAL;
+        gamma = 1.8f; enhancedContrast = 1.0f; clearTypeLevel = 1.0f;
+        break;
+    case theme::TextRenderMode::Sharp:
+        aa = D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE;
+        rm = DWRITE_RENDERING_MODE_GDI_CLASSIC;
+        gamma = 1.8f; enhancedContrast = 1.0f; clearTypeLevel = 1.0f;
+        break;
+    case theme::TextRenderMode::GraySharp:
+        aa = D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE;
+        rm = DWRITE_RENDERING_MODE_GDI_CLASSIC;
+        gamma = 1.8f; enhancedContrast = 1.0f; clearTypeLevel = 0.0f;
+        break;
+    case theme::TextRenderMode::Aliased:
+        aa = D2D1_TEXT_ANTIALIAS_MODE_ALIASED;
+        rm = DWRITE_RENDERING_MODE_ALIASED;
+        gamma = 1.8f; enhancedContrast = 0.0f; clearTypeLevel = 0.0f;
+        break;
+    }
+    ctx_->SetTextAntialiasMode(aa);
+
+    IDWriteRenderingParams* base = nullptr;
+    IDWriteRenderingParams* custom = nullptr;
+    if (SUCCEEDED(dwFactory_->CreateRenderingParams(&base))) {
+        dwFactory_->CreateCustomRenderingParams(
+            gamma, enhancedContrast, clearTypeLevel,
+            base->GetPixelGeometry(), rm, &custom);
+        if (custom) { ctx_->SetTextRenderingParams(custom); custom->Release(); }
+        base->Release();
+    }
+}
+
+/* 构造中英分离的 IDWriteFontFallback。LatinFamily/CjkFamily 任一非空即启用。
+   CJK 覆盖的 Unicode 块：CJK Unified Ideographs + Extension A + 符号 / 标点 /
+   全角形式 / 汉字偏旁 / 注音等常见范围。 */
+void Renderer::RebuildFontFallback() {
+    fontFallback_.Reset();
+    const wchar_t* latin = LatinFontFamily();
+    const wchar_t* cjk   = CjkFontFamily();
+    if (!latin && !cjk) return;
+
+    ComPtr<IDWriteFactory2> dwf2;
+    if (FAILED(reinterpret_cast<IUnknown*>(dwFactory_)->QueryInterface(
+            __uuidof(IDWriteFactory2), reinterpret_cast<void**>(dwf2.GetAddressOf())))) {
+        return;  /* Fallback builder 需要 DWrite 1.2+ */
+    }
+
+    ComPtr<IDWriteFontFallbackBuilder> builder;
+    if (FAILED(dwf2->CreateFontFallbackBuilder(builder.GetAddressOf()))) return;
+
+    /* CJK Unicode 块 */
+    if (cjk) {
+        DWRITE_UNICODE_RANGE cjkRanges[] = {
+            { 0x2E80, 0x2EFF },  /* CJK 部首补充 */
+            { 0x3000, 0x303F },  /* CJK 符号和标点 */
+            { 0x3040, 0x309F },  /* 平假名 */
+            { 0x30A0, 0x30FF },  /* 片假名 */
+            { 0x3100, 0x312F },  /* 注音字母 */
+            { 0x3200, 0x33FF },  /* 带圈符号 / CJK 兼容 */
+            { 0x3400, 0x4DBF },  /* CJK 扩展 A */
+            { 0x4E00, 0x9FFF },  /* CJK 统一汉字 */
+            { 0xF900, 0xFAFF },  /* CJK 兼容汉字 */
+            { 0xFE30, 0xFE4F },  /* CJK 兼容形式 */
+            { 0xFF00, 0xFFEF },  /* 半角及全角形式 */
+        };
+        const wchar_t* families[] = { cjk };
+        builder->AddMapping(cjkRanges,
+                            (UINT32)(sizeof(cjkRanges)/sizeof(cjkRanges[0])),
+                            families, 1);
+    }
+
+    /* ASCII / 拉丁 / 西欧 */
+    if (latin) {
+        DWRITE_UNICODE_RANGE latinRanges[] = {
+            { 0x0020, 0x007F },  /* ASCII */
+            { 0x00A0, 0x024F },  /* Latin-1 补充 / Latin 扩展 A/B */
+        };
+        const wchar_t* families[] = { latin };
+        builder->AddMapping(latinRanges,
+                            (UINT32)(sizeof(latinRanges)/sizeof(latinRanges[0])),
+                            families, 1);
+    }
+
+    /* 其余范围接系统默认 fallback */
+    ComPtr<IDWriteFontFallback> sysFallback;
+    if (SUCCEEDED(dwf2->GetSystemFontFallback(sysFallback.GetAddressOf())) && sysFallback) {
+        builder->AddMappings(sysFallback.Get());
+    }
+
+    builder->CreateFontFallback(fontFallback_.GetAddressOf());
 }
 
 void Renderer::FillRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color) {

@@ -114,6 +114,9 @@ private:
     HWND popupHwnd_ = nullptr;
     Renderer popupRenderer_;
     HWND parentHwnd_ = nullptr;
+    // 父级菜单（子菜单对象里指向打开它的那个菜单）。ROOT 为 nullptr。
+    // 用于子菜单 leaf 被点击后沿链向上 Close，避免 root 菜单残留。
+    ContextMenu* parentMenu_ = nullptr;
 
     void CreatePopupWindow(HWND parent, int screenX, int screenY);
     void DestroyPopupWindow();

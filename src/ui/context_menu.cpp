@@ -355,6 +355,10 @@ LRESULT CALLBACK ContextMenu::PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                 PostMessage(self->parentHwnd_, WM_APP + 100, (WPARAM)clickedId, 0);
             }
             self->Close();
+            // 如果本身是子菜单 popup（parentMenu_ 非空），沿链向上关闭父菜单，
+            // 否则 leaf 点完后 root popup 还留在屏上。
+            ContextMenu* p = self->parentMenu_;
+            while (p) { p->Close(); p = p->parentMenu_; }
         }
         return 0;
     }
@@ -382,7 +386,7 @@ LRESULT CALLBACK ContextMenu::PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                 RECT rc;
                 GetWindowRect(hwnd, &rc);
                 if (pt.x < rc.left || pt.x >= rc.right || pt.y < rc.top || pt.y >= rc.bottom) {
-                    // Check if also outside any open submenu
+                    // 点击落点也要检查：是否在"自己的子菜单"内
                     bool inSubmenu = false;
                     if (self->openSubmenuIndex_ >= 0 && self->openSubmenuIndex_ < (int)self->items_.size()) {
                         auto& sub = self->items_[self->openSubmenuIndex_].submenu;
@@ -393,7 +397,17 @@ LRESULT CALLBACK ContextMenu::PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                                 inSubmenu = true;
                         }
                     }
-                    if (!inSubmenu) {
+                    // 或在任一"祖先菜单 popup"内 —— 子菜单 timer 不能把"用户在
+                    // 父菜单里按下"当成外部点击，否则会引发子菜单关-开-关 闪烁。
+                    bool inAncestor = false;
+                    for (ContextMenu* p = self->parentMenu_; p && !inAncestor; p = p->parentMenu_) {
+                        if (!p->popupHwnd_) continue;
+                        RECT pc;
+                        GetWindowRect(p->popupHwnd_, &pc);
+                        if (pt.x >= pc.left && pt.x < pc.right && pt.y >= pc.top && pt.y < pc.bottom)
+                            inAncestor = true;
+                    }
+                    if (!inSubmenu && !inAncestor) {
                         KillTimer(hwnd, 1);
                         self->Close();
                         return 0;
@@ -409,7 +423,12 @@ LRESULT CALLBACK ContextMenu::PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                     auto& sub = self->items_[self->openSubmenuIndex_].submenu;
                     if (sub && sub->popupHwnd_ == fg) isSubmenu = true;
                 }
-                if (!isSubmenu) {
+                // 或是任一祖先菜单 popup —— 用户点击父菜单时不应把子菜单关掉
+                bool isAncestor = false;
+                for (ContextMenu* p = self->parentMenu_; p && !isAncestor; p = p->parentMenu_) {
+                    if (p->popupHwnd_ == fg) isAncestor = true;
+                }
+                if (!isSubmenu && !isAncestor) {
                     KillTimer(hwnd, 1);
                     self->Close();
                     return 0;
@@ -612,6 +631,7 @@ bool ContextMenu::HandleMouseMove(float x, float y) {
                 // Open new submenu
                 openSubmenuIndex_ = hit;
                 auto& sub = items_[hit].submenu;
+                sub->parentMenu_ = this;  // leaf 点击后可沿链 Close
                 if (popupHwnd_) {
                     // Open submenu as popup window too
                     RECT rc;

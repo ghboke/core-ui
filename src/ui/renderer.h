@@ -5,6 +5,8 @@
 #include <dxgi1_2.h>
 #include <dxgi1_3.h>
 #include <dwrite.h>
+#include <dwrite_2.h>   /* IDWriteFontFallback / Builder (DWrite 1.2+) */
+#include <dwrite_3.h>   /* IDWriteTextFormat3 (DWrite 1.3+, Win10) */
 #include <wincodec.h>
 #include <wrl/client.h>
 #include <string>
@@ -12,6 +14,7 @@
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
+#include "theme.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -64,7 +67,7 @@ public:
                   DWRITE_PARAGRAPH_ALIGNMENT vAlign = DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
                   bool wordWrap = false);
     float MeasureTextWidth(const std::wstring& text, float fontSize,
-                           const wchar_t* family = L"Segoe UI",
+                           const wchar_t* family = nullptr,  /* nullptr = 用 DefaultFontFamily() */
                            DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL);
     float MeasureTextHeight(const std::wstring& text, float maxWidth, float fontSize,
                             DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL);
@@ -131,6 +134,19 @@ public:
 
     // 临时设置渲染目标（用于缓存等场景）
     void SetTarget(ID2D1DeviceContext* target) { ctx_ = target; }
+
+    // ---- 字体 / 渲染模式 per-window 状态 (since 1.3.0) ----
+    // 空串 = 跟随 theme:: 全局默认
+    void        SetDefaultFontFamily(const wchar_t* family);
+    void        SetCjkFonts(const wchar_t* latin, const wchar_t* cjk);
+    void        SetTextRenderMode(theme::TextRenderMode mode);
+    const wchar_t* DefaultFontFamily() const;   // 实际生效的默认字体族（窗口 > theme > "Segoe UI"）
+    const wchar_t* LatinFontFamily() const;     // 中英分离的拉丁字体，nullptr=未设
+    const wchar_t* CjkFontFamily() const;       // 中英分离的中文字体，nullptr=未设
+    theme::TextRenderMode TextRenderMode() const;
+
+    // 应用当前文字渲染模式到 ctx_（在 BeginDraw 之前调用或 CreateRenderTarget 后立即调用）
+    void ApplyTextRenderMode();
 
 private:
     struct ColorKey {
@@ -204,8 +220,21 @@ private:
     ID2D1StrokeStyle* GetRoundStrokeStyle();
 
     ComPtr<ID2D1SolidColorBrush> GetBrush(const D2D1_COLOR_F& color);
-    ComPtr<IDWriteTextFormat> GetTextFormat(float fontSize, const wchar_t* family = L"Segoe UI",
+    ComPtr<IDWriteTextFormat> GetTextFormat(float fontSize, const wchar_t* family = nullptr,
                                             DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL);
+
+    // ---- Per-window font / render 状态 (since 1.3.0) ----
+    // 空串 = 跟随 theme:: 全局
+    std::wstring          defaultFontOverride_;
+    std::wstring          latinFontOverride_;
+    std::wstring          cjkFontOverride_;
+    bool                  hasRenderModeOverride_ = false;
+    theme::TextRenderMode renderModeOverride_ = theme::TextRenderMode::Smooth;
+
+    // 根据当前 latin/cjk 设置构造 IDWriteFontFallback；如果两个都空则返回 nullptr。
+    // 构造后由 Apply... 在 TextFormat3 上 SetFontFallback。
+    ComPtr<IDWriteFontFallback> fontFallback_;
+    void RebuildFontFallback();
 };
 
 } // namespace ui

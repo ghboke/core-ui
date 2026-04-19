@@ -7,6 +7,90 @@
   - 每次发布构建 +1；同一 MAJOR.MINOR.PATCH 下可累加
 - DLL 属性里看到的 `FileVersion` 即该四段串，由 `src/version.rc.in` 注入
 
+## 1.3.0 — build 4
+
+### 新增：字体 / 文字渲染 C API
+
+三层控制粒度：全局默认、单窗口覆盖、渲染模式预设。纯 C API，零 DirectWrite 样板代码。
+支持中英字体分离（Latin / CJK 各走各的家族），通过 `IDWriteFontFallbackBuilder`
+在 11 个 CJK Unicode 区段上做映射。
+
+**全局默认（进程级）**
+- `ui_theme_set_default_font(family)` / `ui_theme_get_default_font()`
+- `ui_theme_set_cjk_font(latin, cjk)` / `ui_theme_get_cjk_latin_font()` / `ui_theme_get_cjk_cjk_font()`
+- `ui_theme_set_text_render_mode(mode)` / `ui_theme_get_text_render_mode()`
+
+**单窗口覆盖**
+- `ui_window_set_default_font(win, family)`
+- `ui_window_set_cjk_font(win, latin, cjk)`
+- `ui_window_set_text_render_mode(win, mode)`
+- `ui_window_clear_font_override(win)` —— 一次清除该窗口所有覆盖
+
+**渲染模式枚举 `UiTextRenderMode`** ——  5 个预设覆盖 95% 场景，不需要手写 DWrite
+gamma / contrast / clearTypeLevel：
+
+| 预设                          | 风格                  | DWrite 映射                    |
+|-------------------------------|-----------------------|--------------------------------|
+| `UI_TEXT_RENDER_SMOOTH`       | 默认 / WinUI 风        | GRAYSCALE + NATURAL_SYMMETRIC |
+| `UI_TEXT_RENDER_CLEARTYPE`    | Office / Chrome 风     | CLEARTYPE + NATURAL           |
+| `UI_TEXT_RENDER_SHARP`        | 记事本最锐             | CLEARTYPE + GDI_CLASSIC       |
+| `UI_TEXT_RENDER_GRAY_SHARP`   | 灰度 + 像素对齐        | GRAYSCALE + GDI_CLASSIC       |
+| `UI_TEXT_RENDER_ALIASED`      | 无抗锯齿 / 像素块      | ALIASED + ALIASED             |
+
+### 修复
+
+- **嵌套 ContextMenu**：子菜单叶子项被点击后不再残留 root popup；父菜单内移动/点击不再
+  让子菜单闪烁 关-开-关。
+
+### Demo
+
+- `demo/font_api_demo.cpp` —— 公开 API 版字体 / 渲染模式演示
+- `demo/font_demo.cpp` —— 7 模式 × 3 字体的低层 A/B 对比，开发调参用
+
+---
+
+### New: Font / text-rendering C API
+
+Three layers of control: process-wide defaults, per-window overrides, and render-mode
+presets. Pure C API, zero DirectWrite boilerplate. Supports Latin / CJK font split
+(each script uses its own family) via `IDWriteFontFallbackBuilder` mapping across
+11 CJK Unicode blocks.
+
+**Global defaults (process-wide)**
+- `ui_theme_set_default_font(family)` / `ui_theme_get_default_font()`
+- `ui_theme_set_cjk_font(latin, cjk)` / `ui_theme_get_cjk_latin_font()` / `ui_theme_get_cjk_cjk_font()`
+- `ui_theme_set_text_render_mode(mode)` / `ui_theme_get_text_render_mode()`
+
+**Per-window overrides**
+- `ui_window_set_default_font(win, family)`
+- `ui_window_set_cjk_font(win, latin, cjk)`
+- `ui_window_set_text_render_mode(win, mode)`
+- `ui_window_clear_font_override(win)` — reset all overrides on this window at once
+
+**Render-mode enum `UiTextRenderMode`** — five presets cover 95% of cases; no need
+to hand-tune DWrite gamma / contrast / clearTypeLevel:
+
+| Preset                        | Style                         | DWrite mapping                 |
+|-------------------------------|-------------------------------|--------------------------------|
+| `UI_TEXT_RENDER_SMOOTH`       | default, WinUI-like           | GRAYSCALE + NATURAL_SYMMETRIC  |
+| `UI_TEXT_RENDER_CLEARTYPE`    | Office / Chrome-like          | CLEARTYPE + NATURAL            |
+| `UI_TEXT_RENDER_SHARP`        | Notepad-sharp                 | CLEARTYPE + GDI_CLASSIC        |
+| `UI_TEXT_RENDER_GRAY_SHARP`   | grayscale, pixel-aligned      | GRAYSCALE + GDI_CLASSIC        |
+| `UI_TEXT_RENDER_ALIASED`      | aliased / pixel block         | ALIASED + ALIASED              |
+
+### Fixes
+
+- **Nested ContextMenu**: a leaf-item click no longer leaves the root popup on screen;
+  movement/clicks within a parent menu no longer cause the submenu to flicker
+  closed-open-closed.
+
+### Demos
+
+- `demo/font_api_demo.cpp` — public-API showcase for the new font / render-mode knobs
+- `demo/font_demo.cpp` — low-level 7-modes × 3-fonts A/B matrix, internal tuning tool
+
+---
+
 ## 1.2.0 — build 3
 
 ### 新增：无边框画布模式（Frameless Canvas Mode）

@@ -258,6 +258,36 @@ export const apiGroups: ApiGroup[] = [
     ],
   },
   {
+    name: "Canvas Mode (1.2.0)",
+    functions: [
+      { name: "ui_window_enable_canvas_mode", signature: "void ui_window_enable_canvas_mode(UiWindow win, int enable)", description: "One-shot frameless canvas mode: min_size=32x32, transparent bg, root drag, titlebar hidden" },
+      { name: "ui_window_set_min_size", signature: "void ui_window_set_min_size(UiWindow win, float w, float h)", description: "Override the default 480x360 minimum window size" },
+      { name: "ui_window_set_background_mode", signature: "void ui_window_set_background_mode(UiWindow win, int mode)", description: "0=theme fill (default), 1=transparent Clear on paint" },
+      { name: "ui_widget_set_drag_window", signature: "void ui_widget_set_drag_window(UiWidget w, int enable)", description: "Hitting this widget returns HTCAPTION so the system drags the window" },
+      { name: "ui_window_set_rect", signature: "void ui_window_set_rect(UiWindow win, float x, float y, float w, float h)", description: "Atomic SetWindowPos + invalidate, DIP-native" },
+      { name: "ui_window_set_size", signature: "void ui_window_set_size(UiWindow win, float w, float h)", description: "Resize preserving position" },
+      { name: "ui_window_set_position", signature: "void ui_window_set_position(UiWindow win, float x, float y)", description: "Move preserving size" },
+      { name: "ui_window_get_rect_screen", signature: "void ui_window_get_rect_screen(UiWindow win, float* x, float* y, float* w, float* h)", description: "Read current window geometry in screen DIPs" },
+      { name: "ui_window_resize_with_anchor", signature: "void ui_window_resize_with_anchor(UiWindow win, float w, float h, float acx, float acy, float sx, float sy)", description: "Resize while pinning client point (acx,acy) to screen point (sx,sy) — cursor-anchored wheel-zoom primitive" },
+    ],
+  },
+  {
+    name: "Fonts & Text Rendering (1.3.0)",
+    functions: [
+      { name: "ui_theme_set_default_font", signature: "void ui_theme_set_default_font(const wchar_t* family)", description: "Set process-wide default font family (default: Segoe UI)" },
+      { name: "ui_theme_get_default_font", signature: "const wchar_t* ui_theme_get_default_font(void)", description: "Get the current process-wide default font family" },
+      { name: "ui_theme_set_cjk_font", signature: "void ui_theme_set_cjk_font(const wchar_t* latin, const wchar_t* cjk)", description: "Split fonts by script: Latin uses 'latin', CJK uses 'cjk' via IDWriteFontFallbackBuilder" },
+      { name: "ui_theme_get_cjk_latin_font", signature: "const wchar_t* ui_theme_get_cjk_latin_font(void)", description: "Get the Latin half of the CJK split, or NULL if not set" },
+      { name: "ui_theme_get_cjk_cjk_font", signature: "const wchar_t* ui_theme_get_cjk_cjk_font(void)", description: "Get the CJK half of the CJK split, or NULL if not set" },
+      { name: "ui_theme_set_text_render_mode", signature: "void ui_theme_set_text_render_mode(UiTextRenderMode mode)", description: "Set global text render mode: SMOOTH / CLEARTYPE / SHARP / GRAY_SHARP / ALIASED" },
+      { name: "ui_theme_get_text_render_mode", signature: "UiTextRenderMode ui_theme_get_text_render_mode(void)", description: "Get the current global text render mode" },
+      { name: "ui_window_set_default_font", signature: "void ui_window_set_default_font(UiWindow win, const wchar_t* family)", description: "Override default font for a single window (overrides global default)" },
+      { name: "ui_window_set_cjk_font", signature: "void ui_window_set_cjk_font(UiWindow win, const wchar_t* latin, const wchar_t* cjk)", description: "Override CJK split for a single window" },
+      { name: "ui_window_set_text_render_mode", signature: "void ui_window_set_text_render_mode(UiWindow win, UiTextRenderMode mode)", description: "Override text render mode for a single window" },
+      { name: "ui_window_clear_font_override", signature: "void ui_window_clear_font_override(UiWindow win)", description: "Clear every font/mode override on this window, reverting to global defaults" },
+    ],
+  },
+  {
     name: "Debug & Inspector",
     functions: [
       { name: "ui_debug_dump_tree", signature: "char* ui_debug_dump_tree(UiWindow win)", description: "Dump widget tree as JSON string" },

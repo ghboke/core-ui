@@ -15,7 +15,7 @@
 > **8.4 MB 一个 DLL，就能写出跟 Office / VSCode 同一设计语言的 Windows 桌面应用。**
 > 不要 Chromium、不要 .NET、不要 Qt 几十兆的 moc/uic——一个 C 头文件，一份 `.ui` 标记文件，搞定。
 
-![version](https://img.shields.io/badge/version-1.1.0.2-blue)
+![version](https://img.shields.io/badge/version-1.3.0.4-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2B-lightgrey)
 ![size](https://img.shields.io/badge/dll-8.4MB-brightgreen)
