@@ -7,6 +7,7 @@
   &nbsp;·&nbsp;
   <a href="https://ghboke.github.io/core-ui/"><b>📖 Online Docs</b></a>
 </p>
+
 **Core UI** is a modern Windows desktop UI framework. Rendering runs on **Direct2D / Direct3D 11** hardware acceleration, aligned with Microsoft's **Fluent 2** visual language, and every widget — from buttons and text fields to Flyout, Dialog, and TitleBar (25+ built-ins) — is exposed through a single **pure C API (250+ functions)**, so Rust, Go, Python, C#, Delphi, and even Lua can bind it directly without a C++ shim. UIs are best described in **`.uix` single-file components** — Vue 3 SFC style (`<window>` + `<script>` + `<style>` + `<template>`) with reactive bindings, `v-if` / `v-for` / `v-model` / `@click`, a CSS subset, and CSS-variable theming. Scripts are evaluated in-process by an embedded **QuickJS-NG** runtime — no DOM, no Webview.
 
 > **A 3.0 MB single DLL that ships Office / VS Code-grade UI on Windows.**

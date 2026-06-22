@@ -7,6 +7,7 @@
   &nbsp;·&nbsp;
   <a href="https://ghboke.github.io/core-ui/"><b>📖 在线文档</b></a>
 </p>
+
 **Core UI** 是一个现代化的 Windows 桌面 UI 框架，底层基于 **Direct2D / Direct3D 11** 硬件加速渲染，对齐 Microsoft **Fluent 2** 视觉语言，把从按钮、文本框到 Flyout、Dialog、TitleBar 的 25+ 个内置控件统一在一套**纯 C API**（250+ 个导出函数）之下——Rust、Go、Python、C#、Delphi 乃至 Lua 都能直接调用，不需要写 C++ 绑定层。界面推荐用 **`.uix` 单文件组件**（Vue 3 SFC 风格：`<window>` + `<script>` + `<style>` + `<template>`）描述：响应式数据绑定、`v-if` / `v-for` / `v-model` / `@click`、CSS 子集和 CSS 变量主题，脚本由内置的 **QuickJS-NG** 在原生进程内求值——没有 DOM、没有 Webview。
 
 > **3.0 MB 一个 DLL，就能写出跟 Office / VSCode 同一设计语言的 Windows 桌面应用。**
