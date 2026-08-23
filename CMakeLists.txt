@@ -234,6 +234,16 @@ endif()
 
 option(UI_CORE_BUILD_INTERNAL_TESTS
     "Build internal regression test targets when test/ is available" ON)
+if(UI_CORE_BUILD_INTERNAL_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/src/scroll_view_layout_test.cpp")
+    add_executable(scroll_view_layout_test EXCLUDE_FROM_ALL
+        test/src/scroll_view_layout_test.cpp
+    )
+    target_compile_definitions(scroll_view_layout_test PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(scroll_view_layout_test PRIVATE src/ui)
+    target_link_libraries(scroll_view_layout_test PRIVATE core-ui)
+endif()
+
 if(UI_CORE_BUILD_INTERNAL_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/src/svg_normalize_test.cpp")
     add_executable(svg_normalize_test EXCLUDE_FROM_ALL
         test/src/svg_normalize_test.cpp
