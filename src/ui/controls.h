@@ -502,8 +502,10 @@ private:
 
     float ThumbWidth() const { return (hoveringBar_ || draggingThumb_) ? kThumbWide : kThumbThin; }
     void ClampScroll();
+    D2D1_RECT_F ViewportRect() const;
     float VisibleHeight() const;
     D2D1_RECT_F ThumbRect() const;
+    void DrawScrollbar(Renderer& r);
 };
 
 // ---- RadioButton ----
