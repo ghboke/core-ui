@@ -618,6 +618,7 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
     if (prop == "text") {
         if (auto* lbl = dynamic_cast<LabelWidget*>(w))  lbl->SetText(ToWide(v.ToString()));
         else if (auto* btn = dynamic_cast<ButtonWidget*>(w)) btn->SetText(ToWide(v.ToString()));
+        else if (auto* nav = dynamic_cast<NavItemWidget*>(w)) nav->SetText(ToWide(v.ToString()));
         return;
     }
     if (prop == "id") {
@@ -759,6 +760,32 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
                 return;
             }
             painted ? tg->SetOn(b)       : tg->SetOnImmediate(b);
+        } else if (auto* nav = dynamic_cast<NavItemWidget*>(w)) {
+            if (nav->IsSelected() == b) {
+                traceBindingNoop();
+                shouldInvalidate = false;
+                return;
+            }
+            nav->SetSelected(b);
+        }
+        return;
+    }
+    if (prop == "open") {
+        if (auto* split = dynamic_cast<SplitViewWidget*>(w)) {
+            const bool open = v.ToBool();
+            if (split->IsPaneOpen() == open) {
+                traceBindingNoop();
+                shouldInvalidate = false;
+                return;
+            }
+            w->PaintedOnce() ? split->SetPaneOpen(open) : split->SetPaneOpenImmediate(open);
+        }
+        return;
+    }
+    if (prop == "active" || prop == "activeIndex") {
+        if (auto* stack = dynamic_cast<StackWidget*>(w)) {
+            stack->SetActiveIndex(static_cast<int>(v.ToNumber()));
+            ui::RequestLayout();
         }
         return;
     }

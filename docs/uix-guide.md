@@ -539,11 +539,14 @@ obj.unknown          # 返回 null（不报错）
 | 标签 | Widget | 说明 |
 |---|---|---|
 | `<div>` | `VBoxWidget`（或 `HBoxWidget` 如果 `flex-direction: row`）| 通用容器 |
+| `<Stack active="0">` | `StackWidget` | 只显示一个直接子元素；`:active` 可反应式切换页面 |
+| `<SplitView mode="inline" open="true">` | `SplitViewWidget` | 恰好两个元素子节点，依次为 pane 和 content；`:open` 可反应式控制侧栏 |
 | `<span>` | `LabelWidget` | |
 | `<p>` | `LabelWidget`（支持换行）| **没有 inline 流**——子元素 `<strong>`/`<em>` 会堆叠显示，不会 inline 混排 |
 | `<h1>`–`<h6>` | `LabelWidget` | 预设字号 + 粗体 |
 | `<a>` | `LabelWidget` | 加 cursor:pointer（不自动导航）|
 | `<button>` | `ButtonWidget` | CSS `background-color` 映射 `SetCustomBgColor` |
+| `<NavItem text="..." selected="true"/>` | `NavItemWidget` | SplitView 侧栏导航项；`:text` / `:selected` 支持反应式绑定 |
 | `<input type="text"/>` | `TextInputWidget` | |
 | `<input type="checkbox"/>` | `CheckBoxWidget` | |
 | `<input type="radio"/>` | `RadioButtonWidget` | `name` 属性作为同组标识 |
@@ -574,6 +577,9 @@ obj.unknown          # 返回 null（不报错）
 | 标签 | 属性 | 作用 |
 |---|---|---|
 | `<TitleBar>` | `title`、`show-minimize`、`show-maximize`、`show-close`、`show-icon`（都是 `true`/`false`）| |
+| `<Stack>` | `active` | 初始显示的直接子元素索引 |
+| `<SplitView>` | `mode`、`open`、`openPaneLength`、`compactPaneLength` | mode 为 `overlay` / `inline` / `compactOverlay` / `compactInline` |
+| `<NavItem>` | `text`、`svg`、`glyph`、`selected` | `selected` 控制选中指示器 |
 | `<ProgressBar>` | `min`、`max`、`value`（数字）、`indeterminate`（true/1 = 动画 stripe）| 构造时解析 |
 | `<input type="range">` | `min`、`max`、`value` | |
 | `<input type="number">` | `min`、`max`、`value`、`step` | step 决定显示小数位 |

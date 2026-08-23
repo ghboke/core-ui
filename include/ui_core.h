@@ -389,6 +389,7 @@ UI_API void ui_window_on_key(UiWindow win, UiWindowKeyCallback cb, void* userdat
 /* ------------------------------------------------------------------ */
 UI_API UiWidget ui_vbox(void);
 UI_API UiWidget ui_hbox(void);
+UI_API UiWidget ui_stack(void);
 UI_API UiWidget ui_spacer(float size);     /* 0 = expanding */
 UI_API UiWidget ui_panel(UiColor bg);
 UI_API UiWidget ui_panel_themed(int theme_color_id);  /* 0=sidebar_bg, 1=toolbar_bg, 2=content_bg */
@@ -410,6 +411,8 @@ UI_API UiWidget ui_toggle(const wchar_t* text);
 UI_API UiWidget ui_progress_bar(float min_val, float max_val, float value);
 UI_API UiWidget ui_tab_control(void);
 UI_API UiWidget ui_scroll_view(void);
+UI_API UiWidget ui_nav_item(const wchar_t* text, const char* svg);
+UI_API UiWidget ui_split_view(void);
 UI_API UiWidget ui_dialog(void);
 
 /* ------------------------------------------------------------------ */
@@ -852,6 +855,37 @@ UI_API void  ui_progress_set_value(UiWidget w, float value);
 UI_API void ui_tab_add(UiWidget tab_control, const wchar_t* title, UiWidget content);
 UI_API int  ui_tab_get_active(UiWidget tab_control);
 UI_API void ui_tab_set_active(UiWidget tab_control, int index);
+
+/* ------------------------------------------------------------------ */
+/* Stack                                                              */
+/* ------------------------------------------------------------------ */
+UI_API int  ui_stack_get_active_index(UiWidget stack);
+UI_API void ui_stack_set_active_index(UiWidget stack, int index);
+
+/* ------------------------------------------------------------------ */
+/* NavItem                                                            */
+/* ------------------------------------------------------------------ */
+UI_API int  ui_nav_get_selected(UiWidget nav_item);
+UI_API void ui_nav_set_selected(UiWidget nav_item, int selected);
+
+/* ------------------------------------------------------------------ */
+/* SplitView                                                          */
+/* ------------------------------------------------------------------ */
+typedef enum UiSplitViewMode {
+    UI_SPLIT_VIEW_OVERLAY = 0,
+    UI_SPLIT_VIEW_INLINE = 1,
+    UI_SPLIT_VIEW_COMPACT_OVERLAY = 2,
+    UI_SPLIT_VIEW_COMPACT_INLINE = 3
+} UiSplitViewMode;
+
+UI_API void ui_split_set_pane(UiWidget split_view, UiWidget pane);
+UI_API void ui_split_set_content(UiWidget split_view, UiWidget content);
+UI_API int  ui_split_get_open(UiWidget split_view);
+UI_API void ui_split_set_open(UiWidget split_view, int open);
+UI_API void ui_split_set_open_immediate(UiWidget split_view, int open);
+UI_API void ui_split_set_mode(UiWidget split_view, UiSplitViewMode mode);
+UI_API void ui_split_set_open_pane_length(UiWidget split_view, float length);
+UI_API void ui_split_set_compact_pane_length(UiWidget split_view, float length);
 
 /* ------------------------------------------------------------------ */
 /* ScrollView                                                         */

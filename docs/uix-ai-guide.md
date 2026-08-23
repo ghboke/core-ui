@@ -244,8 +244,11 @@ CSS 子集 + 选择器 + cascade。常用属性：
 | 标签 | 作用 |
 |------|------|
 | `div` / `section` / `nav` | flex 容器 (默认 column) |
+| `Stack` | 只显示一个子页面的容器；`active` 指定当前索引 |
+| `SplitView` | 侧栏 + 内容双槽布局；前两个元素子节点分别作为侧栏和内容 |
 | `label` / `span` / `p` / `h1`-`h6` | 文本（不可编辑） |
 | `button` | 按钮 |
+| `NavItem` | 侧栏导航项；支持 `text` / `svg` / `glyph` / `selected` |
 | `input` | 文本输入；`type="password"` / `checkbox` / `radio` / `range` / `number` 切换形态 |
 | `textarea` | 多行文本 |
 | `toggle` | 开关 |
