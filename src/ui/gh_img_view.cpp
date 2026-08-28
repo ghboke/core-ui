@@ -14,9 +14,12 @@
 #include "event.h"
 #include "display_list.h"
 #include "svg_style_inliner.h"
+#include "svg_d2d_segments.h"
+#include "image_shadow_geom.h"
 #include "ui_context.h"
 #include "debug_trace.h"
 #include "resource_store.h"
+#include "theme.h"
 
 #include <lunasvg.h>     /* SVG thumbnail/fallback data; main interactive view uses
                           * D2D ID2D1SvgDocument when it can be created. */
@@ -88,6 +91,14 @@ inline ImageSampling SamplingForInterp(D2D1_INTERPOLATION_MODE interp) {
     if (interp == D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR) return ImageSampling::Nearest;
     if (interp == D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC) return ImageSampling::HighQualityCubic;
     return ImageSampling::Linear;
+}
+
+// 瓦片专用: 越界采样 clamp 到边缘像素。DrawBitmap 默认按透明采样边界外,
+// 放大时每块瓦片边缘插值淡出 → 拼缝一条半透明缝线 (透明图上尤其明显)。
+inline ImageSampling TileSamplingForInterp(D2D1_INTERPOLATION_MODE interp) {
+    if (interp == D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR) return ImageSampling::Nearest;
+    if (interp == D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC) return ImageSampling::HighQualityCubicClamp;
+    return ImageSampling::LinearClamp;
 }
 
 inline int NormalizeAngle(int a) {
@@ -1122,14 +1133,6 @@ std::string BuildD2DFilteredElementsSvg_(const std::string& svg) {
     return out;
 }
 
-struct D2DDropShadowLayerXml_ {
-    std::string shadowXml;
-    std::string coverXml;
-    float dx = 0.0f;
-    float dy = 0.0f;
-    float stdDeviation = 0.0f;
-};
-
 enum class D2DFilterPaintMode_ {
     SourcePaintBlur,
     RecolorSourceAlpha
@@ -1144,83 +1147,6 @@ struct D2DFilterSpec_ {
     float dy = 0.0f;
     float stdDeviation = 0.0f;
 };
-
-std::string BuildD2DBaseWithoutFilteredElementsSvg_(const std::string& svg) {
-    std::string out;
-    out.reserve(svg.size());
-    size_t pos = 0;
-    while (true) {
-        size_t lt = svg.find('<', pos);
-        if (lt == std::string::npos) {
-            out.append(svg, pos, std::string::npos);
-            break;
-        }
-        size_t gt = svg.find('>', lt);
-        if (gt == std::string::npos) {
-            out.append(svg, pos, std::string::npos);
-            break;
-        }
-        std::string tag = svg.substr(lt, gt - lt + 1);
-        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
-        if (!info.special && !info.closing &&
-            IsD2DUnsupportedSvgElement_(info.name)) {
-            out.append(svg, pos, lt - pos);
-            pos = info.selfClosing
-                ? gt + 1
-                : FindSvgElementEnd_(svg, lt, gt, info.name);
-            continue;
-        }
-        if (!info.special && !info.closing &&
-            !ExtractXmlAttr_(tag, "filter").empty()) {
-            std::string cleaned = tag;
-            EraseXmlAttr_(cleaned, "filter");
-            out.append(svg, pos, lt - pos);
-            out += cleaned;
-            pos = gt + 1;
-            continue;
-        }
-        out.append(svg, pos, gt + 1 - pos);
-        pos = gt + 1;
-    }
-    return out;
-}
-
-std::string BuildD2DLayerResourceContext_(const std::string& svg, size_t rootGt) {
-    std::string out;
-    int depth = 0;
-    size_t pos = rootGt + 1;
-    while (pos < svg.size()) {
-        size_t lt = svg.find('<', pos);
-        if (lt == std::string::npos) break;
-        size_t gt = svg.find('>', lt);
-        if (gt == std::string::npos) break;
-
-        SvgTagInfo_ info = ParseSvgTag_(svg, lt, gt);
-        if (info.special) {
-            pos = gt + 1;
-            continue;
-        }
-        if (info.closing) {
-            if (depth == 0 && info.name == "svg") break;
-            if (depth > 0) --depth;
-            pos = gt + 1;
-            continue;
-        }
-
-        if (depth == 0 && IsD2DLayerResourceElement_(info.name)) {
-            size_t end = info.selfClosing ? gt + 1
-                                          : FindSvgElementEnd_(svg, lt, gt, info.name);
-            if (end <= lt) end = gt + 1;
-            out += BuildD2DBaseWithoutFilteredElementsSvg_(svg.substr(lt, end - lt));
-            pos = end;
-            continue;
-        }
-
-        if (!info.selfClosing) ++depth;
-        pos = gt + 1;
-    }
-    return out;
-}
 
 std::string BuildSvgThumbnailXml_(const std::string& svg) {
     std::string out;
@@ -1379,100 +1305,105 @@ const D2DFilterSpec_* FindD2DFilterSpec_(const std::vector<D2DFilterSpec_>& spec
     return nullptr;
 }
 
-std::vector<D2DDropShadowLayerXml_> BuildD2DDropShadowLayerXmls_(const std::string& svg) {
-    std::vector<D2DDropShadowLayerXml_> layers;
-    size_t rootLt = svg.find("<svg");
-    size_t rootGt = rootLt == std::string::npos ? std::string::npos : svg.find('>', rootLt);
-    if (rootLt == std::string::npos || rootGt == std::string::npos) return layers;
+/* 把一个带 filter 的元素的开标签改写成"阴影版": 去掉自身 paint, 换成滤镜的
+ * flood 颜色。元素的子树和祖先链由分段器保留, 这里只动这一个开标签。
+ *
+ * 限界: 对 <g filter=...> 这种容器, 换 g 的 fill 盖不住子元素自己写死的 fill,
+ * 阴影会带上原色。真正的做法是按 SourceAlpha 取整组 alpha 做剪影 —— 归 P2 的
+ * filter → D2D effect 图编译器。此前的实现更糟 (直接把子树整个丢掉)。 */
+std::string BuildShadowOpenTag_(const std::string& openTag,
+                                const D2DFilterSpec_& spec) {
+    size_t nameStart = 1;
+    size_t nameEnd = nameStart;
+    while (nameEnd < openTag.size() && IsXmlNameChar_(openTag[nameEnd])) ++nameEnd;
+    if (nameEnd == nameStart) return openTag;
+    const std::string tagName = openTag.substr(nameStart, nameEnd - nameStart);
 
-    std::vector<D2DFilterSpec_> filterSpecs = CollectD2DFilterSpecs_(svg);
-    if (filterSpecs.empty()) return layers;
-
-    std::string rootOpen = svg.substr(rootLt, rootGt - rootLt + 1);
-    std::string layerResourceContext = BuildD2DLayerResourceContext_(svg, rootGt);
-
-    size_t pos = rootGt + 1;
-    while (true) {
-        size_t lt = svg.find('<', pos);
-        if (lt == std::string::npos) break;
-        size_t gt = svg.find('>', lt);
-        if (gt == std::string::npos) break;
-        if (lt + 1 >= svg.size() || svg[lt + 1] == '/' || svg[lt + 1] == '?' ||
-            svg[lt + 1] == '!') {
-            pos = gt + 1;
-            continue;
-        }
-
-        std::string tag = svg.substr(lt, gt - lt + 1);
-        std::string filterId = ExtractFirstSvgUrlRefId_(ExtractXmlAttr_(tag, "filter"));
-        const D2DFilterSpec_* filterSpec = FindD2DFilterSpec_(filterSpecs, filterId);
-        if (!filterSpec) {
-            pos = gt + 1;
-            continue;
-        }
-
-        size_t nameStart = lt + 1;
-        size_t nameEnd = nameStart;
-        while (nameEnd < gt && IsXmlNameChar_(svg[nameEnd])) ++nameEnd;
-        std::string tagName = svg.substr(nameStart, nameEnd - nameStart);
-        std::string attrs = svg.substr(nameEnd, gt - nameEnd);
-        if (!attrs.empty() && attrs.back() == '>') attrs.pop_back();
-        if (!attrs.empty() && attrs.back() == '/') attrs.pop_back();
-
-        const bool hadStroke = TagHasAttr_(tag, "stroke") ||
-                               TagNameIs_(tagName, "line", "polyline");
-        const bool hadFill = TagHasAttr_(tag, "fill") ||
-                             TagNameIs_(tagName, "circle", "ellipse", "rect", "polygon");
-
-        std::string coverAttrs = attrs;
-        EraseXmlAttr_(coverAttrs, "filter");
-        std::string shadowAttrs = coverAttrs;
-
-        const bool recolorShadow =
-            filterSpec->paintMode == D2DFilterPaintMode_::RecolorSourceAlpha;
-        if (recolorShadow) {
-            EraseXmlAttr_(shadowAttrs, "style");
-            EraseXmlAttr_(shadowAttrs, "fill");
-            EraseXmlAttr_(shadowAttrs, "stroke");
-            EraseXmlAttr_(shadowAttrs, "fill-opacity");
-            EraseXmlAttr_(shadowAttrs, "stroke-opacity");
-        }
-
-        std::string cover = rootOpen + layerResourceContext + "<" + tagName +
-                            coverAttrs + "/></svg>";
-        std::string shadow = rootOpen + layerResourceContext + "<" + tagName +
-                             shadowAttrs;
-        if (recolorShadow) {
-            if (hadFill) {
-                shadow += " fill=\"" + filterSpec->color + "\" fill-opacity=\"" +
-                          std::to_string(filterSpec->opacity) + "\"";
-            } else {
-                shadow += " fill=\"none\"";
-            }
-            if (hadStroke) {
-                shadow += " stroke=\"" + filterSpec->color + "\" stroke-opacity=\"" +
-                          std::to_string(filterSpec->opacity) + "\"";
-            }
-        }
-        shadow += "/></svg>";
-
-        layers.push_back(D2DDropShadowLayerXml_{std::move(shadow), std::move(cover),
-                                                filterSpec->dx, filterSpec->dy,
-                                                filterSpec->stdDeviation});
-        pos = gt + 1;
+    size_t tail = openTag.size();
+    while (tail > nameEnd && openTag[tail - 1] != '>') --tail;
+    if (tail == nameEnd) return openTag;
+    --tail;                                     // 指向 '>'
+    bool selfClosing = false;
+    size_t attrEnd = tail;
+    while (attrEnd > nameEnd &&
+           std::isspace(static_cast<unsigned char>(openTag[attrEnd - 1]))) {
+        --attrEnd;
     }
-    return layers;
+    if (attrEnd > nameEnd && openTag[attrEnd - 1] == '/') {
+        selfClosing = true;
+        --attrEnd;
+    }
+    std::string attrs = openTag.substr(nameEnd, attrEnd - nameEnd);
+
+    const bool hadStroke = TagHasAttr_(openTag, "stroke") ||
+                           TagNameIs_(tagName, "line", "polyline");
+    const bool hadFill = TagHasAttr_(openTag, "fill") ||
+                         TagNameIs_(tagName, "circle", "ellipse", "rect", "polygon");
+
+    if (spec.paintMode == D2DFilterPaintMode_::RecolorSourceAlpha) {
+        EraseXmlAttr_(attrs, "style");
+        EraseXmlAttr_(attrs, "fill");
+        EraseXmlAttr_(attrs, "stroke");
+        EraseXmlAttr_(attrs, "fill-opacity");
+        EraseXmlAttr_(attrs, "stroke-opacity");
+        if (hadFill) {
+            attrs += " fill=\"" + spec.color + "\" fill-opacity=\"" +
+                     std::to_string(spec.opacity) + "\"";
+        } else {
+            attrs += " fill=\"none\"";
+        }
+        if (hadStroke) {
+            attrs += " stroke=\"" + spec.color + "\" stroke-opacity=\"" +
+                     std::to_string(spec.opacity) + "\"";
+        }
+    }
+    return "<" + tagName + attrs + (selfClosing ? "/>" : ">");
+}
+
+/* SVG 文本 -> 有序 D2D 绘制步骤。分段器命中红线时置 *rasterOnly 并返回空,
+ * 调用方据此回落 LunaSVG 光栅。 */
+std::vector<SvgDocumentRef::Step> BuildD2DSvgSteps_(const std::string& svg,
+                                                    bool* rasterOnly) {
+    std::vector<SvgDocumentRef::Step> out;
+    svgseg::Plan plan = svgseg::BuildPlan(svg);
+    if (!plan.usable) {
+        if (rasterOnly) *rasterOnly = true;
+        return out;
+    }
+
+    const std::vector<D2DFilterSpec_> filterSpecs = CollectD2DFilterSpecs_(svg);
+    out.reserve(plan.steps.size());
+    for (const auto& segStep : plan.steps) {
+        SvgDocumentRef::Step step;
+        step.xml = svgseg::StepXml(segStep);
+        if (segStep.filtered) {
+            const D2DFilterSpec_* spec =
+                FindD2DFilterSpec_(filterSpecs, segStep.filterId);
+            if (spec) {
+                step.shadow_xml = svgseg::StepXmlWithOpenTag(
+                    segStep, BuildShadowOpenTag_(segStep.openTag, *spec));
+                step.dx = spec->dx;
+                step.dy = spec->dy;
+                step.std_deviation = spec->stdDeviation;
+            }
+        }
+        out.push_back(std::move(step));
+    }
+    return out;
 }
 
 } // namespace
 
 namespace test {
 
-std::pair<std::string, std::string> BuildFirstD2DDropShadowLayerXmlForTest(
+/* 返回每一步的 (shadow_xml, xml)。普通段 shadow_xml 为空。顺序即绘制顺序。 */
+std::vector<std::pair<std::string, std::string>> BuildD2DSvgStepsForTest(
     const std::string& svg) {
-    auto layers = BuildD2DDropShadowLayerXmls_(svg);
-    if (layers.empty()) return {};
-    return {layers.front().shadowXml, layers.front().coverXml};
+    std::vector<std::pair<std::string, std::string>> out;
+    bool rasterOnly = false;
+    for (auto& step : BuildD2DSvgSteps_(svg, &rasterOnly))
+        out.emplace_back(std::move(step.shadow_xml), std::move(step.xml));
+    return out;
 }
 
 std::pair<std::string, bool> ConvertSimpleSvgMasksToClipPathsForD2DForTest(
@@ -1684,7 +1615,126 @@ GhImgViewWidget::~GhImgViewWidget() {
     if (previewResourceKey_.IsValid()) {
         GlobalResourceStore().Remove(previewResourceKey_);
     }
+    if (checkerTileResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(checkerTileResourceKey_);
+    }
     ClearSvgRaster_();
+}
+
+// ===== 棋盘垫层 (透明像素对比背景) =====
+
+namespace {
+/* 棋盘瓦片的保留 generation — 见 gh_img_view.h 成员注释。 */
+constexpr uint64_t kCheckerTileGeneration = ~0ull;
+}  // namespace
+
+void GhImgViewWidget::EnsureCheckerboardTile_(Renderer& r) {
+    const int curTheme = (int)theme::CurrentMode();
+    if (checkerTileResourceKey_.IsValid() && checkerTheme_ == curTheme) {
+        if (!checkerTile_) {
+            auto res = GlobalResourceStore().Acquire(checkerTileResourceKey_);
+            if (res && res->bytes) {
+                checkerTile_ = r.CreateBitmapFromPixels(
+                    res->bytes->data(), res->width, res->height, res->stride);
+            }
+        }
+        return;
+    }
+
+    if (checkerTileResourceKey_.IsValid()) {
+        GlobalResourceStore().Remove(checkerTileResourceKey_);
+        checkerTileResourceKey_ = {};
+    }
+    checkerTile_.Reset();
+
+    /* 16×16 / 8px 方格, 配色对齐 ImageViewPlusWidget::EnsureCheckerboardTile。 */
+    const int sz = 16;
+    uint8_t pixels[sz * sz * 4];
+    uint32_t c1, c2;
+    if (theme::CurrentMode() == theme::Mode::Dark) {
+        c1 = (255u << 24) | (71u << 16)  | (64u << 8)  | 64u;
+        c2 = (255u << 24) | (56u << 16)  | (51u << 8)  | 51u;
+    } else {
+        /* build 280: 浅色格子提亮到 #FAFAFA/#E6E6E6 —— 旧的 #CCCCCC/#999999
+         * 在浅色主题下压得太重, 透明区看起来比图还抢眼。 */
+        c1 = (255u << 24) | (250u << 16) | (250u << 8) | 250u;
+        c2 = (255u << 24) | (230u << 16) | (230u << 8) | 230u;
+    }
+    for (int y = 0; y < sz; ++y)
+        for (int x = 0; x < sz; ++x) {
+            int ix = x / 8, iy = y / 8;
+            uint32_t c = ((ix + iy) % 2 == 0) ? c1 : c2;
+            memcpy(pixels + (y * sz + x) * 4, &c, 4);
+        }
+
+    ResourceKey key = GlobalResourceStore().AddImage(
+        ResourceKind::Bitmap, kCheckerTileGeneration, sz, sz, sz * 4,
+        PixelFormat::BgraPremul, pixels, true);
+    if (!key.IsValid()) return;
+
+    checkerTileResourceKey_ = key;
+    auto res = GlobalResourceStore().Acquire(checkerTileResourceKey_);
+    if (res && res->bytes) {
+        checkerTile_ = r.CreateBitmapFromPixels(
+            res->bytes->data(), res->width, res->height, res->stride);
+    }
+    checkerTheme_ = curTheme;
+}
+
+void GhImgViewWidget::DrawCheckerboard_(Renderer& r, const D2D1_RECT_F& area) {
+    EnsureCheckerboardTile_(r);
+    if (!checkerTile_ && !checkerTileResourceKey_.IsValid()) return;
+    r.FillRectWithImagePattern(checkerTileResourceKey_, checkerTile_.Get(), area);
+}
+
+void GhImgViewWidget::DrawImageShadow_(Renderer& r, const D2D1_RECT_F& visual,
+                                       const D2D1_RECT_F& viewport) {
+    namespace ish = imgshadow;
+
+    /* 图片在屏上太小时常规阴影会盖过图片本身 —— 按短边降档 / 隐藏。
+     * 注意用的是 visual (屏幕尺寸), 不是原图分辨率: 决定观感的是屏上多大。 */
+    const ish::Tier tier = ish::ResolveTier(visual.right - visual.left,
+                                            visual.bottom - visual.top);
+    if (tier == ish::Tier::Hidden) return;
+
+    const bool dark = theme::CurrentMode() == theme::Mode::Dark;
+    const ish::Params p = ish::ScaleParams(ish::ParamsForTheme(dark),
+                                           ish::TierScale(tier));
+
+    const ish::RectF img{visual.left, visual.top, visual.right, visual.bottom};
+    const ish::RectF vp{viewport.left, viewport.top, viewport.right, viewport.bottom};
+
+    if (p.shadowAlpha > 0.0f && p.blur > 0.0f) {
+        ish::RectF bands[4];
+        const int n = ish::ShadowBands(img, vp, p.blur, p.offsetY, bands);
+        if (n > 0) {
+            const ish::RectF s = ish::ShadowBounds(img, p.blur, p.offsetY);
+            const D2D1_RECT_F shadowRect{s.left, s.top, s.right, s.bottom};
+            const D2D1_COLOR_F shadowColor = D2D1::ColorF(0.0f, 0.0f, 0.0f,
+                                                          p.shadowAlpha);
+            /* 每条边带各裁剪一次再画同一个模糊矩形 —— 图片矩形被挖空, 透明图
+             * 的透明区不会透出暗块。D2D 的 effect 按输出区域惰性求值, 裁到窄
+             * 边带后四次的总开销约等于一次全幅模糊, 不必自建离屏复用。 */
+            for (int i = 0; i < n; ++i) {
+                const D2D1_RECT_F clip{bands[i].left, bands[i].top,
+                                       bands[i].right, bands[i].bottom};
+                r.PushClip(clip);
+                r.DrawBlurredRoundedRect(shadowRect, 0.0f, 0.0f, p.blur, shadowColor);
+                r.PopClip();
+            }
+        }
+    }
+
+    /* 描边落在图片矩形外侧半个 dip 处, 1dip 笔画整条在图片之外 (D2D 描边沿路径
+     * 居中), 不吃掉图片最外圈那行像素。纯投影对"白底画布上的白图"基本无效,
+     * 这道描边补的就是那个洞; 深色主题下它是边界感的主力。 */
+    if (p.hairlineAlpha > 0.0f) {
+        const ish::RectF h = ish::HairlineRect(img);
+        const D2D1_COLOR_F c = p.hairlineLight
+            ? D2D1::ColorF(1.0f, 1.0f, 1.0f, p.hairlineAlpha)
+            : D2D1::ColorF(0.0f, 0.0f, 0.0f, p.hairlineAlpha);
+        r.DrawRect(D2D1_RECT_F{h.left, h.top, h.right, h.bottom}, c, 1.0f);
+    }
 }
 
 // ===== 数据形状 =====
@@ -1712,11 +1762,11 @@ void GhImgViewWidget::Begin(const Info& info, Renderer& r) {
     /* 切瓦块 source 前清 SVG 状态. svgSlot_ 置空 = 放弃任何在飞后台渲染 (其线程
      * 写到的是旧 slot, 自然丢弃)。 */
     svgDoc_.reset();
-    svgD2DDoc_.Reset();
-    svgD2DXml_.clear();
+    svgD2DSteps_.clear();
+    svgD2DStepDocs_.clear();
+    svgD2DStepShadowDocs_.clear();
     svgThumbXml_.clear();
     svgRasterMain_ = false;
-    svgD2DShadowLayers_.clear();
     ClearSvgRaster_();
     svgW_ = svgH_ = 0;
     svgSlot_.reset();
@@ -1893,11 +1943,11 @@ void GhImgViewWidget::Clear() {
     previewResourceKey_ = {};
     previewW_ = previewH_ = 0;
     svgDoc_.reset();
-    svgD2DDoc_.Reset();
-    svgD2DXml_.clear();
+    svgD2DSteps_.clear();
+    svgD2DStepDocs_.clear();
+    svgD2DStepShadowDocs_.clear();
     svgThumbXml_.clear();
     svgRasterMain_ = false;
-    svgD2DShadowLayers_.clear();
     ClearSvgRaster_();
     svgW_ = svgH_ = 0;
     svgSlot_.reset();
@@ -1957,36 +2007,48 @@ bool GhImgViewWidget::SetSvgFromFile(const std::wstring& path, Renderer& r) {
      * over. Loading must therefore validate/store XML without requiring a UI
      * RT; the render thread will recreate the SvgDocument while replaying the
      * DisplayList. */
-    Microsoft::WRL::ComPtr<ID2D1SvgDocument> d2dDoc;
     std::string xml;
-    std::string d2dXml;
+    std::vector<SvgDocumentRef::Step> d2dSteps;
     std::string thumbXml;
     bool needsRasterMain = false;
+    Microsoft::WRL::ComPtr<ID2D1SvgDocument> probeDoc;   /* 只用来探 natural size */
     auto tryPrepareSvg = [&](std::string candidateXml) -> bool {
         if (candidateXml.empty()) return false;
         EnsureLunaSvgFallbackFont_();
         candidateXml = ReplaceCssLightDark_(std::move(candidateXml));
+        candidateXml = NormalizeSvgPaintColorsForD2D(std::move(candidateXml));
         candidateXml = ExpandSvgSwitchImageFallbacksForD2D_(candidateXml);
         candidateXml = ExpandEmbeddedSvgImagesForD2D_(candidateXml);
         candidateXml = r.SvgInlineTextAsPaths(candidateXml);
         auto maskConversion = ConvertSimpleSvgMasksToClipPathsForD2D_(candidateXml);
         std::string candidateD2DSource = std::move(maskConversion.xml);
-        std::string candidateD2DXml = HasSvgFilter_(candidateXml)
-            ? BuildD2DBaseWithoutFilteredElementsSvg_(candidateD2DSource)
-            : candidateD2DSource;
+
+        /* 带 filter 的 SVG 按文档顺序切段 (顺序即 z 序); 分段器命中红线时
+         * rasterOnly 置位, 主视图回落 LunaSVG —— 不硬切, 见 svg_d2d_segments.h。 */
+        bool rasterOnly = false;
+        std::vector<SvgDocumentRef::Step> candidateSteps;
+        if (HasSvgFilter_(candidateXml)) {
+            candidateSteps = BuildD2DSvgSteps_(candidateD2DSource, &rasterOnly);
+        }
+        if (candidateSteps.empty()) {
+            candidateSteps.resize(1);
+            candidateSteps[0].xml = candidateD2DSource;
+        }
         std::string candidateThumbXml = HasSvgFilter_(candidateXml)
             ? BuildSvgThumbnailXml_(candidateXml)
             : std::string{};
-        Microsoft::WRL::ComPtr<ID2D1SvgDocument> candidateDoc;
-        if (!r.CreateSvgDocumentFromXml(candidateD2DXml, 1024.0f, 1024.0f,
-                                        hasImmediateD2D ? &candidateDoc : nullptr)) {
+        /* 第一段能被 D2D 解析 = 这份 SVG 走得通 D2D 路径。有 UI RT 时顺便留下
+         * 这份 document 供下面探 natural size (viewBox / width / height), 不入缓存。 */
+        Microsoft::WRL::ComPtr<ID2D1SvgDocument> candidateProbe;
+        if (!r.CreateSvgDocumentFromXml(candidateSteps[0].xml, 1024.0f, 1024.0f,
+                                        hasImmediateD2D ? &candidateProbe : nullptr)) {
             return false;
         }
         xml = std::move(candidateXml);
-        d2dXml = std::move(candidateD2DXml);
+        d2dSteps = std::move(candidateSteps);
+        probeDoc = std::move(candidateProbe);
         thumbXml = std::move(candidateThumbXml);
-        d2dDoc = std::move(candidateDoc);
-        needsRasterMain = NeedsLunaSvgMainRenderer_(xml) ||
+        needsRasterMain = rasterOnly || NeedsLunaSvgMainRenderer_(xml) ||
                           maskConversion.hasUnconvertedMaskRefs;
         return true;
     };
@@ -2022,9 +2084,10 @@ bool GhImgViewWidget::SetSvgFromFile(const std::wstring& path, Renderer& r) {
         natW = static_cast<uint32_t>(viewBoxW + 0.5f);
         natH = static_cast<uint32_t>(viewBoxH + 0.5f);
     }
+    bool sizedExplicit = haveViewBox || cssW > 0.0f || cssH > 0.0f;
     Microsoft::WRL::ComPtr<ID2D1SvgElement> root;
-    if (d2dDoc) d2dDoc->GetRoot(root.GetAddressOf());
-    if (root && !haveViewBox && cssW <= 0.0f && cssH <= 0.0f) {
+    if (probeDoc) probeDoc->GetRoot(root.GetAddressOf());
+    if (root && !sizedExplicit) {
         D2D1_SVG_VIEWBOX vb{};
         if (SUCCEEDED(root->GetAttributeValue(L"viewBox",
                                               D2D1_SVG_ATTRIBUTE_POD_TYPE_VIEWBOX,
@@ -2032,6 +2095,7 @@ bool GhImgViewWidget::SetSvgFromFile(const std::wstring& path, Renderer& r) {
             vb.width > 0.0f && vb.height > 0.0f) {
             natW = static_cast<uint32_t>(vb.width + 0.5f);
             natH = static_cast<uint32_t>(vb.height + 0.5f);
+            sizedExplicit = true;
         } else {
             D2D1_SVG_LENGTH lw{}, lh{};
             if (SUCCEEDED(root->GetAttributeValue(L"width",
@@ -2039,58 +2103,37 @@ bool GhImgViewWidget::SetSvgFromFile(const std::wstring& path, Renderer& r) {
                                                   &lw, sizeof(lw))) &&
                 lw.value > 0.0f) {
                 natW = static_cast<uint32_t>(lw.value + 0.5f);
+                sizedExplicit = true;
             }
             if (SUCCEEDED(root->GetAttributeValue(L"height",
                                                   D2D1_SVG_ATTRIBUTE_POD_TYPE_LENGTH,
                                                   &lh, sizeof(lh))) &&
                 lh.value > 0.0f) {
                 natH = static_cast<uint32_t>(lh.value + 0.5f);
+                sizedExplicit = true;
             }
         }
 
+    }
+    auto doc = lunasvg::Document::loadFromData(xml);
+    /* 根节点无 viewBox / width / height (常见于 Scratch 积木等工具导出) 时,
+     * 1024×1024 兜底会与实际绘制范围脱节 — 内容溢出声明矩形, natural size
+     * 相关的一切 (fit / zoom / minimap / 棋盘垫层) 都按错误边界算。用 LunaSVG
+     * 的内容包围盒替代: 视口取 (0,0)..(bbox 右下角), 绘制原点不动。 */
+    if (!sizedExplicit && doc) {
+        const lunasvg::Box box = doc->boundingBox();
+        const float right  = box.x + box.w;
+        const float bottom = box.y + box.h;
+        if (right > 1.0f && bottom > 1.0f) {
+            natW = static_cast<uint32_t>(std::ceil(right));
+            natH = static_cast<uint32_t>(std::ceil(bottom));
+        }
     }
     if (natW == 0) natW = 1024;
     if (natH == 0) natH = 1024;
-    if (root) {
-        const D2D1_SVG_LENGTH ow{static_cast<float>(natW), D2D1_SVG_LENGTH_UNITS_NUMBER};
-        const D2D1_SVG_LENGTH oh{static_cast<float>(natH), D2D1_SVG_LENGTH_UNITS_NUMBER};
-        root->SetAttributeValue(L"width", ow);
-        root->SetAttributeValue(L"height", oh);
-    }
-
-    std::vector<SvgD2DDropShadowLayer> shadowLayers;
-    if (HasSvgFilter_(xml)) {
-        auto* ctx5 = hasImmediateD2D ? r.RT5() : nullptr;
-        for (auto& layerXml : BuildD2DDropShadowLayerXmls_(xml)) {
-            SvgD2DDropShadowLayer layer;
-            layer.dx = layerXml.dx;
-            layer.dy = layerXml.dy;
-            layer.stdDeviation = layerXml.stdDeviation;
-
-            if (ctx5) {
-                Microsoft::WRL::ComPtr<IStream> shadowStream =
-                    CreateStreamFromString_(layerXml.shadowXml);
-                Microsoft::WRL::ComPtr<IStream> coverStream =
-                    CreateStreamFromString_(layerXml.coverXml);
-                if (shadowStream) {
-                    ctx5->CreateSvgDocument(shadowStream.Get(),
-                                            D2D1::SizeF((float)natW, (float)natH),
-                                            layer.shadowDoc.GetAddressOf());
-                }
-                if (coverStream) {
-                    ctx5->CreateSvgDocument(coverStream.Get(),
-                                            D2D1::SizeF((float)natW, (float)natH),
-                                            layer.coverDoc.GetAddressOf());
-                }
-            }
-
-            layer.shadowXml = std::move(layerXml.shadowXml);
-            layer.coverXml = std::move(layerXml.coverXml);
-            shadowLayers.push_back(std::move(layer));
-        }
-    }
-
-    auto doc = lunasvg::Document::loadFromData(xml);
+    /* 早前这里还会把 natW/natH 写回 probeDoc 的根节点 width/height。那份 document
+     * 现在只用于探尺寸、探完就丢, 而且真正决定布局的是绘制时的 SetViewportSize
+     * (display list 回放路径从头到尾就没做过这个写回)。故不再写。 */
 
     /* 进入 SVG 模式 — 清瓦块 state, 把 natural size 写进 info_ 让 Fit / zoom
      * 几何全部复用瓦块路径的代码. levels = 1 (SVG 不分级). */
@@ -2104,14 +2147,12 @@ bool GhImgViewWidget::SetSvgFromFile(const std::wstring& path, Renderer& r) {
     svgSlot_ = std::make_shared<SvgRenderSlot>();   /* 新文件 → 新结果槽 */
     svgRasterMain_ = needsRasterMain;
     svgThumbXml_ = std::move(thumbXml);
+    svgD2DStepDocs_.clear();
+    svgD2DStepShadowDocs_.clear();
     if (svgRasterMain_) {
-        svgD2DDoc_.Reset();
-        svgD2DXml_.clear();
-        svgD2DShadowLayers_.clear();
+        svgD2DSteps_.clear();
     } else {
-        svgD2DDoc_ = std::move(d2dDoc);
-        svgD2DXml_ = d2dXml.empty() ? xml : d2dXml;
-        svgD2DShadowLayers_ = std::move(shadowLayers);
+        svgD2DSteps_ = std::move(d2dSteps);
     }
     svgDoc_  = std::move(doc);       /* unique_ptr → shared_ptr */
     svgW_    = natW;
@@ -2172,21 +2213,9 @@ int GhImgViewWidget::RenderSvgToBgra(uint32_t target_w, uint32_t target_h,
         return true;
     };
 
-    if (!svgRasterMain_ && !svgD2DXml_.empty()) {
-        std::vector<SvgDocumentRef::DropShadowLayer> shadowRefs;
-        shadowRefs.reserve(svgD2DShadowLayers_.size());
-        for (const auto& layer : svgD2DShadowLayers_) {
-            if (layer.shadowXml.empty() || layer.coverXml.empty()) continue;
-            SvgDocumentRef::DropShadowLayer ref;
-            ref.shadow_xml = layer.shadowXml;
-            ref.cover_xml = layer.coverXml;
-            ref.dx = layer.dx;
-            ref.dy = layer.dy;
-            ref.std_deviation = layer.stdDeviation;
-            shadowRefs.push_back(std::move(ref));
-        }
-        if (r.RenderSvgDocumentToBgra(svgD2DXml_, static_cast<float>(svgW_),
-                                      static_cast<float>(svgH_), shadowRefs,
+    if (!svgRasterMain_ && !svgD2DSteps_.empty()) {
+        if (r.RenderSvgDocumentToBgra(svgD2DSteps_, static_cast<float>(svgW_),
+                                      static_cast<float>(svgH_),
                                       out_w_v, out_h_v, out_bgra)) {
             if (out_w) *out_w = out_w_v;
             if (out_h) *out_h = out_h_v;
@@ -2475,6 +2504,11 @@ void GhImgViewWidget::Fit() {
     if (info_.fullWidth == 0 || info_.fullHeight == 0) return;
     float w = std::max(1.0f, rect.right - rect.left);
     float h = std::max(1.0f, rect.bottom - rect.top);
+    /* 留内边距: 不留的话图片长边正好贴满视口, 图片阴影整条画在视口外看不见
+     * (下游 GuoheView 报的"拖入图片后顶边阴影超出看不到")。默认 0, 宿主按需开。 */
+    const float pad = imgshadow::ClampFitPadding(fitPadding_, w, h);
+    w = std::max(1.0f, w - pad * 2.0f);
+    h = std::max(1.0f, h - pad * 2.0f);
     // rotation-aware: 90/270 时图像视觉宽高互换, fit 用 effective 尺寸.
     float effW = (float)EffectiveImageWidth();
     float effH = (float)EffectiveImageHeight();
@@ -2552,10 +2586,27 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
 
     r.PushClip(rect);
 
+    /* 棋盘垫层: 画在一切图像内容之下, 只覆盖图片区域 (visual = 旋转后可见
+     * AABB, 90° 倍数旋转下就是图片精确边界)。与视口求交限制 fill 面积 —
+     * 大图高倍 zoom 时 dest 可达百万级像素, pattern brush 锚定屏幕原点,
+     * 求交不会移动花纹。 */
+    /* 图片阴影: 画在棋盘和一切图像内容之下。只画图片矩形外圈, 所以跟棋盘
+     * (只画图片矩形内) 在空间上不重叠, 先后顺序无所谓。 */
+    if (shadow_) DrawImageShadow_(r, visual, rect);
+
+    if (checkerboard_) {
+        D2D1_RECT_F cb = visual;
+        cb.left   = std::max(cb.left,   rect.left);
+        cb.top    = std::max(cb.top,    rect.top);
+        cb.right  = std::min(cb.right,  rect.right);
+        cb.bottom = std::min(cb.bottom, rect.bottom);
+        if (cb.right > cb.left && cb.bottom > cb.top) DrawCheckerboard_(r, cb);
+    }
+
     /* SVG 模式: 主视图优先 D2D SvgDocument 直绘, 避免线框图在默认缩放下
      * 先栅格化再采样导致发虚。D2D 不可用或创建失败时再走下方 LunaSVG
      * 视口栅格缓存路径。 */
-    if (svgD2DDoc_ || !svgD2DXml_.empty()) {
+    if (!svgD2DSteps_.empty()) {
         float dcx = (dest.left + dest.right ) * 0.5f;
         float dcy = (dest.top  + dest.bottom) * 0.5f;
         D2D1_MATRIX_3X2_F xf =
@@ -2566,91 +2617,22 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
                                                  D2D1::Point2F(dcx, dcy));
         }
         bool recordedSvgDocument = false;
-        if (!svgD2DXml_.empty() && r.IsRecordingDisplayList()) {
-            std::vector<SvgDocumentRef::DropShadowLayer> shadowRefs;
-            shadowRefs.reserve(svgD2DShadowLayers_.size());
-            for (const auto& layer : svgD2DShadowLayers_) {
-                if (layer.shadowXml.empty() || layer.coverXml.empty()) continue;
-                SvgDocumentRef::DropShadowLayer ref;
-                ref.shadow_xml = layer.shadowXml;
-                ref.cover_xml = layer.coverXml;
-                ref.dx = layer.dx;
-                ref.dy = layer.dy;
-                ref.std_deviation = layer.stdDeviation;
-                shadowRefs.push_back(std::move(ref));
-            }
-            r.RecordSvgDocument(svgD2DXml_, (float)svgW_, (float)svgH_, xf,
-                                std::move(shadowRefs));
+        if (r.IsRecordingDisplayList()) {
+            r.RecordSvgDocument(svgD2DSteps_, (float)svgW_, (float)svgH_, xf);
             recordedSvgDocument = true;
         }
 
         if (auto* ctx5 = r.RT5()) {
-            if (!svgD2DDoc_ && !svgD2DXml_.empty()) {
-                r.CreateSvgDocumentFromXml(svgD2DXml_, (float)svgW_, (float)svgH_,
-                                           &svgD2DDoc_);
-            }
-            if (!svgD2DDoc_) {
-                if (recordedSvgDocument) {
-                    r.PopClip();
-                    return;
-                }
-            } else {
-                D2D1_MATRIX_3X2_F oldXf;
-                ctx5->GetTransform(&oldXf);
-                D2D1_MATRIX_3X2_F svgXf = xf * oldXf;
-                xf = svgXf;
-                ctx5->SetTransform(xf);
-                svgD2DDoc_->SetViewportSize(D2D1::SizeF((float)svgW_, (float)svgH_));
-                ctx5->DrawSvgDocument(svgD2DDoc_.Get());
-
-                for (auto& layer : svgD2DShadowLayers_) {
-                    if (!layer.shadowDoc && !layer.shadowXml.empty()) {
-                        r.CreateSvgDocumentFromXml(layer.shadowXml, (float)svgW_, (float)svgH_,
-                                                   &layer.shadowDoc);
-                    }
-                    if (!layer.coverDoc && !layer.coverXml.empty()) {
-                        r.CreateSvgDocumentFromXml(layer.coverXml, (float)svgW_, (float)svgH_,
-                                                   &layer.coverDoc);
-                    }
-                    if (!layer.shadowDoc || !layer.coverDoc) continue;
-                    Microsoft::WRL::ComPtr<ID2D1CommandList> shadowList;
-                    if (SUCCEEDED(ctx5->CreateCommandList(shadowList.GetAddressOf()))) {
-                        Microsoft::WRL::ComPtr<ID2D1Image> oldTarget;
-                        ctx5->GetTarget(&oldTarget);
-                        ctx5->SetTarget(shadowList.Get());
-                        ctx5->SetTransform(D2D1::Matrix3x2F::Identity());
-                        ctx5->Clear(D2D1::ColorF(0, 0, 0, 0));
-                        layer.shadowDoc->SetViewportSize(D2D1::SizeF((float)svgW_,
-                                                                     (float)svgH_));
-                        ctx5->DrawSvgDocument(layer.shadowDoc.Get());
-                        ctx5->SetTarget(oldTarget.Get());
-                        if (SUCCEEDED(shadowList->Close())) {
-                            Microsoft::WRL::ComPtr<ID2D1Effect> blur;
-                            if (SUCCEEDED(ctx5->CreateEffect(CLSID_D2D1GaussianBlur,
-                                                            blur.GetAddressOf()))) {
-                                blur->SetInput(0, shadowList.Get());
-                                blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
-                                               layer.stdDeviation);
-                                blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
-                                               D2D1_BORDER_MODE_SOFT);
-                                D2D1_MATRIX_3X2_F shadowXf =
-                                    D2D1::Matrix3x2F::Translation(layer.dx, layer.dy) *
-                                    svgXf;
-                                ctx5->SetTransform(shadowXf);
-                                ctx5->DrawImage(blur.Get(), D2D1::Point2F(0, 0),
-                                                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
-                                ctx5->SetTransform(svgXf);
-                                layer.coverDoc->SetViewportSize(
-                                    D2D1::SizeF((float)svgW_, (float)svgH_));
-                                ctx5->DrawSvgDocument(layer.coverDoc.Get());
-                            }
-                        }
-                    }
-                }
-                ctx5->SetTransform(oldXf);
-                r.PopClip();
-                return;
-            }
+            D2D1_MATRIX_3X2_F oldXf;
+            ctx5->GetTransform(&oldXf);
+            /* steps 的顺序就是 z 序 —— 逐段画, 带 filter 的那步先画自己的阴影
+             * 再画本体。三个绘制点共用 Renderer::DrawSvgStepsOrdered。 */
+            Renderer::DrawSvgStepsOrdered(ctx5, svgD2DSteps_, (float)svgW_,
+                                          (float)svgH_, xf * oldXf,
+                                          &svgD2DStepDocs_, &svgD2DStepShadowDocs_);
+            ctx5->SetTransform(oldXf);
+            r.PopClip();
+            return;
         }
         if (recordedSvgDocument) {
             r.PopClip();
@@ -2806,11 +2788,28 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
         r.PushTransform(xf);
     }
 
-    // 1) preview 兜底（最粗，永远先画）
+    // L230/L231 透明图垫层策略: preview 兜底层和低清 fallback 层画在瓦块
+    // 【下方】, 带 alpha 的图瓦块透明/半透明像素挡不住它们, 低清内容会从
+    // logo/文字边缘透出模糊毛边。所以垫层只画在 active level 缺瓦片的格子
+    // 矩形内 (PushClip): 已覆盖区域永远不透底, 缺口内保持渐进加载过渡。
+    // rotation != 0 时 PushClip 在旋转 transform 下不可靠 → 回退整层垫底
+    // (旋转是少见瞬态操作)。
+    std::vector<D2D1_RECT_F> missing;
+    int presentTiles = 0;
+    const bool haveRange = (info_.levels > 0) &&
+        MissingCellRects_(activeLevel_, dest, missing, &presentTiles);
+    const bool activeCovers  = haveRange && missing.empty();
+    // clip 垫层只在【部分】瓦块已到时有意义; 可见区一块瓦块都没有 (fast
+    // path levels=1 永远无瓦片 / 慢路径首帧) 时按旧行为整张画 preview,
+    // 免得整屏拆成一格格 clip 绘制。
+    const bool clipUnderlay  =
+        haveRange && !missing.empty() && presentTiles > 0 && !rotated;
+
+    // 1) preview 兜底（最粗，先画; 只画在缺瓦片区域）
     // Interpolation 走 PickInterp: 大幅下采 (zoom < 0.5) 退 HQ_LINEAR 避免
     // CUBIC negative-lobe 在高对比边缘振铃出色边. 适度缩放 / 上采保持
     // HQ_CUBIC 的锐度优势.
-    if (previewResourceKey_.IsValid()) {
+    if (previewResourceKey_.IsValid() && !activeCovers) {
         float pscale = previewW_ > 0
             ? (dest.right - dest.left) / static_cast<float>(previewW_)
             : 1.0f;
@@ -2818,7 +2817,16 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
         auto pinterp = (!antialias_ && pscale >= 1.0f)
             ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
             : PickInterp(pscale);
-        r.DrawImageResource(previewResourceKey_, dest, SamplingForInterp(pinterp));
+        const ImageSampling ps = SamplingForInterp(pinterp);
+        if (clipUnderlay) {
+            for (const auto& rc : missing) {
+                r.PushClipAliased(rc);
+                r.DrawImageResource(previewResourceKey_, dest, ps);
+                r.PopClip();
+            }
+        } else {
+            r.DrawImageResource(previewResourceKey_, dest, ps);
+        }
     }
 
     // 2) 多级金字塔：从最粗到最细，每级把已加载的可见瓦块画上去。
@@ -2829,8 +2837,21 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
         // 画在其【下方】兜底 gap。不画比活动层【更高清】的残留层 (lvl < active, 如放大
         // 后保留的 L0): 它们在当前缩放下要大幅缩小, 画在最上层会 ring/锯齿/糊
         // (放大→缩小后文字发硬、部分区域看着"坏了"就是这个高清残留层盖在上面)。
-        for (int lvl = (int)info_.levels - 1; lvl >= (int)activeLevel_; --lvl) {
-            DrawLevel(r, (uint32_t)lvl, dest);
+        if (clipUnderlay) {
+            for (const auto& rc : missing) {
+                r.PushClipAliased(rc);
+                for (int lvl = (int)info_.levels - 1; lvl > (int)activeLevel_; --lvl) {
+                    DrawLevel(r, (uint32_t)lvl, dest, &rc);
+                }
+                r.PopClip();
+            }
+            DrawLevel(r, activeLevel_, dest);
+        } else {
+            const int coarsest = activeCovers ? (int)activeLevel_
+                                              : (int)info_.levels - 1;
+            for (int lvl = coarsest; lvl >= (int)activeLevel_; --lvl) {
+                DrawLevel(r, (uint32_t)lvl, dest);
+            }
         }
     }
 
@@ -2839,10 +2860,11 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
     r.PopClip();
 }
 
-void GhImgViewWidget::DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& dest) {
+bool GhImgViewWidget::VisibleTileRange_(uint32_t level, const D2D1_RECT_F& dest,
+                                        int& tx0, int& ty0, int& tx1, int& ty1) const {
     uint32_t lw = LevelWidth(level);
     uint32_t lh = LevelHeight(level);
-    if (lw == 0 || lh == 0) return;
+    if (lw == 0 || lh == 0) return false;
 
     uint32_t ts = info_.tileSize;
     uint32_t txMax = (lw + ts - 1) / ts;
@@ -2852,7 +2874,7 @@ void GhImgViewWidget::DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& 
     // 用单一 (宽) scale 缩 Y 会让该级溢出 dest 底边 → X 用 scaleX, Y 用 scaleY。
     float scaleX = LevelToScreenScale (level) * zoom_;
     float scaleY = LevelToScreenScaleY(level) * zoom_;
-    if (scaleX <= 1e-6f || scaleY <= 1e-6f) return;
+    if (scaleX <= 1e-6f || scaleY <= 1e-6f) return false;
 
     // 可见瓦块范围 — rotation-aware: widget rect 4 角通过反旋转回 logical
     // 空间, 取 AABB, 再换算到 level 像素. rotation=0 时退化为旧路径
@@ -2879,10 +2901,77 @@ void GhImgViewWidget::DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& 
     float vly0 = std::min({ly[0], ly[1], ly[2], ly[3]});
     float vly1 = std::max({ly[0], ly[1], ly[2], ly[3]});
 
-    int tx0 = std::max(0, (int)std::floor(vlx0 / ts));
-    int ty0 = std::max(0, (int)std::floor(vly0 / ts));
-    int tx1 = std::min((int)txMax, (int)std::floor((vlx1 - 1) / ts) + 1);
-    int ty1 = std::min((int)tyMax, (int)std::floor((vly1 - 1) / ts) + 1);
+    tx0 = std::max(0, (int)std::floor(vlx0 / ts));
+    ty0 = std::max(0, (int)std::floor(vly0 / ts));
+    tx1 = std::min((int)txMax, (int)std::floor((vlx1 - 1) / ts) + 1);
+    ty1 = std::min((int)tyMax, (int)std::floor((vly1 - 1) / ts) + 1);
+    return true;
+}
+
+bool GhImgViewWidget::MissingCellRects_(uint32_t level, const D2D1_RECT_F& dest,
+                                        std::vector<D2D1_RECT_F>& out,
+                                        int* presentTiles) const {
+    out.clear();
+    if (presentTiles) *presentTiles = 0;
+    int tx0, ty0, tx1, ty1;
+    if (!VisibleTileRange_(level, dest, tx0, ty0, tx1, ty1)) return false;
+    if (tx0 >= tx1 || ty0 >= ty1) {
+        // 可见区没瓦块格 (viewport 完全在图外) → 报 false, 走整层垫底旧路径。
+        return false;
+    }
+
+    const uint32_t ts = info_.tileSize;
+    const uint32_t lw = LevelWidth(level);
+    const uint32_t lh = LevelHeight(level);
+    const float scaleX = LevelToScreenScale (level) * zoom_;
+    const float scaleY = LevelToScreenScaleY(level) * zoom_;
+    const float dpr = dpi_scale_ > 1e-3f ? dpi_scale_ : 1.0f;
+    auto snapDev = [dpr](float v) { return std::round(v * dpr) / dpr; };
+    // 格子边界公式与 DrawLevel 的瓦块 dest 完全一致 (同 snap), 保证缺口
+    // 矩形与相邻瓦块像素级对齐, 不留缝也不重叠。
+    auto cellEdgeX = [&](int tx) {
+        return snapDev(dest.left + (float)std::min((uint32_t)tx * ts, lw) * scaleX);
+    };
+    auto cellEdgeY = [&](int ty) {
+        return snapDev(dest.top  + (float)std::min((uint32_t)ty * ts, lh) * scaleY);
+    };
+
+    for (int ty = ty0; ty < ty1; ++ty) {
+        int runStart = -1;
+        for (int tx = tx0; tx <= tx1; ++tx) {
+            const bool miss = tx < tx1 &&
+                tiles_.find(TileKey{level, (uint32_t)tx, (uint32_t)ty}) == tiles_.end();
+            if (tx < tx1 && !miss && presentTiles) ++*presentTiles;
+            if (miss && runStart < 0) runStart = tx;
+            if (!miss && runStart >= 0) {
+                out.push_back(D2D1_RECT_F{cellEdgeX(runStart), cellEdgeY(ty),
+                                          cellEdgeX(tx),       cellEdgeY(ty + 1)});
+                runStart = -1;
+            }
+        }
+    }
+    return true;
+}
+
+void GhImgViewWidget::DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& dest,
+                                const D2D1_RECT_F* cull) {
+    int tx0, ty0, tx1, ty1;
+    if (!VisibleTileRange_(level, dest, tx0, ty0, tx1, ty1)) return;
+
+    uint32_t ts = info_.tileSize;
+    float scaleX = LevelToScreenScale (level) * zoom_;
+    float scaleY = LevelToScreenScaleY(level) * zoom_;
+    float destLeft = dest.left;
+    float destTop  = dest.top;
+
+    // cull: 垫层按缺口矩形 clip 绘制时, 只遍历与缺口相交的瓦块 (正确性由
+    // PushClip 保证, 这里纯粹省 draw call)。cull 仅在 rotation==0 下传入。
+    if (cull) {
+        tx0 = std::max(tx0, (int)std::floor((cull->left  - destLeft) / scaleX / ts));
+        ty0 = std::max(ty0, (int)std::floor((cull->top   - destTop ) / scaleY / ts));
+        tx1 = std::min(tx1, (int)std::floor((cull->right  - destLeft) / scaleX / ts) + 1);
+        ty1 = std::min(ty1, (int)std::floor((cull->bottom - destTop ) / scaleY / ts) + 1);
+    }
 
     // Interpolation: 大幅下采 (scale < 0.5) 退 HQ_LINEAR 避免 cubic 振铃
     // 出色边. 适度缩放 / 上采保持 HQ_CUBIC. scale 局部变量已是 screen-per-
@@ -2891,7 +2980,10 @@ void GhImgViewWidget::DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& 
     auto interp = (!antialias_ && scaleX >= 1.0f)
         ? D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
         : PickInterp(scaleX);   // X/Y scale 差 <5%, interp 判定用 scaleX 即可
-    const ImageSampling sampling = SamplingForInterp(interp);
+    // 瓦块用 aliased-edge 采样变体: DrawBitmap 矩形边缘 AA 在相邻瓦块共享
+    // 边界各画一条部分覆盖边 → 拼缝半透明缝线; aliased 光栅化无缝。采样
+    // 内核 (含 HQ prefilter) 与普通路径一致, 只是边缘光栅化不同。
+    const ImageSampling sampling = TileSamplingForInterp(interp);
     // snap 屏幕坐标到整数【设备像素】(dest rect 是 DIP, ctx 按 dpi_scale_ 缩到设备).
     const float dpr = dpi_scale_ > 1e-3f ? dpi_scale_ : 1.0f;
     auto snapDev = [dpr](float v) { return std::round(v * dpr) / dpr; };
@@ -3013,6 +3105,12 @@ float GhImgViewWidget::LevelToScreenScaleY(uint32_t level) const {
     return (float)info_.fullHeight / (float)lh;
 }
 
+void GhImgViewWidget::SetDpiScale(float s) {
+    if (s <= 1e-3f || s == dpi_scale_) return;
+    dpi_scale_ = s;
+    if (autoLevel_) activeLevel_ = PickAutoLevel();
+}
+
 D2D1_RECT_F GhImgViewWidget::ComputeDestRect() const {
     float fullW = (float)info_.fullWidth;
     float fullH = (float)info_.fullHeight;
@@ -3020,8 +3118,21 @@ D2D1_RECT_F GhImgViewWidget::ComputeDestRect() const {
     float h = fullH * zoom_;
     float cx = (rect.left + rect.right) * 0.5f + panX_;
     float cy = (rect.top  + rect.bottom) * 0.5f + panY_;
-    return D2D1_RECT_F{cx - w * 0.5f, cy - h * 0.5f,
-                       cx + w * 0.5f, cy + h * 0.5f};
+    float l = cx - w * 0.5f;
+    float t = cy - h * 0.5f;
+    /* 物理像素对齐: zoom×dpr 接近整数倍 (100%/200%, 或 borderless 下
+     * 1/dpi 补偿后的"实际大小") 时把图像原点吸附到物理像素网格。居中
+     * letterbox 奇偶差会让原点落在 0.5 物理像素上, 1:1 显示整图被双线性
+     * 采样糊掉 (实测梯度能量掉到 53%)。非整数倍缩放本来就要重采样, 不吸附
+     * 以保持 pan/zoom 连续。 */
+    const float dpr = dpi_scale_ > 1e-3f ? dpi_scale_ : 1.0f;
+    const float physScale = zoom_ * dpr;
+    const float nearestInt = std::round(physScale);
+    if (nearestInt >= 1.0f && std::fabs(physScale - nearestInt) < 1e-3f) {
+        l = std::round(l * dpr) / dpr;
+        t = std::round(t * dpr) / dpr;
+    }
+    return D2D1_RECT_F{l, t, l + w, t + h};
 }
 
 D2D1_RECT_F GhImgViewWidget::ComputeVisualDestRect() const {

@@ -103,7 +103,7 @@ list_clear=清空
 
 # Events page
 events_title=事件
-events_desc=9 种 wired 事件类型,$event 含 {x,y,delta,button} payload。
+events_desc=13 种 wired 事件类型,鼠标 $event 对标 DOM MouseEvent: {offsetX,offsetY,clientX,clientY,button,buttons,deltaX,deltaY,修饰键}。
 events_box=点击 / 双击 / 滚轮 / 鼠标按下抬起 都会被捕获
 events_count=次事件
 events_last=最近

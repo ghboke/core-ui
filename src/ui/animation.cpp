@@ -218,6 +218,13 @@ void AnimationManager::Cancel(Widget* target) {
     }), anims_.end());
 }
 
+void AnimationManager::Cancel(Widget* target, AnimProperty prop) {
+    if (!target) return;
+    anims_.erase(std::remove_if(anims_.begin(), anims_.end(), [&](const Animation& a) {
+        return a.target == target && a.property == prop;
+    }), anims_.end());
+}
+
 bool AnimationManager::HasActive() const {
     return !anims_.empty();
 }

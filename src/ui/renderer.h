@@ -92,12 +92,31 @@ public:
     void SetDisplayListRecorder(DisplayListRecorder* recorder);
     DisplayListRecorder* DisplayListRecorderTarget() const { return displayListRecorder_; }
     bool IsRecordingDisplayList() const { return ActiveDisplayListRecorder() != nullptr; }
-    bool RenderSvgDocumentToBgra(const std::string& xml,
+    bool RenderSvgDocumentToBgra(const std::vector<SvgDocumentRef::Step>& steps,
                                  float viewportW, float viewportH,
-                                 const std::vector<SvgDocumentRef::DropShadowLayer>& dropShadowLayers,
                                  uint32_t width, uint32_t height,
                                  uint8_t* outBgra);
+
+    /* 按 steps 的顺序逐段绘制到 ctx5 当前目标 —— D2D filter 的 z 正确性全在这个
+     * 顺序里, 三个绘制点 (UI 线程即时 / display list 回放 / 离屏 BGRA) 必须共用
+     * 这一份实现, 不要各写各的循环。
+     *
+     * contentDocs / shadowDocs 是可选缓存 (与 steps 等长, 懒建): UI 线程即时路径
+     * 传自己的成员缓存避免每帧重解析 SVG; 回放和离屏路径传 nullptr 现建现用。
+     * 调用前 ctx5 需已 BeginDraw; 返回时 transform 恢复为 svgXform。 */
+    static void DrawSvgStepsOrdered(
+        ID2D1DeviceContext5* ctx5,
+        const std::vector<SvgDocumentRef::Step>& steps,
+        float viewportW, float viewportH,
+        const D2D1_MATRIX_3X2_F& svgXform,
+        std::vector<ComPtr<ID2D1SvgDocument>>* contentDocs,
+        std::vector<ComPtr<ID2D1SvgDocument>>* shadowDocs);
     void FillRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color);
+    /* 任意四边形填充 (pts 顺序 TL,TR,BR,BL 或任意环绕序)。
+     * FillRect + PushTransform 只能画平行四边形 —— 仿射变换保持边的平行性,
+     * 梯形 / 透视四边形 (拍歪的照片里的一行字) 必须走真几何。
+     * 内部建 ID2D1PathGeometry 后 FillGeometry, 无接缝、数学精确。 */
+    void FillQuad(const D2D1_POINT_2F pts[4], const D2D1_COLOR_F& color);
     void FillRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, const D2D1_COLOR_F& color);
     bool DrawBlurredRoundedRect(const D2D1_RECT_F& rect, float rx, float ry,
                                 float blurRadius, const D2D1_COLOR_F& color);
@@ -181,6 +200,11 @@ public:
     /* 高质量插值绘制（缩小时用 HIGH_QUALITY_CUBIC，文字/线条更清晰） */
     void DrawBitmapHQ(ID2D1Bitmap* bitmap, const D2D1_RECT_F& destRect, float opacity = 1.0f,
                       D2D1_INTERPOLATION_MODE interp = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+    /* 边缘 clamp 绘制: BitmapBrush1 + EXTEND_CLAMP, 越界采样重复边缘像素。
+     * 分块瓦片放大绘制用 — DrawBitmap 的插值在位图边缘外按透明采样, 会在
+     * 瓦片拼缝处淡出一条半透明缝线。 */
+    void DrawBitmapClamped(ID2D1Bitmap* bitmap, const D2D1_RECT_F& destRect, float opacity = 1.0f,
+                           D2D1_INTERPOLATION_MODE interp = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
     /* 带锐化的位图绘制（用于图片查看器） */
     void DrawBitmapSharpened(ID2D1Bitmap* bitmap, const D2D1_RECT_F& destRect, float sharpenAmount = 0.3f,
                               D2D1_INTERPOLATION_MODE interp = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
@@ -190,12 +214,17 @@ public:
                            ImageSampling sampling, float opacity = 1.0f);
     void FillRectWithImagePattern(ResourceKey key, ID2D1Bitmap* bitmap, const D2D1_RECT_F& rect);
     void FillGradientRect(GradientRef gradient, const D2D1_RECT_F& rect, float radius);
+    void RecordSvgDocument(std::vector<SvgDocumentRef::Step> steps,
+                           float viewportW, float viewportH,
+                           D2D1_MATRIX_3X2_F transform);
+    /* 单段便利重载 — 不带 filter 的调用方 (image_source_svg / svg_widget) 用。 */
     void RecordSvgDocument(std::string xml, float viewportW, float viewportH,
-                           D2D1_MATRIX_3X2_F transform,
-                           std::vector<SvgDocumentRef::DropShadowLayer> dropShadowLayers = {});
+                           D2D1_MATRIX_3X2_F transform);
     bool DrawBackdropBlur(const D2D1_RECT_F& rect, float radius, float blurRadius);
     void FillRectWithBitmap(ID2D1Bitmap* bitmap, const D2D1_RECT_F& rect);
     void PushClip(const D2D1_RECT_F& rect);
+    /* aliased 裁剪 — 相邻 clip 矩形拼接绘制同一内容时用, 见 recorder 注释 */
+    void PushClipAliased(const D2D1_RECT_F& rect);
     void PopClip();
     // Rounded-rect clip: anything drawn between Push/Pop is masked to the
     // rounded shape. Required to keep state-layer hovers (e.g. up/down buttons
@@ -203,6 +232,23 @@ public:
     // past the container's corners. Must be paired with PopRoundedClip().
     void PushRoundedClip(const D2D1_RECT_F& rect, float rx, float ry);
     void PopRoundedClip();
+
+    /* ---- 视口剔除 (build 285) --------------------------------------------
+     * opt-in: 只有明确 PushCull 的容器 (目前只有 ScrollViewWidget) 才启用。
+     * 栈为空时 IsCulled 恒为 false, 所有既有绘制路径行为不变。
+     *
+     * 为什么需要: 长列表里 clip 只让 D2D 把画出界的像素丢掉, 遍历子树和录
+     * display list 的钱一分没省 —— 2000 行的 ScrollView 每帧要录 2000 行,
+     * 实测 6.6ms/帧, 拖动滚动条明显不跟手。
+     *
+     * 注意不要在这里做"全局默认开": 任何画到自己 rect 之外的控件 (阴影、
+     * 焦点环、溢出装饰) 都会被误剪。Widget::DrawTree 判定时会按该 widget 的
+     * box-shadow 外扩量放宽, 但那只覆盖阴影这一类。 */
+    void PushCull(const D2D1_RECT_F& rect);
+    void PopCull();
+    /* rect 与当前剔除矩形完全不相交 → true (可以整棵子树跳过)。
+     * 栈为空 → 永远 false。 */
+    bool IsCulled(const D2D1_RECT_F& rect) const;
     void PushOpacity(float opacity, const D2D1_RECT_F& bounds);
     void PopOpacity();
     void PushTransform(const D2D1_MATRIX_3X2_F& transform);
@@ -277,6 +323,10 @@ public:
     void ApplyTextRenderMode();
 
 private:
+    /* 视口剔除矩形栈 (build 285). 嵌套 ScrollView 时取交集 —— 内层只可能比
+     * 外层更小, 存交集省得判定时反复回溯整个栈。 */
+    std::vector<D2D1_RECT_F> cullStack_;
+
     struct ColorKey {
         uint32_t r = 0;
         uint32_t g = 0;

@@ -13,6 +13,7 @@ namespace ui {
 enum class DrawCommandType : uint8_t {
     Clear,
     PushClip,
+    PushClipAliased,
     PopClip,
     PushRoundedClip,
     PopRoundedClip,
@@ -34,12 +35,21 @@ enum class DrawCommandType : uint8_t {
     DrawSvgDocument,
     DrawSvgTextRuns,
     DrawBackdropBlur,
+    /* 任意四边形填充。FillRect + PushTransform 只能表达平行四边形 (仿射变换
+     * 保持平行性), 梯形/透视四边形必须走真几何填充。新值一律追加在末尾 —
+     * 中间插值会打乱既有编号。 */
+    FillQuad,
 };
 
 enum class ImageSampling : uint8_t {
     Nearest,
     Linear,
     HighQualityCubic,
+    // Clamp 变体: 越界采样重复边缘像素 (D2D1_EXTEND_MODE_CLAMP), 而不是
+    // DrawBitmap 默认的透明边界。分块瓦片 (gh_img tile) 放大绘制必须用
+    // clamp, 否则每块瓦片边缘插值淡出 → 拼缝处一条半透明缝线。
+    LinearClamp,
+    HighQualityCubicClamp,
 };
 
 struct TextStyle {
@@ -128,19 +138,38 @@ struct SvgIconRef {
     std::vector<SvgPathLayerRef> layers;
 };
 
+/* 一份 SVG 被拆成的有序绘制步骤 (见 ui/svg_d2d_segments.h)。
+ *
+ * D2D 的 ID2D1SvgDocument 完全不支持 <filter>, 且一份文档只能整张
+ * DrawSvgDocument —— 没有元素级合成的钩子。所以带 filter 的 SVG 要按绘制顺序
+ * 切成若干子文档逐段画, 轮到带 filter 的元素时改走离屏 + effect。
+ *
+ * **steps 的顺序就是 z 序**: 早前的实现是"整张基础文档 + 所有阴影层画在最后",
+ * 那样带 filter 的元素会盖住文档顺序在它之后的全部内容 (下游 GuoheView 的
+ * pikaq.svg: 身体椭圆盖掉了肚皮、眼睛、嘴)。不要再把 shadow/cover 从这个序列里
+ * 抽出来单独批处理。 */
 struct SvgDocumentRef {
-    struct DropShadowLayer {
+    struct Step {
+        // 本段内容。带 filter 的步里只有那一个元素 (祖先链保留)。
+        std::string xml;
+        // 非空 = 本步先画阴影: 把 shadow_xml 录进离屏、高斯模糊、按 dx/dy 偏移画出,
+        // 然后才画 xml 本体。阴影必须紧贴它自己这一步, 不能推迟。
         std::string shadow_xml;
-        std::string cover_xml;
         float dx = 0.0f;
         float dy = 0.0f;
         float std_deviation = 0.0f;
     };
 
-    std::string xml;
+    std::vector<Step> steps;
     float viewport_w = 0.0f;
     float viewport_h = 0.0f;
-    std::vector<DropShadowLayer> drop_shadow_layers;
+};
+
+/* 任意四边形的 4 顶点 (顺序 TL,TR,BR,BL, 亦即沿边环绕)。放侧池而非直接塞
+ * DrawCommand —— 32 字节乘以每条命令太浪费, 跟 text_pool / image_refs 一样
+ * 走"侧池 + 索引"。 */
+struct QuadRef {
+    D2D1_POINT_2F pts[4] = {};
 };
 
 struct DrawCommand {
@@ -161,6 +190,7 @@ struct DrawCommand {
     uint32_t svg_ref_index = UINT32_MAX;
     uint32_t svg_document_ref_index = UINT32_MAX;
     uint32_t svg_text_ref_index = UINT32_MAX;
+    uint32_t quad_index = UINT32_MAX;
     TextStyle text_style;
     ImageSampling sampling = ImageSampling::Linear;
 };
@@ -187,6 +217,7 @@ public:
     std::vector<SvgIconRef> svg_icon_refs;
     std::vector<SvgDocumentRef> svg_document_refs;
     std::vector<SvgTextRunListRef> svg_text_refs;
+    std::vector<QuadRef> quad_refs;
 
     bool Empty() const { return commands.empty(); }
     void Clear();
@@ -206,6 +237,9 @@ public:
     void Reset(DisplayList base = {});
     void Clear(D2D1_COLOR_F color);
     void PushClip(D2D1_RECT_F rect);
+    // aliased 裁剪: 边缘不做 AA。相邻 clip 矩形拼接绘制同一内容时必须用
+    // 这个, 否则共享边界两侧各一条部分覆盖边 → 拼缝半透明缝线。
+    void PushClipAliased(D2D1_RECT_F rect);
     void PopClip();
     void PushRoundedClip(D2D1_RECT_F rect, float rx, float ry);
     void PopRoundedClip();
@@ -214,6 +248,7 @@ public:
     void PushTransform(D2D1_MATRIX_3X2_F transform);
     void PopTransform();
     void FillRect(D2D1_RECT_F rect, D2D1_COLOR_F color);
+    void FillQuad(const D2D1_POINT_2F pts[4], D2D1_COLOR_F color);
     void DrawRect(D2D1_RECT_F rect, D2D1_COLOR_F color, float strokeWidth);
     void FillRoundedRect(D2D1_RECT_F rect, float rx, float ry, D2D1_COLOR_F color);
     void DrawRoundedRect(D2D1_RECT_F rect, float rx, float ry, D2D1_COLOR_F color, float strokeWidth);

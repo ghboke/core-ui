@@ -24,6 +24,7 @@ DisplayList::DisplayList(DisplayList&& other) noexcept
       svg_icon_refs(std::move(other.svg_icon_refs)),
       svg_document_refs(std::move(other.svg_document_refs)),
       svg_text_refs(std::move(other.svg_text_refs)),
+      quad_refs(std::move(other.quad_refs)),
       owned_resources_(std::move(other.owned_resources_)) {
     other.owned_resources_.clear();
 }
@@ -43,6 +44,7 @@ DisplayList& DisplayList::operator=(DisplayList&& other) noexcept {
     svg_icon_refs = std::move(other.svg_icon_refs);
     svg_document_refs = std::move(other.svg_document_refs);
     svg_text_refs = std::move(other.svg_text_refs);
+    quad_refs = std::move(other.quad_refs);
     owned_resources_ = std::move(other.owned_resources_);
     other.owned_resources_.clear();
     return *this;
@@ -56,6 +58,7 @@ void DisplayList::Clear() {
     svg_icon_refs.clear();
     svg_document_refs.clear();
     svg_text_refs.clear();
+    quad_refs.clear();
     ReleaseOwnedResources();
 }
 
@@ -87,6 +90,11 @@ void DisplayListRecorder::Clear(D2D1_COLOR_F color) {
 
 void DisplayListRecorder::PushClip(D2D1_RECT_F rect) {
     auto& cmd = AddCommand(DrawCommandType::PushClip);
+    cmd.rect = rect;
+}
+
+void DisplayListRecorder::PushClipAliased(D2D1_RECT_F rect) {
+    auto& cmd = AddCommand(DrawCommandType::PushClipAliased);
     cmd.rect = rect;
 }
 
@@ -127,6 +135,15 @@ void DisplayListRecorder::PopTransform() {
 void DisplayListRecorder::FillRect(D2D1_RECT_F rect, D2D1_COLOR_F color) {
     auto& cmd = AddCommand(DrawCommandType::FillRect);
     cmd.rect = rect;
+    cmd.color = color;
+}
+
+void DisplayListRecorder::FillQuad(const D2D1_POINT_2F pts[4], D2D1_COLOR_F color) {
+    QuadRef quad;
+    for (int i = 0; i < 4; ++i) quad.pts[i] = pts[i];
+    list_.quad_refs.push_back(quad);
+    auto& cmd = AddCommand(DrawCommandType::FillQuad);
+    cmd.quad_index = (uint32_t)(list_.quad_refs.size() - 1);
     cmd.color = color;
 }
 

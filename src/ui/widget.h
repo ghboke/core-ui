@@ -18,6 +18,7 @@
 #include <functional>
 #include <cfloat>
 #include <algorithm>
+#include <unordered_set>
 
 namespace ui {
 
@@ -78,6 +79,24 @@ public:
     void AddChild(WidgetPtr child);
     void InsertChild(size_t index, WidgetPtr child);   // clamps index to [0, size()]
     void RemoveChild(Widget* child);
+
+    /* 一次性把 [at, at+removeCount) 换成 replacement (build 285)。
+     *
+     * 为什么需要: v-for 重排原本是 "n 次 RemoveChild + n 次 InsertChild",
+     * 而两者各自都是 O(n) (RemoveChild 用 remove_if 扫全表, InsertChild 是
+     * vector 中间插入的 memmove) —— 合起来 O(n^2)。2000 行实测 6.6 秒。
+     * 本接口把整块一次性换掉: 一趟 erase + 一次 range-insert = O(n)。
+     *
+     * at 会夹到 [0, size()]; removeCount 夹到不越界。replacement 里的空指针
+     * 会被跳过。 */
+    void ReplaceChildRange(size_t at, size_t removeCount,
+                           std::vector<WidgetPtr> replacement);
+
+    /* 批量摘除 (build 285)。一趟 remove_if + 一次 erase = O(n), 取代
+     * "k 次 RemoveChild" 的 k*O(n)。victims 里不存在的项忽略。
+     * 与 ReplaceChildRange 配对使用: 先整体摘除, 再整块插回。 */
+    void RemoveChildren(const std::unordered_set<Widget*>& victims);
+
     Widget* Parent() const { return parent_; }
     std::vector<WidgetPtr>& Children() { return children_; }
     const std::vector<WidgetPtr>& Children() const { return children_; }
@@ -145,6 +164,9 @@ public:
     bool visible = true;
     bool hitTransparent = false;  /* true 时 HitTest 只看子不返回自身，让事件穿透到下层 */
     bool dragWindow = false;      /* true 时命中该 widget 触发窗口拖动（WM_NCHITTEST → HTCAPTION） */
+    bool hitClient = false;       /* true 时命中该 widget (或其子) 强制 HTCLIENT — canvas mode 拖窗
+                                     区域里的交互 overlay (如 borderless 关闭热区) 用它拿回
+                                     WM_MOUSEMOVE/CLICK。NCHITTEST ancestor walk 里优先于 dragWindow。 */
     bool enabled = true;
     bool hovered = false;
     bool pressed = false;
@@ -351,6 +373,36 @@ public:
     // Mirrors CSS / web `mouseleave` event semantics. No args because mouseleave
     // has no meaningful cursor position (cursor is either elsewhere or gone).
     std::function<void()>                  onMouseLeaveHook;
+    // Fires when cursor enters this widget (added to the hovered ancestor
+    // chain). Mirrors web `mouseenter` (non-bubbling — fires per widget in
+    // the chain individually, like DOM mouseenter on each element).
+    std::function<void(const MouseEvent&)> onMouseEnterHook;
+    // Fires on right-button release over this widget (deepest hit widget).
+    // Mirrors web `contextmenu`. e.button == 2.
+    std::function<void(const MouseEvent&)> onContextMenuHook;
+
+    // ---- Drag & drop (HTML5-style, dispatched by UiWindowImpl) ----
+    // Source side: set `draggable` (+ optional declarative `dragData`
+    // payload). After the press moves past the drag threshold the window
+    // fires onDragStartHook — the handler may rewrite `data` (equivalent of
+    // DOM dataTransfer.setData). onDragEndHook fires when the drag finishes,
+    // dropped=true iff a target accepted it.
+    bool draggable = false;
+    std::wstring dragData;
+    std::function<void(const MouseEvent&, std::wstring& data)> onDragStartHook;
+    std::function<void(bool dropped)> onDragEndHook;
+    // Target side: a widget accepts drops when `dropTarget` is set or an
+    // onDropHook is installed (DOM: listening for drop implies droppable —
+    // without the dragover-preventDefault dance). `dragOver` is maintained
+    // by the window while a drag hovers the widget and maps to the CSS
+    // `:drag-over` pseudo-class.
+    bool dropTarget = false;
+    bool dragOver = false;
+    std::function<void(const MouseEvent&)> onDragEnterHook;
+    std::function<void(const MouseEvent&)> onDragOverHook;
+    std::function<void()> onDragLeaveHook;
+    std::function<void(const std::wstring& data, const MouseEvent&)> onDropHook;
+    bool CanAcceptDrop() const { return dropTarget || (bool)onDropHook; }
     // Form-style submit. Fired when a TextInput/TextArea sees ENTER pressed
     // while focused. Other widgets ignore it; pages can listen on the form
     // wrapper element itself by hooking directly through @submit.
@@ -392,6 +444,11 @@ public:
     virtual bool OnMouseDoubleClick(const MouseEvent& e);
     virtual bool OnKeyDown(int vk)   { (void)vk; return false; }
     virtual bool OnKeyChar(wchar_t c){ (void)c;  return false; }
+    // IME anchor: caret rect in window DIP coords. Text-editing widgets
+    // override; UiWindowImpl uses it to pin the IME composition/candidate
+    // window at the caret (WM_IME_STARTCOMPOSITION/WM_IME_COMPOSITION).
+    // Requires an active measure context; return false when unknown.
+    virtual bool GetCaretRect(D2D1_RECT_F* out) const { (void)out; return false; }
     virtual D2D1_SIZE_F SizeHint() const { return {fixedW, fixedH}; }
 
     // ---- Focus ----
@@ -433,6 +490,12 @@ protected:
     std::vector<WidgetPtr> children_;
     bool paintedOnce_ = false;   // see PaintedOnce() / MarkPainted() above
 };
+
+/* 递归平移 w 及其全部后代的 rect (build 285 起对外)。
+ * 两个用途: ① CSS transform: translate 绘制前应用、绘制后撤销;
+ *          ② ScrollViewWidget 的纯滚动 —— 内容没变、只是偏移变了时, 平移 rect
+ *             比重跑一遍 flex 布局便宜一个量级。 */
+UI_API void ShiftSubtreeRects(Widget* w, float dx, float dy);
 
 // ---- Layout containers ----
 

@@ -12,6 +12,7 @@
 #include "image_view_gdi.h"  // GDI-based image view (for images > D2D texture limit)
 #include "image_view_plus.h" // forward decl needed for GhImgView 临近的 ImageViewPlus 引用
 #include "gh_img_view.h"     // 通用瓦块画布
+#include "ocr_img_view.h"    // 图片划词 (OCR 文本选择画布)
 #include "css/value.h"       // ParseColor for ui_theme_set_accent_hex
 #include "page/compiler.h"   // ui::page::RefreshAllPageThemes — runtime theme push
 #include "../../include/ui_core.h"
@@ -465,6 +466,43 @@ UI_API UiWidget ui_text_input(const wchar_t* placeholder) {
 
 UI_API UiWidget ui_text_area(const wchar_t* placeholder) {
     return Reg(std::make_shared<ui::TextAreaWidget>(placeholder ? placeholder : L""));
+}
+
+UI_API UiWidget ui_chips_input(const wchar_t* placeholder) {
+    return Reg(std::make_shared<ui::ChipsInputWidget>(placeholder ? placeholder : L""));
+}
+
+UI_API void ui_chips_input_set_value(UiWidget w, const wchar_t* tpl) {
+    auto* ci = As<ui::ChipsInputWidget>(w);
+    if (ci) ci->SetValue(tpl ? tpl : L"");
+}
+
+UI_API const wchar_t* ui_chips_input_get_value(UiWidget w) {
+    static thread_local std::wstring buf;
+    auto* ci = As<ui::ChipsInputWidget>(w);
+    buf = ci ? ci->Value() : L"";
+    return buf.c_str();
+}
+
+UI_API void ui_chips_input_set_chip_labels(UiWidget w, const wchar_t* spec) {
+    auto* ci = As<ui::ChipsInputWidget>(w);
+    if (ci) ci->SetChipLabels(spec ? spec : L"");
+}
+
+UI_API void ui_chips_input_insert_chip(UiWidget w, const wchar_t* key) {
+    auto* ci = As<ui::ChipsInputWidget>(w);
+    if (ci && key) ci->InsertChip(key);
+}
+
+UI_API void ui_chips_input_on_changed(UiWidget w, UiChipsChangedCallback cb,
+                                       void* userdata) {
+    auto* ci = As<ui::ChipsInputWidget>(w);
+    if (!ci) return;
+    if (!cb) { ci->onTextChanged = nullptr; return; }
+    uint64_t handle = w;
+    ci->onTextChanged = [cb, userdata, handle](const std::wstring& v) {
+        cb(handle, v.c_str(), userdata);
+    };
 }
 
 UI_API UiWidget ui_combobox(const wchar_t** items, int count) {
@@ -1150,6 +1188,30 @@ UI_API int ui_gh_img_view_get_antialias(UiWidget w) {
     auto* gv = As<ui::GhImgViewWidget>(w);
     return (gv && gv->Antialias()) ? 1 : 0;
 }
+UI_API void ui_gh_img_view_set_checkerboard(UiWidget w, int on) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetCheckerboard(on != 0);
+}
+UI_API int ui_gh_img_view_get_checkerboard(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return (gv && gv->Checkerboard()) ? 1 : 0;
+}
+UI_API void ui_gh_img_view_set_shadow(UiWidget w, int on) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetShadow(on != 0);
+}
+UI_API int ui_gh_img_view_get_shadow(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return (gv && gv->Shadow()) ? 1 : 0;
+}
+UI_API void ui_gh_img_view_set_fit_padding(UiWidget w, float dip) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetFitPadding(dip);
+}
+UI_API float ui_gh_img_view_get_fit_padding(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return gv ? gv->FitPadding() : 0.0f;
+}
 UI_API void ui_gh_img_view_set_wheel_zoom_enabled(UiWidget w, int on) {
     auto* gv = As<ui::GhImgViewWidget>(w);
     if (gv) gv->SetWheelZoomEnabled(on != 0);
@@ -1171,6 +1233,10 @@ UI_API void ui_gh_img_view_get_pan_lock(UiWidget w, int* out_lock_x, int* out_lo
 UI_API float ui_gh_img_view_get_zoom(UiWidget w) {
     auto* gv = As<ui::GhImgViewWidget>(w);
     return gv ? gv->Zoom() : 1.0f;
+}
+UI_API void ui_gh_img_view_set_dpi_scale(UiWidget w, float scale) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetDpiScale(scale);
 }
 UI_API void ui_gh_img_view_set_zoom(UiWidget w, float zoom) {
     auto* gv = As<ui::GhImgViewWidget>(w);
@@ -1245,6 +1311,226 @@ UI_API void ui_gh_img_view_on_tile_evicted(UiWidget w,
     gv->onTileEvicted = [cb, userdata, apiHandle](uint32_t level, uint32_t tx, uint32_t ty) {
         if (cb) cb(apiHandle, level, tx, ty, userdata);
     };
+}
+
+// ================================================================
+// OcrImgView — 图片划词 (OCR 文本选择画布)
+// ================================================================
+
+UI_API UiWidget ui_ocr_img_view(void) {
+    return Reg(std::make_shared<ui::OcrImgViewWidget>());
+}
+
+UI_API int ui_ocr_img_view_set_image(UiWidget w, UiWindow win,
+                                      const void* bgra, uint32_t width,
+                                      uint32_t height, uint32_t stride) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    auto* wn = Win(win);
+    if (!ov || !wn || !bgra) return ui::OcrImgViewWidget::kSetImageBadArgs;
+    return ov->SetImage(bgra, width, height, stride, wn->GetRenderer());
+}
+
+UI_API void ui_ocr_img_view_clear_image(UiWidget w) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (ov) ov->ClearImage();
+}
+
+UI_API void ui_ocr_img_view_set_text(UiWidget w, const UiOcrTextItem* items,
+                                      uint32_t count, size_t item_stride,
+                                      UiOcrGranularity granularity) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (!ov) return;
+    if (!items || count == 0 || item_stride == 0) {
+        ov->Model().Clear();
+        return;
+    }
+    /* stride 兼容拷贝: 宿主结构体可能比当前 lib 版本旧 (小 stride, 尾部字段
+     * 取默认) 或新 (大 stride, 多余字节忽略)。逐字段搬, 不整块 memcpy。 */
+    std::vector<ui::OcrTextItem> v;
+    v.reserve(count);
+    const auto* base = reinterpret_cast<const uint8_t*>(items);
+    const size_t known = std::min(item_stride, sizeof(UiOcrTextItem));
+    for (uint32_t i = 0; i < count; ++i) {
+        UiOcrTextItem src{};
+        memcpy(&src, base + (size_t)i * item_stride, known);
+        ui::OcrTextItem it;
+        it.text  = src.text ? src.text : "";
+        memcpy(it.quad, src.quad, sizeof(it.quad));
+        it.block = src.block;
+        it.line  = src.line;
+        it.word  = src.word;
+        it.flags = src.flags;
+        v.push_back(std::move(it));
+    }
+    /* BLOCK 粒度: 入口拆成字, 让选择粒度统一到字级。CHAR 粒度直接用 ——
+     * 但 word 字段若全为 0 (宿主没填分词), 双击会选中整行, 这是宿主的
+     * 数据问题, lib 不猜。 */
+    if (granularity == UI_OCR_GRANULARITY_BLOCK) {
+        std::vector<ui::OcrTextItem> chars;
+        ui::SplitItemsIntoChars(v.data(), v.size(), chars);
+        ov->Model().SetItems(chars.data(), chars.size());
+    } else {
+        ov->Model().SetItems(v.data(), v.size());
+    }
+}
+
+UI_API void ui_ocr_img_view_clear_text(UiWidget w) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (ov) ov->Model().Clear();
+}
+
+UI_API uint32_t ui_ocr_img_view_item_count(UiWidget w) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    return ov ? (uint32_t)ov->Model().ItemCount() : 0u;
+}
+
+UI_API const char* ui_ocr_img_view_selected_text(UiWidget w) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (!ov) return "";
+    return ov->SelectedTextUtf8().c_str();
+}
+
+UI_API void ui_ocr_img_view_select_all(UiWidget w) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (ov) ov->Model().SelectAll();
+}
+
+UI_API void ui_ocr_img_view_clear_selection(UiWidget w) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (ov) ov->Model().ClearSelection();
+}
+
+UI_API int ui_ocr_img_view_has_selection(UiWidget w) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    return (ov && ov->Model().HasSelection()) ? 1 : 0;
+}
+
+UI_API int ui_ocr_img_view_copy_selection(UiWidget w) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    return (ov && ov->CopySelectionToClipboard()) ? 1 : 0;
+}
+
+UI_API void ui_ocr_img_view_select_range(UiWidget w, uint32_t first,
+                                          uint32_t last) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (!ov) return;
+    auto& model = ov->Model();
+    const size_t count = model.ItemCount();
+    if (count == 0) return;
+    if (first > last) { const uint32_t t = first; first = last; last = t; }
+    const uint32_t maxIndex = (uint32_t)(count - 1);
+    if (first > maxIndex) first = maxIndex;
+    if (last  > maxIndex) last  = maxIndex;
+    /* 走跟真实拖选同一条状态机路径 (Begin→Update→End), 选区语义与手势
+     * 完全一致, onSelectionChanged 也照常 fire。 */
+    model.BeginSelect(first);
+    model.UpdateSelect(last);
+    model.EndSelect();
+}
+
+UI_API int ui_ocr_img_view_selection_range(UiWidget w, uint32_t* first,
+                                            uint32_t* last) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (!ov) return 0;
+    const auto& selection = ov->Model().Selection();
+    if (selection.empty()) return 0;
+    if (first) *first = selection.front().first;
+    if (last)  *last  = selection.back().last;
+    return 1;
+}
+
+UI_API int ui_ocr_img_view_item_meta(UiWidget w, uint32_t index,
+                                      uint32_t* block, uint32_t* line,
+                                      uint32_t* word) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (!ov) return 0;
+    const auto& model = ov->Model();
+    if (index >= model.ItemCount()) return 0;
+    const ui::OcrTextItem& item = model.Item(index);
+    if (block) *block = item.block;
+    if (line)  *line  = item.line;
+    if (word)  *word  = item.word;
+    return 1;
+}
+
+UI_API void ui_ocr_img_view_on_selection_changed(UiWidget w,
+                                                  UiOcrSelectionCallback cb,
+                                                  void* userdata) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (!ov) return;
+    UiWidget apiHandle = w;
+    auto* widget = ov;
+    ov->Model().onSelectionChanged = [cb, userdata, apiHandle, widget] {
+        /* widget 内部依赖这个 callback 失效 selected_text 缓存 + 重绘,
+         * 宿主注册后必须保持该行为再转发。 */
+        widget->OnModelSelectionChanged();
+        if (cb) cb(apiHandle, userdata);
+    };
+}
+
+UI_API void ui_ocr_img_view_fit(UiWidget w) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (ov) ov->Fit();
+}
+
+UI_API void ui_ocr_img_view_reset(UiWidget w) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (ov) ov->Reset();
+}
+
+UI_API void ui_ocr_img_view_set_zoom(UiWidget w, float zoom) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (ov) ov->SetZoom(zoom);
+}
+
+UI_API float ui_ocr_img_view_get_zoom(UiWidget w) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    return ov ? ov->Zoom() : 1.0f;
+}
+
+UI_API void ui_ocr_img_view_set_pan(UiWidget w, float px, float py) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (ov) ov->SetPan(px, py);
+}
+
+UI_API void ui_ocr_img_view_get_pan(UiWidget w, float* px, float* py) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (px) *px = ov ? ov->PanX() : 0.0f;
+    if (py) *py = ov ? ov->PanY() : 0.0f;
+}
+
+UI_API void ui_ocr_img_view_set_rotation(UiWidget w, int angle) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (ov) ov->SetRotation(angle);
+}
+
+UI_API int ui_ocr_img_view_get_rotation(UiWidget w) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    return ov ? ov->Rotation() : 0;
+}
+
+UI_API void ui_ocr_img_view_image_to_screen(UiWidget w, float ix, float iy,
+                                             float* sx, float* sy) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    float x = 0, y = 0;
+    if (ov) ov->ImageToScreen(ix, iy, x, y);
+    if (sx) *sx = x;
+    if (sy) *sy = y;
+}
+
+UI_API void ui_ocr_img_view_screen_to_image(UiWidget w, float sx, float sy,
+                                             float* ix, float* iy) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    float x = 0, y = 0;
+    if (ov) ov->ScreenToImage(sx, sy, x, y);
+    if (ix) *ix = x;
+    if (iy) *iy = y;
+}
+
+UI_API void ui_ocr_img_view_set_highlight_color(UiWidget w, float rr, float gg,
+                                                 float bb, float aa) {
+    auto* ov = As<ui::OcrImgViewWidget>(w);
+    if (ov) ov->SetHighlightColor(D2D1_COLOR_F{ rr, gg, bb, aa });
 }
 
 // ================================================================
@@ -1582,6 +1868,48 @@ UI_API void ui_widget_on_mouse_leave(UiWidget w,
     };
 }
 
+/* Drag & drop (build 259+) — 见 ui_core.h 注释. */
+UI_API void ui_widget_set_draggable(UiWidget w, int draggable) {
+    auto* p = W(w);
+    if (p) p->draggable = draggable != 0;
+}
+
+UI_API void ui_widget_set_drag_data(UiWidget w, const wchar_t* data) {
+    auto* p = W(w);
+    if (!p) return;
+    p->dragData = data ? data : L"";
+    p->draggable = true;  // payload implies draggable (matches .uix attr)
+}
+
+UI_API void ui_widget_set_drop_target(UiWidget w, int accept) {
+    auto* p = W(w);
+    if (p) p->dropTarget = accept != 0;
+}
+
+UI_API void ui_widget_on_drop(UiWidget w, UiDropCallback cb, void* userdata) {
+    auto* p = W(w);
+    if (!p) return;
+    if (!cb) { p->onDropHook = nullptr; return; }
+    uint64_t handle = w;
+    /* 捕 p 指针 — hook 存在 widget 上, 生命周期一致, 不悬空 (同 mouse_move). */
+    p->onDropHook = [cb, userdata, handle, p](const std::wstring& data,
+                                              const ui::MouseEvent& e) {
+        cb(handle, data.c_str(),
+           e.x - p->rect.left, e.y - p->rect.top, userdata);
+    };
+}
+
+UI_API void ui_widget_on_drag_end(UiWidget w, UiDragEndCallback cb,
+                                   void* userdata) {
+    auto* p = W(w);
+    if (!p) return;
+    if (!cb) { p->onDragEndHook = nullptr; return; }
+    uint64_t handle = w;
+    p->onDragEndHook = [cb, userdata, handle](bool dropped) {
+        cb(handle, dropped ? 1 : 0, userdata);
+    };
+}
+
 /* Build 64+ (L13): 通用 widget focus / blur hook. 内部接 Widget::onFocusHook /
  * onBlurHook (这两个 hook lib 内已存在, JS 端通过 page_state.cpp 用着, 现在
  * 暴露 C API). 触发点: UiWindowImpl::SetFocus 切换 focusedWidget_ 时, 旧 widget
@@ -1610,6 +1938,21 @@ UI_API void ui_widget_on_blur(UiWidget w,
     };
 }
 
+/* build 287: 通用 widget submit hook. 接 Widget::onSubmitHook —— TextInput /
+ * TextArea 在 OnKeyDown 收到 VK_RETURN 时 fire。见 ui_core.h 里的说明: 这是
+ * v-for 迭代体内做行内编辑时唯一能拿到 Enter 的路子。cb=NULL 解绑. */
+UI_API void ui_widget_on_submit(UiWidget w,
+                                 UiWidgetFocusCallback cb,
+                                 void* userdata) {
+    auto* p = W(w);
+    if (!p) return;
+    if (!cb) { p->onSubmitHook = nullptr; return; }
+    uint64_t handle = w;
+    p->onSubmitHook = [cb, userdata, handle]() {
+        cb(handle, userdata);
+    };
+}
+
 /* Build 66+ (L16): 通用 widget 滚轮回调. 接 Widget::onMouseWheelHook
  * (跟 .uix @wheel 同路径). UiWindowImpl::OnMouseWheel 开头会无条件 fire
  * 这个 hook, 跟 widget 子类的 OnMouseWheel dispatch loop 无关 — 所以
@@ -1624,6 +1967,21 @@ UI_API void ui_widget_on_mouse_wheel(UiWidget w,
     /* widget 内坐标: e.x / e.y 是 widget 坐标系 (跟 onMouseMoveHook 同). */
     p->onMouseWheelHook = [cb, userdata, handle, p](const ui::MouseEvent& e) {
         cb(handle, e.x - p->rect.left, e.y - p->rect.top, e.delta, userdata);
+    };
+}
+
+/* build 287: widget 级 contextmenu hook. 见 ui_core.h 里的说明 —— 这是列表
+ * 逐行右键唯一可靠的挂法, selector trigger 撞 v-if 时序会失效。
+ * x/y 传窗口 DIP 坐标 (MouseEvent 里就是), 直接能喂 ui_menu_show. cb=NULL 解绑. */
+UI_API void ui_widget_on_context_menu(UiWidget w,
+                                       UiWidgetContextMenuCallback cb,
+                                       void* userdata) {
+    auto* p = W(w);
+    if (!p) return;
+    if (!cb) { p->onContextMenuHook = nullptr; return; }
+    uint64_t handle = w;
+    p->onContextMenuHook = [cb, userdata, handle](const ui::MouseEvent& e) {
+        cb(handle, e.x, e.y, userdata);
     };
 }
 
@@ -1783,6 +2141,27 @@ UI_API void ui_text_area_set_text(UiWidget w, const wchar_t* text) {
 UI_API void ui_text_area_set_read_only(UiWidget w, int read_only) {
     auto* ta = As<ui::TextAreaWidget>(w);
     if (ta) ta->readOnly = (read_only != 0);
+}
+
+UI_API void ui_text_area_set_selection(UiWidget w, int start, int end) {
+    auto* ta = As<ui::TextAreaWidget>(w);
+    if (ta) ta->SetSelectionRange(start, end);
+}
+
+UI_API int ui_text_area_get_selection(UiWidget w, int* start, int* end) {
+    auto* ta = As<ui::TextAreaWidget>(w);
+    return (ta && ta->SelectionRange(start, end)) ? 1 : 0;
+}
+
+UI_API void ui_text_area_on_selection_changed(UiWidget w,
+                                               UiTextAreaSelectionCallback cb,
+                                               void* userdata) {
+    auto* ta = As<ui::TextAreaWidget>(w);
+    if (!ta) return;
+    UiWidget handle = w;
+    ta->onSelectionChanged = [cb, userdata, handle] {
+        if (cb) cb(handle, userdata);
+    };
 }
 
 // ================================================================
@@ -2356,10 +2735,19 @@ UI_API int ui_debug_click(UiWindow win, UiWidget w) {
     return ui_debug_click_at(win, cx, cy);
 }
 
+UI_API int ui_debug_double_click_at(UiWindow win, float x, float y) {
+    auto* wi = Win(win); if (!wi) return -1;
+    wi->SimMouseDoubleClick(x, y);
+    wi->Invalidate();
+    return 0;
+}
+
 UI_API int ui_debug_double_click(UiWindow win, UiWidget w) {
-    int r1 = ui_debug_click(win, w);
-    if (r1 != 0) return r1;
-    return ui_debug_click(win, w);
+    auto* wi = Win(win); if (!wi) return -1;
+    auto* p = W(w); if (!p) return -1;
+    float cx, cy;
+    if (!WidgetCenter(p, cx, cy)) return -1;
+    return ui_debug_double_click_at(win, cx, cy);
 }
 
 UI_API int ui_debug_right_click_at(UiWindow win, float x, float y) {
@@ -2461,6 +2849,30 @@ UI_API int ui_debug_blur(UiWindow win) {
 UI_API int ui_debug_key(UiWindow win, int vk) {
     auto* wi = Win(win); if (!wi) return -1;
     wi->SimKeyDown(vk);
+    return 0;
+}
+
+UI_API int ui_debug_key_mod(UiWindow win, int vk, int ctrl, int shift, int alt) {
+    auto* wi = Win(win); if (!wi) return -1;
+    /* Widget 的 OnKeyDown 普遍用 GetKeyState(VK_CONTROL) 之类读修饰键
+     * (LabelWidget / TextInputWidget / OcrImgViewWidget 都是)。GetKeyState
+     * 读的是【调用线程】的键盘状态表, SetKeyboardState 能改它 —— debug 命令
+     * 本来就在 UI 线程执行, 所以注入期间临时把修饰键置下、结束还原, 模拟键
+     * 就能走到和真实按键完全一样的分支。不这么做的话 Ctrl+C / Ctrl+A 之类
+     * 组合键永远测不了 (vk 到了但 GetKeyState 说 Ctrl 没按下)。 */
+    BYTE saved[256];
+    const bool haveState = GetKeyboardState(saved) != FALSE;
+    if (haveState) {
+        BYTE st[256];
+        memcpy(st, saved, sizeof(st));
+        const BYTE down = 0x80, up = 0x00;
+        st[VK_CONTROL] = st[VK_LCONTROL] = ctrl  ? down : up;
+        st[VK_SHIFT]   = st[VK_LSHIFT]   = shift ? down : up;
+        st[VK_MENU]    = st[VK_LMENU]    = alt   ? down : up;
+        SetKeyboardState(st);
+    }
+    wi->SimKeyDown(vk);
+    if (haveState) SetKeyboardState(saved);
     return 0;
 }
 
@@ -2598,10 +3010,17 @@ UI_API int ui_debug_text_set(UiWidget w, const wchar_t* text) {
     return -1;
 }
 
+UI_API void ui_asset_invalidate(const char* name) {
+    if (!name || !*name) return;
+    ui::ImageWidget::RetryFailedLoads(name);
+}
+
 UI_API int ui_debug_scroll_set(UiWidget w, float y) {
     auto* sv = As<ui::ScrollViewWidget>(w); if (!sv) return -1;
+    /* build 285: SetScrollY 自己走纯偏移路径把内容归位了, 不必再补一次
+     * DoLayout()。留着的话调试通道量到的是"滚动 + 全量重布局", 跟真实鼠标
+     * 滚动不是同一条路 —— 性能对比会失真, 而且掩盖住本次优化的效果。 */
     sv->SetScrollY(y);
-    sv->DoLayout();
     return 0;
 }
 

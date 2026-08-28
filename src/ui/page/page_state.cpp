@@ -23,6 +23,7 @@
 
 namespace ui::page {
 
+
 namespace {
 
 std::wstring ToWide(const std::string& s) {
@@ -301,6 +302,16 @@ UiWindowImpl* OwnerWindow(Widget* w) {
     return ui::GetContext().FindWindowByWidget(w);
 }
 
+/* 直接落值前掐掉这条属性上在飞的动画。
+ *
+ * 少了这一步就会丢写: 宿主同一帧先把属性推到 A (起了 transition 动画, 此刻
+ * widget 上的值还是旧值), 紧接着又推 B; 第二次因为"当前值跟 B 已经相等"走
+ * 直接落值分支, 值写成了 B, 但 A 那条动画还在飞, 下一帧就覆盖回 A。
+ * 症状是最后一次写像丢了, invalidate 也救不回来 (下游 GuoheView bug-070)。 */
+void CancelAnim(Widget* w, AnimProperty prop) {
+    if (auto* win = OwnerWindow(w)) win->CancelPropertyAnimation(w, prop);
+}
+
 void SetOpacityMaybeAnimated(Widget* w, float target) {
     const auto* t = FindTransition(w, 0);
     if (t && std::abs(w->opacity - target) > 0.001f) {
@@ -309,10 +320,8 @@ void SetOpacityMaybeAnimated(Widget* w, float target) {
                                  t->durationMs, static_cast<EasingFunction>(t->easing));
             return;
         }
-    } else {
-        w->opacity = target;
-        return;
     }
+    CancelAnim(w, AnimProperty::Opacity);
     w->opacity = target;
 }
 
@@ -324,11 +333,8 @@ void SetWidthMaybeAnimated(Widget* w, float target) {
                                  t->durationMs, static_cast<EasingFunction>(t->easing));
             return;
         }
-    } else {
-        w->fixedW = target;
-        ui::RequestLayout();
-        return;
     }
+    CancelAnim(w, AnimProperty::Width);
     w->fixedW = target;
     ui::RequestLayout();
 }
@@ -341,11 +347,8 @@ void SetHeightMaybeAnimated(Widget* w, float target) {
                                  t->durationMs, static_cast<EasingFunction>(t->easing));
             return;
         }
-    } else {
-        w->fixedH = target;
-        ui::RequestLayout();
-        return;
     }
+    CancelAnim(w, AnimProperty::Height);
     w->fixedH = target;
     ui::RequestLayout();
 }
@@ -361,10 +364,11 @@ void SetBgMaybeAnimated(Widget* w, const D2D1_COLOR_F& target) {
             win->AnimateProperty(w, AnimProperty::BgColorA, w->bgColor.a, target.a, tA->durationMs, easing);
             return;
         }
-    } else {
-        w->bgColor = target;
-        return;
     }
+    CancelAnim(w, AnimProperty::BgColorR);
+    CancelAnim(w, AnimProperty::BgColorG);
+    CancelAnim(w, AnimProperty::BgColorB);
+    CancelAnim(w, AnimProperty::BgColorA);
     w->bgColor = target;
 }
 
@@ -596,8 +600,11 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         bool& shouldInvalidate;
         ~InvalidateOnExit() {
             if (!shouldInvalidate) return;
-            ui::GetContext().InvalidateAllWindows();
-            ui::GetContext().UpdateAnimTimers();
+            /* build 285: 走合批版本。批量绑定 (v-for 建列表) 期间只记待办,
+             * 批结束统一各做一次 —— UpdateAnimTimers 单次是 O(整棵树), 每条
+             * 绑定都调一次会让整体退化成 O(n^2)。非批量场景行为不变。 */
+            ui::GetContext().RequestInvalidateAll();
+            ui::GetContext().RequestAnimTimerUpdate();
         }
     } _invalidate{shouldInvalidate};
 
@@ -644,6 +651,24 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
             for (auto& c : x->Children()) refresh(c.get());
         };
         refresh(w);
+        return;
+    }
+    if (prop == "chip-labels" || prop == "chipLabels") {
+        if (auto* ci = dynamic_cast<ChipsInputWidget*>(w))
+            ci->SetChipLabels(ToWide(v.ToString()));
+        return;
+    }
+    if (prop == "draggable") {
+        w->draggable = v.ToBool();
+        return;
+    }
+    if (prop == "drag-data" || prop == "dragData") {
+        w->draggable = true;  // payload implies draggable (matches factory)
+        w->dragData = ToWide(v.ToString());
+        return;
+    }
+    if (prop == "drop-target" || prop == "dropTarget") {
+        w->dropTarget = v.ToBool();
         return;
     }
     if (prop == "visible") {
@@ -768,6 +793,14 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
             ti->SetText(ToWide(v.ToString()));   // no animation, painted check irrelevant
         } else if (auto* ta = dynamic_cast<TextAreaWidget*>(w)) {
             ta->SetText(ToWide(v.ToString()));
+        } else if (auto* ci = dynamic_cast<ChipsInputWidget*>(w)) {
+            std::wstring nv = ToWide(v.ToString());
+            if (ci->Value() == nv) {  // avoid clobbering caret on echo
+                traceBindingNoop();
+                shouldInvalidate = false;
+                return;
+            }
+            ci->SetValue(nv);
         } else if (auto* slider = dynamic_cast<SliderWidget*>(w)) {
             // SliderWidget::SetValue 不带 value 动画 (只有 thumb scale hover
             // animation, 跟 value 无关), 直接 set 即可, painted 检查无意义.
@@ -1497,9 +1530,21 @@ struct CondInIter {
     const ui::uix::Node*  templateNode = nullptr;
     JSValue               fn           = JS_UNDEFINED;  // loop closure: fn(item[, idx]) → bool
     uint64_t              effectId     = 0;
+    // build 287: 条件求值体本身。keyed diff 复用一行时, iteration 的 itemValue
+    // 换成了新数组里的新对象, 旧 effect 的依赖集还挂在被丢弃的旧对象上, 于是
+    // v-for 里的 v-if 再也不会重新求值 (表现: 行内容能更新, 但该出现/消失的
+    // 分支纹丝不动)。存下求值体, 复用时 Dispose + 重新 WatchEffect 即可让依赖
+    // 集在新对象上重建 —— WatchEffect 会立刻跑一次, 顺带完成分支切换。
+    std::function<void()> evalFn;
     WidgetPtr             mounted;
     std::vector<JSValue>  innerFns;
     std::vector<uint64_t> innerEffects;
+    /* build 289: 与 innerEffects 一一对应的求值体。理由跟上面的 evalFn 完全
+     * 一样, 只是管的是 v-if **子树内部**的 binding: keyed diff 复用一行时,
+     * 这些 effect 的依赖集同样还挂在被丢弃的旧 item 对象上, 于是子树里的
+     * {{ item.xxx }} 再也不更新。build 287 只修了条件本身, 漏了这一半 ——
+     * 表现是"该出现的分支出现了, 但里面的数字/文字是旧的"。 */
+    std::vector<std::function<void()>> innerEvalFns;
     // v-if nested inside this v-if (still in the outer v-for's loop scope).
     // mount() builds them; unmount() tears them down.
     std::vector<std::unique_ptr<CondInIter>> innerConditionals;
@@ -1993,6 +2038,7 @@ void PageState::DestroyJsIteration(JsLoopRuntime& rt, JsLoopIteration& iter) {
         for (uint64_t id : cr.innerEffects) jsRt_->DisposeEffect(id);
         for (auto& f : cr.innerFns) JS_FreeValue(ctx, f);
         cr.innerEffects.clear();
+        cr.innerEvalFns.clear();
         cr.innerFns.clear();
         if (!JS_IsUndefined(cr.fn)) JS_FreeValue(ctx, cr.fn);
         cr.fn = JS_UNDEFINED;
@@ -2099,9 +2145,41 @@ void PageState::RewireIterationBindings(JsLoopRuntime& rt, JsLoopIteration& iter
                 JS_FreeValue(ctx, r);
             });
     }
+
+    // build 287: v-if 也得跟着重接。bindings 走的是 ApplyBindingToWidget, 属性
+    // 变了就能看出来; v-if 决定的是 widget 在不在, 依赖集失效的后果是整个分支
+    // 卡死在复用前的形态。先重接本层再递归 inner —— 本层 effect 立刻重跑, 若
+    // 判 false 会 unmount 并连带销毁 innerConditionals, 那时递归自然跳过。
+    std::function<void(std::vector<std::unique_ptr<CondInIter>>&)> rewireConds =
+        [&](std::vector<std::unique_ptr<CondInIter>>& conds) {
+            for (auto& cr : conds) {
+                if (!cr || !cr->evalFn) continue;
+                if (cr->effectId) jsRt_->DisposeEffect(cr->effectId);
+                cr->effectId = jsRt_->WatchEffect(cr->evalFn);
+
+                /* build 289: 子树**内部**的 binding 也要重接。只修条件不修内部,
+                 * 表现是"该出现的分支出现了, 但里面的数字/文字还是旧的"。
+                 * 注意顺序: 上面的 effect 刚跑过, 若判 false 会 unmount 并把
+                 * innerEffects/innerEvalFns 清空, 这里自然就没得重接了。 */
+                const size_t n = std::min(cr->innerEffects.size(),
+                                          cr->innerEvalFns.size());
+                for (size_t k = 0; k < n; ++k) {
+                    if (cr->innerEffects[k]) jsRt_->DisposeEffect(cr->innerEffects[k]);
+                    cr->innerEffects[k] = jsRt_->WatchEffect(cr->innerEvalFns[k]);
+                }
+                if (!cr->innerConditionals.empty()) rewireConds(cr->innerConditionals);
+            }
+        };
+    rewireConds(iter.conditionals);
 }
 
 void PageState::RebuildJsLoop(JsLoopRuntime& rt) {
+
+    /* 整个重建过程合成一批: 中途每条绑定各自 InvalidateAllWindows +
+     * UpdateAnimTimers 是 O(n^2) 的来源 (见 ui_context.h BeginBatch 注释)。
+     * 中途没有任何一帧上屏, 合批不改变可见行为。 */
+    ui::Context::BatchScope batch(ui::GetContext());
+
     if (!rt.spec || !rt.spec->parentWidget || !rt.spec->templateNode) return;
     if (!jsRt_ || JS_IsUndefined(rt.listFn)) return;
     JSContext* ctx = jsRt_->ctx();
@@ -2184,24 +2262,30 @@ void PageState::RebuildJsLoop(JsLoopRuntime& rt) {
     oldByKey.clear();
 
     // Reorder the parent's children so iterations appear in the new list
-    // order. Pull all reused widgets out first, then reinsert at the
-    // correct positions (insertIndex + i). New iters were already
-    // InsertChild'd at construction, but at the wrong slot — same lift +
-    // reinsert dance gets them right too.
+    // order. New iters were already InsertChild'd at construction, but at the
+    // wrong slot; reused ones sit wherever they were — so the whole block gets
+    // lifted out and put back contiguously at insertIndex.
+    //
+    // build 285: 这里原本是 "n 次 RemoveChild + n 次 InsertChild"。两者各自
+    // 都是 O(n) —— RemoveChild 用 remove_if 扫全表, InsertChild 是 vector
+    // 中间插入的 memmove —— 合起来 O(n^2)。2000 行实测 6.6 秒, 5000 行 41 秒。
+    // 换成 "一趟批量摘除 + 一次整块插入", 两次 O(n)。
     if (rt.spec->parentWidget) {
+        std::unordered_set<Widget*> lifted;
+        lifted.reserve(newIters.size() * 2);
+        std::vector<WidgetPtr> block;
+        block.reserve(newIters.size());
         for (auto& iter : newIters) {
             if (iter && iter->mountedRoot) {
-                rt.spec->parentWidget->RemoveChild(iter->mountedRoot.get());
+                lifted.insert(iter->mountedRoot.get());
+                block.push_back(iter->mountedRoot);
             }
         }
-        for (uint32_t i = 0; i < newIters.size(); ++i) {
-            if (newIters[i] && newIters[i]->mountedRoot) {
-                size_t pos = rt.spec->insertIndex + i;
-                if (pos > rt.spec->parentWidget->Children().size())
-                    pos = rt.spec->parentWidget->Children().size();
-                rt.spec->parentWidget->InsertChild(pos, newIters[i]->mountedRoot);
-            }
-        }
+        rt.spec->parentWidget->RemoveChildren(lifted);
+        size_t pos = rt.spec->insertIndex;
+        if (pos > rt.spec->parentWidget->Children().size())
+            pos = rt.spec->parentWidget->Children().size();
+        rt.spec->parentWidget->ReplaceChildRange(pos, 0, std::move(block));
     }
 
     rt.iterations = std::move(newIters);
@@ -2297,7 +2381,7 @@ std::unique_ptr<CondInIter> PageState::BuildCondInIter(
 
     CondInIter* crRaw = cr.get();
 
-    cr->effectId = jsRt_->WatchEffect(
+    cr->evalFn =
         [this, ctx, crRaw, iterRaw, hasIdx, loopVar, indexVar, locals]() {
             JSValue args[2];
             int argc = 1;
@@ -2331,7 +2415,8 @@ std::unique_ptr<CondInIter> PageState::BuildCondInIter(
                     crRaw->innerFns.push_back(bfn);
                     Widget* tg = b.target;
                     std::string pp = b.property;
-                    uint64_t eid = jsRt_->WatchEffect(
+                    /* 求值体存一份 (build 289) —— 复用行时要拿它重接依赖。 */
+                    std::function<void()> evalOne =
                         [this, ctx, bfn, tg, pp, iterRaw, hasIdx]() {
                             JSValue args2[2];
                             int argc2 = 1;
@@ -2346,8 +2431,10 @@ std::unique_ptr<CondInIter> PageState::BuildCondInIter(
                             ui::expr::Value ev = ui::uix::JSValueToExprValue(ctx, rr);
                             ApplyBindingToWidget(tg, pp, ev);
                             JS_FreeValue(ctx, rr);
-                        });
+                        };
+                    uint64_t eid = jsRt_->WatchEffect(evalOne);
                     crRaw->innerEffects.push_back(eid);
+                    crRaw->innerEvalFns.push_back(std::move(evalOne));
                 }
                 // Events — loop closure
                 for (auto& sev : sub.events) {
@@ -2420,6 +2507,7 @@ std::unique_ptr<CondInIter> PageState::BuildCondInIter(
                 crRaw->innerConditionals.clear();
                 for (uint64_t id : crRaw->innerEffects) jsRt_->DisposeEffect(id);
                 crRaw->innerEffects.clear();
+                crRaw->innerEvalFns.clear();
                 for (auto& f : crRaw->innerFns) JS_FreeValue(ctx, f);
                 crRaw->innerFns.clear();
                 if (crRaw->parent && crRaw->mounted) {
@@ -2427,7 +2515,9 @@ std::unique_ptr<CondInIter> PageState::BuildCondInIter(
                 }
                 crRaw->mounted.reset();
             }
-        });
+        };
+
+    cr->effectId = jsRt_->WatchEffect(cr->evalFn);
 
     return cr;
 }
@@ -2574,14 +2664,31 @@ void PageState::WireQuickJSEvent(Widget* target, const std::string& evName,
         JS_FreeValue(ctx, arg);
     };
 
-    // MouseEvent → JS `{ x, y, delta, button }`. Each invocation builds a
-    // fresh object; the closure callee owns it via JS_FreeValue in callHandler.
-    auto mouseEventValue = [ctx](const ui::MouseEvent& e) -> JSValue {
+    // MouseEvent → JS object mirroring DOM MouseEvent/WheelEvent. Legacy
+    // fields x/y/delta are kept for pages written against the old shape.
+    // `target` is captured raw — safe because the hook lives on the widget
+    // itself and dies with it. Each invocation builds a fresh object; the
+    // closure callee owns it via JS_FreeValue in callHandler.
+    auto mouseEventValue = [ctx, target](const ui::MouseEvent& e) -> JSValue {
         JSValue obj = JS_NewObject(ctx);
+        // DOM: client* = window coords, offset* = target-local coords.
+        JS_SetPropertyStr(ctx, obj, "clientX", JS_NewFloat64(ctx, e.x));
+        JS_SetPropertyStr(ctx, obj, "clientY", JS_NewFloat64(ctx, e.y));
+        JS_SetPropertyStr(ctx, obj, "offsetX", JS_NewFloat64(ctx, e.x - target->rect.left));
+        JS_SetPropertyStr(ctx, obj, "offsetY", JS_NewFloat64(ctx, e.y - target->rect.top));
+        JS_SetPropertyStr(ctx, obj, "button",  JS_NewInt32(ctx, e.button));
+        JS_SetPropertyStr(ctx, obj, "buttons", JS_NewInt32(ctx, e.buttons));
+        JS_SetPropertyStr(ctx, obj, "ctrlKey",  JS_NewBool(ctx, e.ctrl));
+        JS_SetPropertyStr(ctx, obj, "shiftKey", JS_NewBool(ctx, e.shift));
+        JS_SetPropertyStr(ctx, obj, "altKey",   JS_NewBool(ctx, e.alt));
+        // DOM WheelEvent: deltaY positive = scroll down; Win32 delta is the
+        // opposite sign, flip here so pages can use the web convention.
+        JS_SetPropertyStr(ctx, obj, "deltaY", JS_NewFloat64(ctx, -e.delta));
+        JS_SetPropertyStr(ctx, obj, "deltaX", JS_NewFloat64(ctx, e.deltaX));
+        // Legacy (pre-DOM-parity) fields.
         JS_SetPropertyStr(ctx, obj, "x",      JS_NewFloat64(ctx, e.x));
         JS_SetPropertyStr(ctx, obj, "y",      JS_NewFloat64(ctx, e.y));
         JS_SetPropertyStr(ctx, obj, "delta",  JS_NewFloat64(ctx, e.delta));
-        JS_SetPropertyStr(ctx, obj, "button", JS_NewInt32(ctx, e.leftBtn ? 0 : -1));
         return obj;
     };
 
@@ -2606,6 +2713,75 @@ void PageState::WireQuickJSEvent(Widget* target, const std::string& evName,
     } else if (evName == "dblclick") {
         target->onMouseDblClickHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
             callHandler(mouseEventValue(e));
+        };
+    } else if (evName == "mouseenter") {
+        target->onMouseEnterHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
+            callHandler(mouseEventValue(e));
+        };
+    } else if (evName == "mouseleave") {
+        // Leave carries no cursor position (see onMouseLeaveHook comment).
+        target->onMouseLeaveHook = [callHandler]() { callHandler(JS_UNDEFINED); };
+    } else if (evName == "contextmenu") {
+        target->onContextMenuHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
+            callHandler(mouseEventValue(e));
+        };
+    } else if (evName == "dragstart") {
+        // $event carries `data` (the payload, defaulting to drag-data) which
+        // the handler may reassign — DOM dataTransfer.setData equivalent.
+        // Can't go through callHandler: the object must stay alive after the
+        // call so the reassigned `data` can be read back.
+        target->onDragStartHook = [this, ctx, fn, mouseEventValue](
+                const ui::MouseEvent& e, std::wstring& data) {
+            JSValue obj = mouseEventValue(e);
+            std::string utf8 = ToUtf8(data);
+            JS_SetPropertyStr(ctx, obj, "data",
+                              JS_NewStringLen(ctx, utf8.data(), utf8.size()));
+            JSValue argv[1] = { obj };
+            JSValue r = JS_Call(ctx, fn, jsState_, 1, argv);
+            if (JS_IsException(r)) {
+                JSValue exc = JS_GetException(ctx);
+                const char* msg = JS_ToCString(ctx, exc);
+                errors_.push_back(std::string("@dragstart handler threw: ") +
+                                  (msg ? msg : "(no message)"));
+                if (msg) JS_FreeCString(ctx, msg);
+                JS_FreeValue(ctx, exc);
+            }
+            JS_FreeValue(ctx, r);
+            JSValue nd = JS_GetPropertyStr(ctx, obj, "data");
+            if (JS_IsString(nd)) {
+                const char* s = JS_ToCString(ctx, nd);
+                if (s) { data = ToWide(s); JS_FreeCString(ctx, s); }
+            }
+            JS_FreeValue(ctx, nd);
+            JS_FreeValue(ctx, obj);
+        };
+    } else if (evName == "dragend") {
+        target->onDragEndHook = [callHandler, ctx](bool dropped) {
+            callHandler(JS_NewBool(ctx, dropped));
+        };
+    } else if (evName == "dragenter") {
+        target->dropTarget = true;
+        target->onDragEnterHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
+            callHandler(mouseEventValue(e));
+        };
+    } else if (evName == "dragover") {
+        target->dropTarget = true;
+        target->onDragOverHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
+            callHandler(mouseEventValue(e));
+        };
+    } else if (evName == "dragleave") {
+        target->dropTarget = true;
+        target->onDragLeaveHook = [callHandler]() { callHandler(JS_UNDEFINED); };
+    } else if (evName == "drop") {
+        // Listening for drop implies droppable (no dragover-preventDefault
+        // dance) — CanAcceptDrop() already treats onDropHook as acceptance.
+        target->onDropHook = [callHandler, mouseEventValue, ctx](
+                const std::wstring& data, const ui::MouseEvent& e) {
+            JSValue obj = mouseEventValue(e);
+            std::string utf8 = ToUtf8(data);
+            JS_SetPropertyStr(ctx, obj, "data",
+                              JS_NewStringLen(ctx, utf8.data(), utf8.size()));
+            callHandler(obj);
         };
     } else if (evName == "submit") {
         target->onSubmitHook = [callHandler]() { callHandler(JS_UNDEFINED); };
@@ -2634,7 +2810,8 @@ void PageState::WireQuickJSModelWrite(Widget* target, const std::string& propNam
     JSContext* ctx = jsRt_->ctx();
 
     if (dynamic_cast<TextInputWidget*>(target) ||
-        dynamic_cast<TextAreaWidget*>(target)) {
+        dynamic_cast<TextAreaWidget*>(target) ||
+        dynamic_cast<ChipsInputWidget*>(target)) {
         target->onTextChanged = [this, ctx, propName](const std::wstring& v) {
             std::string utf8 = ToUtf8(v);
             JS_SetPropertyStr(ctx, jsState_, propName.c_str(),

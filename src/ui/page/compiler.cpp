@@ -746,6 +746,9 @@ void CompileElement(CompilerCtx& ctx,
                 pm.id  = p->id;
                 pm.classes = p->classList;
                 for (const auto& c : p->dynamicClasses) pm.classes.push_back(c);
+                // 祖先伪类参与匹配 (`.zone:hover .btn`): 不带状态位的话这类
+                // 选择器永远匹配失败。
+                pm.stateBits = p->CurrentStateBits();
                 chain.push_back(std::move(pm));
             }
             for (size_t i = 0; i < chain.size(); ++i) {

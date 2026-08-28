@@ -3,12 +3,14 @@
 #include "controls.h"
 #include "image_view_plus.h"
 #include "gh_img_view.h"
+#include "ocr_img_view.h"
 #include "theme.h"
 #include "animation.h"
 #include "debug_trace.h"
 #include "overlay_service.h"
 #include "render_thread.h"
 #include <windowsx.h>
+#include <imm.h>       /* IME composition/candidate window positioning */
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <wrl/client.h>
@@ -69,6 +71,10 @@ struct UiInvokeReq {
 };
 
 bool UiWindowImpl::classRegistered_ = false;
+
+// Defined above UiWindowImpl::OnMouseMove; declared here because WM_RBUTTONUP
+// (@contextmenu) dispatches earlier in the file.
+static void StampDomMouseState(MouseEvent& e, int button = -1);
 
 #ifndef DWMWA_TRANSITIONS_FORCEDISABLED
 #define DWMWA_TRANSITIONS_FORCEDISABLED 3
@@ -552,6 +558,8 @@ void UiWindowImpl::NotifyWidgetDestroyed(Widget* w) {
     if (pressedWidget_ == w) pressedWidget_ = nullptr;
     if (focusedWidget_ == w) focusedWidget_ = nullptr;
     if (tooltipWidget_ == w) tooltipWidget_ = nullptr;
+    if (dragSource_ == w) { dragSource_ = nullptr; dragActive_ = false; }
+    if (dragOverTarget_ == w) dragOverTarget_ = nullptr;
     animationHost_.RemoveWidget(w);
     propertyAnimations_.Cancel(w);
 }
@@ -1214,6 +1222,10 @@ void UiWindowImpl::AnimateProperty(Widget* target, AnimProperty prop, float from
     Invalidate();
 }
 
+void UiWindowImpl::CancelPropertyAnimation(Widget* target, AnimProperty prop) {
+    propertyAnimations_.Cancel(target, prop);
+}
+
 void UiWindowImpl::SetTitle(const std::wstring& title) {
     title_ = title;
     if (hwnd_) SetWindowTextW(hwnd_, title_.c_str());
@@ -1654,13 +1666,46 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         OnMouseWheel((float)pt.x, (float)pt.y, GET_WHEEL_DELTA_WPARAM(wParam));
         return 0;
     }
+    case WM_MOUSEHWHEEL: {
+        // Horizontal wheel → @wheel with deltaX (DOM parity). No built-in
+        // control scrolls horizontally today, so only the hook path exists.
+        POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        ScreenToClient(hwnd_, &pt);
+        float hdx = (float)pt.x / dpiScale_, hdy = (float)pt.y / dpiScale_;
+        if (root_) {
+            Widget* hit = root_->HitTest(hdx, hdy);
+            if (hit && hit->onMouseWheelHook) {
+                MouseEvent e{hdx, hdy};
+                StampDomMouseState(e, -1);
+                e.deltaX = (float)GET_WHEEL_DELTA_WPARAM(wParam);
+                hit->onMouseWheelHook(e);
+                InvalidateNow();
+            }
+        }
+        return 0;
+    }
     case WM_RBUTTONUP: {
         float dx = (float)GET_X_LPARAM(lParam) / dpiScale_;
         float dy = (float)GET_Y_LPARAM(lParam) / dpiScale_;
+        DispatchContextMenu(dx, dy);
         if (onRightClick) onRightClick(dx, dy);
         InvalidateNow();
         return 0;
     }
+
+    case WM_IME_STARTCOMPOSITION:
+        imeComposing_ = true;
+        UpdateImeCompositionPos();
+        break;
+    case WM_IME_COMPOSITION:
+        // Pin the IME composition/candidate window at the focused widget's
+        // caret, then let DefWindowProc run the default composition handling
+        // (result chars still arrive via WM_CHAR).
+        UpdateImeCompositionPos();
+        break;
+    case WM_IME_ENDCOMPOSITION:
+        imeComposing_ = false;
+        break;
 
     case WM_CHAR:
         // Don't forward Tab char (handled in WM_KEYDOWN)
@@ -1683,6 +1728,9 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
          * IME 无关、user32 已链接, 不引 imm32)。IME 文字输入走 WM_CHAR/
          * WM_IME_CHAR 另一条路, 不受此影响。 */
         if (vk == VK_PROCESSKEY) {
+            /* 组字进行中: 按键 (退格删组字串 / 翻页 / 数字选字) 完全属于
+             * IME, 绝不转发给控件 — 否则退格会把已落定文本也删掉。 */
+            if (imeComposing_) break;
             UINT sc = (UINT)((lParam >> 16) & 0xFF);
             UINT real = MapVirtualKeyW(sc, MAPVK_VSC_TO_VK);
             if (real) vk = (int)real;
@@ -1714,6 +1762,31 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_SETCURSOR:
         switch (LOWORD(lParam)) {
         case HTCLIENT: {
+            // Open ComboBox dropdown is an overlay, not a widget subtree —
+            // hoveredWidget_ / CSS cursor resolution below would fall through
+            // to whatever sits underneath it (e.g. a draggable chip showing
+            // the move cursor). Inside the dropdown rect always show the
+            // plain arrow and stop here.
+            if (root_) {
+                bool inDropdown = false;
+                ForEachWidget(root_.get(), [&](Widget* w) {
+                    if (inDropdown) return;
+                    auto* cb = dynamic_cast<ComboBoxWidget*>(w);
+                    if (!cb || !cb->IsOpen()) return;
+                    POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd_, &pt);
+                    const float mx = (float)pt.x / dpiScale_;
+                    const float my = (float)pt.y / dpiScale_;
+                    auto dr = cb->DropdownRect();
+                    if (mx >= dr.left && mx < dr.right &&
+                        my >= dr.top && my < dr.bottom) {
+                        inDropdown = true;
+                    }
+                });
+                if (inDropdown) {
+                    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+                    return TRUE;
+                }
+            }
             // Splitter: resize cursor during drag or hover over bar
             if (root_) {
                 bool splitterCursor = false;
@@ -1769,9 +1842,35 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 SetCursor(LoadCursor(nullptr, sys));
                 return TRUE;
             }
+            // Draggable elements (DnD sources, e.g. variable chips feeding a
+            // chips-input) show the move cursor — framework-wide, mirrors the
+            // affordance of HTML draggable items.
+            for (ui::Widget* w = hoveredWidget_; w; w = w->Parent()) {
+                if (w->draggable) {
+                    SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+                    return TRUE;
+                }
+            }
             if (hoveredWidget_) {
                 if (dynamic_cast<TextInputWidget*>(hoveredWidget_)) {
                     SetCursor(LoadCursor(nullptr, IDC_IBEAM)); return TRUE;
+                }
+                if (auto* ci = dynamic_cast<ChipsInputWidget*>(hoveredWidget_)) {
+                    // Zoned cursor: chip body → move (drag-reorderable),
+                    // chip × close zone → hand (click target),
+                    // text / free area → I-beam. Active reorder keeps move.
+                    if (ci->IsDraggingChip()) {
+                        SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+                        return TRUE;
+                    }
+                    POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd_, &pt);
+                    ActiveMeasureContextScope measureScope(measureContext_, renderer_);
+                    const float mx = (float)pt.x / dpiScale_;
+                    LPCWSTR shape = IDC_IBEAM;
+                    if (ci->IsOverChipClose(measureContext_, mx)) shape = IDC_HAND;
+                    else if (ci->IsOverChip(measureContext_, mx)) shape = IDC_SIZEALL;
+                    SetCursor(LoadCursor(nullptr, shape));
+                    return TRUE;
                 }
                 auto* ta = dynamic_cast<TextAreaWidget*>(hoveredWidget_);
                 if (ta) {
@@ -2230,6 +2329,64 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
         }
     }
 
+    // Drag ghost: a small pill following the cursor showing the grabbed
+    // item's display text (source label text — localized; falls back to the
+    // raw payload, then "…"). Drawn above everything but the tooltip; kept
+    // deliberately simple — targets signal acceptance via the :drag-over
+    // pseudo-class instead of ghost styling.
+    if (dragActive_) {
+        std::wstring ghost = dragGhostText_.empty()
+                                 ? (dragPayload_.empty() ? L"…" : dragPayload_)
+                                 : dragGhostText_;
+        if (ghost.size() > 32) ghost = ghost.substr(0, 31) + L"…";
+        float fontSize = theme::kFontSizeSmall;
+        float padH = 8.0f, padV = 4.0f;
+        float textW = fontSize * 0.65f * static_cast<float>(ghost.size());
+        {
+            IDWriteFactory* dwf = renderer_.DWFactory();
+            IDWriteTextFormat* fmt = nullptr;
+            if (dwf) {
+                dwf->CreateTextFormat(theme::kFontFamily, nullptr,
+                    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL, fontSize, L"", &fmt);
+                if (fmt) {
+                    IDWriteTextLayout* layout = nullptr;
+                    dwf->CreateTextLayout(ghost.c_str(), (UINT32)ghost.size(),
+                        fmt, 1000.0f, 100.0f, &layout);
+                    if (layout) {
+                        DWRITE_TEXT_METRICS metrics = {};
+                        layout->GetMetrics(&metrics);
+                        textW = metrics.width;
+                        layout->Release();
+                    }
+                    fmt->Release();
+                }
+            }
+        }
+        float gw = textW + padH * 2, gh = fontSize + padV * 2 + 4.0f;
+        // Centered on the cursor — matches how the user "holds" the item.
+        float gx = dragX_ - gw * 0.5f, gy = dragY_ - gh * 0.5f;
+        D2D1_SIZE_F winSize = CachedClientSizeDip();
+        if (gx + gw > winSize.width - 2)  gx = winSize.width - 2 - gw;
+        if (gy + gh > winSize.height - 2) gy = winSize.height - 2 - gh;
+        if (gx < 2) gx = 2;
+        if (gy < 2) gy = 2;
+        D2D1_RECT_F bg = {gx, gy, gx + gw, gy + gh};
+        D2D1_COLOR_F bgColor, borderColor;
+        if (theme::IsDark()) {
+            bgColor     = {0.20f, 0.22f, 0.30f, 0.92f};
+            borderColor = {0.35f, 0.45f, 0.75f, 0.90f};
+        } else {
+            bgColor     = {0.93f, 0.95f, 1.00f, 0.95f};
+            borderColor = {0.45f, 0.55f, 0.85f, 0.90f};
+        }
+        renderer_.FillRoundedRect(bg, gh * 0.5f, gh * 0.5f, bgColor);
+        renderer_.DrawRoundedRect(bg, gh * 0.5f, gh * 0.5f, borderColor, 1.0f);
+        D2D1_RECT_F textRect = {gx, gy + padV, gx + gw, gy + gh - padV};
+        renderer_.DrawText(ghost, textRect, theme::kBtnText(), fontSize,
+                           DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+
     // Tooltip rendering
     if (tooltipVisible_ && tooltipWidget_ && !tooltipWidget_->tooltip.empty()) {
         const auto& text = tooltipWidget_->tooltip;
@@ -2408,6 +2565,19 @@ void UiWindowImpl::CloseMenu() {
     Invalidate();
 }
 
+// Fill DOM MouseEvent-style state (buttons bitmask + modifier keys) on an
+// event about to be dispatched to @mouse* hooks. `button` is the DOM button
+// index that caused the event (0 left / 1 middle / 2 right, -1 for move/wheel).
+static void StampDomMouseState(MouseEvent& e, int button) {
+    e.button  = button;
+    e.buttons = ((GetKeyState(VK_LBUTTON) & 0x8000) ? 1 : 0) |
+                ((GetKeyState(VK_RBUTTON) & 0x8000) ? 2 : 0) |
+                ((GetKeyState(VK_MBUTTON) & 0x8000) ? 4 : 0);
+    e.ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    e.shift = (GetKeyState(VK_SHIFT)   & 0x8000) != 0;
+    e.alt   = (GetKeyState(VK_MENU)    & 0x8000) != 0;
+}
+
 void UiWindowImpl::OnMouseMove(float x, float y) {
     ActiveMeasureContextScope measureScope(measureContext_, renderer_);
     float dx = x / dpiScale_, dy = y / dpiScale_;
@@ -2418,6 +2588,45 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
 
     if (pressedWidget_) {
         MouseEvent e{dx, dy, 0, true};
+        StampDomMouseState(e);
+
+        // Drag & drop state machine (armed in OnMouseDown).
+        if (dragSource_) {
+            if (!dragActive_) {
+                float mdx = dx - dragStartX_, mdy = dy - dragStartY_;
+                if (mdx * mdx + mdy * mdy >=
+                    kDragThresholdDip * kDragThresholdDip) {
+                    dragActive_ = true;
+                    SetCapture(hwnd_);
+                    dragPayload_ = dragSource_->dragData;
+                    // Ghost pill shows what the user grabbed: the source
+                    // label's visible (possibly localized) text. The raw
+                    // drag-data key is a machine payload — only fall back to
+                    // it when the source has no display text.
+                    dragGhostText_.clear();
+                    if (auto* lb = dynamic_cast<LabelWidget*>(dragSource_))
+                        dragGhostText_ = lb->Text();
+                    if (dragGhostText_.empty()) dragGhostText_ = dragPayload_;
+                    if (dragSource_->onDragStartHook)
+                        dragSource_->onDragStartHook(e, dragPayload_);
+                }
+            }
+            if (dragActive_) {
+                dragX_ = dx; dragY_ = dy;
+                UpdateDragOverTarget(e);
+                InvalidateNow();  // ghost follows the cursor
+            }
+        }
+
+        // Pointer-capture semantics: during a press the captured widget keeps
+        // receiving @mousemove even when the cursor is over other widgets —
+        // required for script-driven drags to work like DOM setPointerCapture.
+        if (pressedWidget_->onMouseMoveHook) pressedWidget_->onMouseMoveHook(e);
+        // hook 可能跑模态循环 (宿主在 @mousemove 里起 OLE DoDragDrop 拖出):
+        // DoDragDrop 内部 SetCapture 夺走 capture → WM_CAPTURECHANGED 同步派发
+        // → CancelMouseCapture() 清空 pressedWidget_. 返回后必须重查, 否则
+        // 下一行空指针崩溃 (GuoheView 拖出图片到其他窗口即触发).
+        if (!pressedWidget_) { Invalidate(); return; }
         const bool handled = pressedWidget_->OnMouseMove(e);
         // Captured drags can produce a continuous stream of WM_MOUSEMOVE. If
         // we only invalidate, WM_PAINT may not run until the mouse stops, so
@@ -2450,6 +2659,11 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
                 if (oldChain.count(w)) continue;
                 w->hovered = true;
                 w->RefreshCssState();
+                if (w->onMouseEnterHook) {
+                    MouseEvent enterE{dx, dy};
+                    StampDomMouseState(enterE);
+                    w->onMouseEnterHook(enterE);
+                }
             }
             if (hoveredWidget_) {
                 MouseEvent leaveE{dx, dy};
@@ -2481,6 +2695,7 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
         // here means @mousemove on any widget works regardless of subclass.
         if (hit) {
             MouseEvent e{dx, dy};
+            StampDomMouseState(e);
             if (hit->onMouseMoveHook) hit->onMouseMoveHook(e);
             if (hit->OnMouseMove(e)) repaintNow = true;
         }
@@ -2550,17 +2765,13 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
             auto* cb = dynamic_cast<ComboBoxWidget*>(w);
             if (!cb || !cb->IsOpen()) return;
 
-            auto dr = cb->DropdownRect();
-            bool inDropdown = (dx >= dr.left && dx < dr.right &&
-                               dy >= dr.top && dy < dr.bottom);
+            const int dropdownIndex = cb->DropdownItemAt(dx, dy);
+            bool inDropdown = dropdownIndex >= 0;
             bool inCombo = cb->Contains(dx, dy);
 
             if (inDropdown) {
-                int idx = (int)((dy - dr.top) / cb->ItemHeight());
-                if (idx >= 0 && idx < cb->ItemCount()) {
-                    cb->SetSelectedIndex(idx);
-                    if (cb->onSelectionChanged) cb->onSelectionChanged(idx);
-                }
+                cb->SetSelectedIndex(dropdownIndex);
+                if (cb->onSelectionChanged) cb->onSelectionChanged(dropdownIndex);
                 cb->Close();
                 handledByDropdown = true;
             } else if (inCombo) {
@@ -2652,6 +2863,19 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
         hit->RefreshCssState();
         pressedWidget_ = hit;
 
+        // Drag & drop: arm the nearest draggable ancestor. The drag only
+        // starts once the move exceeds kDragThresholdDip (see OnMouseMove),
+        // so plain clicks on draggable widgets keep working.
+        dragSource_ = nullptr;
+        dragActive_ = false;
+        for (Widget* w = hit; w; w = w->Parent()) {
+            if (w->draggable) {
+                dragSource_ = w;
+                dragStartX_ = dx; dragStartY_ = dy;
+                break;
+            }
+        }
+
         if (dynamic_cast<SliderWidget*>(hit) ||
             dynamic_cast<ScrollViewWidget*>(hit) ||
             dynamic_cast<ImageViewWidget*>(hit) ||
@@ -2661,6 +2885,7 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
         }
 
         MouseEvent e{dx, dy, 0, true};
+        StampDomMouseState(e, 0);
         // Fire @mousedown hook before the widget's own logic — see
         // OnMouseMove for the rationale (subclasses don't all forward).
         if (hit->onMouseDownHook) hit->onMouseDownHook(e);
@@ -2675,6 +2900,12 @@ void UiWindowImpl::CancelMouseCapture() {
     // "取消": 复位 pressedWidget_ + widget 内部 drag 状态, 但不 fire onClick
     // (不是真正的点击释放). 不调 ReleaseCapture — capture 已易主.
     if (!pressedWidget_) return;
+    // An in-flight drag ends without a drop when capture is stolen.
+    if (dragActive_) {
+        MouseEvent cancelE{dragX_, dragY_};
+        FinishDrag(false, cancelE);
+    }
+    dragSource_ = nullptr;
     WidgetPtr keepAlive = pressedWidget_->shared_from_this();
     Widget* w = pressedWidget_;
     pressedWidget_ = nullptr;
@@ -2702,6 +2933,7 @@ void UiWindowImpl::OnMouseDoubleClick(float x, float y) {
     Widget* hit = root_->HitTest(dx, dy);
     if (!hit) return;
     MouseEvent e{dx, dy, 0, true};
+    StampDomMouseState(e, 0);
     // Fire @dblclick hook on the hit widget before bubbling — see
     // OnMouseMove for the rationale (subclasses don't all forward).
     if (hit->onMouseDblClickHook) hit->onMouseDblClickHook(e);
@@ -2744,6 +2976,18 @@ void UiWindowImpl::OnMouseUp(float x, float y) {
         // Note: ButtonWidget::OnMouseUp also has a self-fire path, but it's
         // gated on `pressed` which we cleared above, so no double-fire.
         MouseEvent e{dx, dy, 0, false};
+        StampDomMouseState(e, 0);
+
+        // Finish an active drag before the widget's own OnMouseUp. A release
+        // that ends a drag never counts as a click (DOM: dragend suppresses
+        // click on the source).
+        const bool wasDrag = dragActive_;
+        if (dragActive_) {
+            FinishDrag(true, e);
+            ReleaseCapture();  // drag start SetCapture'd for any source type
+        }
+        dragSource_ = nullptr;
+
         // Fire @mouseup hook before subclass dispatch (subclasses don't all
         // forward to Widget::OnMouseUp).
         if (w->onMouseUpHook) w->onMouseUpHook(e);
@@ -2752,7 +2996,7 @@ void UiWindowImpl::OnMouseUp(float x, float y) {
         // Event bubbling: walk up the parent chain to find the first widget
         // with an onClick handler. This mirrors Web semantics so clicking on
         // any descendant of a div with @click="..." fires the div's handler.
-        if (hitWidget) {
+        if (hitWidget && !wasDrag) {
             Widget* target = w;
             while (target && !target->onClick) target = target->Parent();
             if (target && target->onClick) target->onClick();
@@ -2779,11 +3023,30 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
     float dx = x / dpiScale_, dy = y / dpiScale_;
 
     if (root_) {
+        MouseEvent e{dx, dy, (float)delta};
+        StampDomMouseState(e);
+
+        // An open ComboBox owns the wheel while the pointer is inside its
+        // overlay. The overlay is not part of the widget tree, so normal
+        // HitTest would otherwise deliver this wheel event to the ScrollView
+        // or other widget behind it.
+        bool handledByDropdown = false;
+        ForEachWidget(root_.get(), [&](Widget* w) {
+            if (handledByDropdown) return;
+            auto* cb = dynamic_cast<ComboBoxWidget*>(w);
+            if (cb && cb->IsOpen() && cb->OnMouseWheel(e)) {
+                handledByDropdown = true;
+            }
+        });
+        if (handledByDropdown) {
+            InvalidateNow();
+            return;
+        }
+
         // HitTest to find deepest widget, then bubble up looking for scroll handler
         Widget* hit = root_->HitTest(dx, dy);
         bool handled = false;
         bool hookFired = false;
-        MouseEvent e{dx, dy, (float)delta};
 
         // Fire @wheel hook on the hit widget (subclass overrides may not
         // forward to Widget::OnMouseWheel).
@@ -2811,6 +3074,11 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
             else if (auto* gv = dynamic_cast<GhImgViewWidget*>(w)) {
                 if (gv->visible) {
                     handled = gv->OnMouseWheel(e);
+                }
+            }
+            else if (auto* ov = dynamic_cast<OcrImgViewWidget*>(w)) {
+                if (ov->visible) {
+                    handled = ov->OnMouseWheel(e);
                 }
             }
             else if (auto* sv = dynamic_cast<ScrollViewWidget*>(w)) {
@@ -2844,13 +3112,131 @@ void UiWindowImpl::SimMouseUp(float dipX, float dipY) {
 void UiWindowImpl::SimMouseWheel(float dipX, float dipY, float delta) {
     OnMouseWheel(dipX * dpiScale_, dipY * dpiScale_, (int)delta);
 }
+void UiWindowImpl::SimMouseDoubleClick(float dipX, float dipY) {
+    /* 复刻真实 Win32 序列: 第一次完整 click, 然后系统用 WM_LBUTTONDBLCLK
+     * 顶替第二次 WM_LBUTTONDOWN, 最后一个 WM_LBUTTONUP 收尾。 */
+    const float px = dipX * dpiScale_, py = dipY * dpiScale_;
+    OnMouseMove(px, py);
+    OnMouseDown(px, py);
+    OnMouseUp(px, py);
+    OnMouseDoubleClick(px, py);
+    OnMouseUp(px, py);
+}
+// @contextmenu — DOM semantics: fires on right-button release, bubbles up to
+// the nearest ancestor with a listener. A page-level listener does NOT
+// suppress the window's onRightClick host callback (hosts that own a native
+// context menu keep working unchanged). Shared by WM_RBUTTONUP and
+// SimRightClick so simulated right clicks exercise the same path.
+void UiWindowImpl::DispatchContextMenu(float dx, float dy) {
+    if (!root_) return;
+    Widget* hit = root_->HitTest(dx, dy);
+    for (Widget* w = hit; w; w = w->Parent()) {
+        if (w->onContextMenuHook) {
+            MouseEvent e{dx, dy};
+            StampDomMouseState(e, 2);
+            w->onContextMenuHook(e);
+            break;
+        }
+    }
+}
+
+// While a drag is active: hit-test under the cursor, resolve the nearest
+// ancestor that accepts drops, and maintain enter/over/leave + the widget
+// `dragOver` flag (CSS :drag-over). The drag source's own subtree is skipped
+// as a target — dropping something onto itself is a no-op.
+void UiWindowImpl::UpdateDragOverTarget(const MouseEvent& e) {
+    Widget* target = nullptr;
+    if (root_) {
+        Widget* hit = root_->HitTest(e.x, e.y);
+        for (Widget* w = hit; w; w = w->Parent()) {
+            if (w == dragSource_) { target = nullptr; break; }
+            if (!target && w->CanAcceptDrop()) target = w;
+        }
+    }
+    if (target != dragOverTarget_) {
+        if (dragOverTarget_) {
+            dragOverTarget_->dragOver = false;
+            dragOverTarget_->RefreshCssState();
+            if (dragOverTarget_->onDragLeaveHook)
+                dragOverTarget_->onDragLeaveHook();
+        }
+        dragOverTarget_ = target;
+        if (dragOverTarget_) {
+            dragOverTarget_->dragOver = true;
+            dragOverTarget_->RefreshCssState();
+            if (dragOverTarget_->onDragEnterHook)
+                dragOverTarget_->onDragEnterHook(e);
+        }
+    }
+    if (dragOverTarget_ && dragOverTarget_->onDragOverHook)
+        dragOverTarget_->onDragOverHook(e);
+}
+
+// Ends the active drag: fires drop on the hovered target (if accepting and
+// `dropped`), dragend on the source, and clears all drag state. Also used by
+// CancelMouseCapture with dropped=false.
+void UiWindowImpl::FinishDrag(bool dropped, const MouseEvent& e) {
+    Widget* target = dragOverTarget_;
+    Widget* source = dragSource_;
+    dragOverTarget_ = nullptr;
+    dragSource_ = nullptr;
+    dragActive_ = false;
+    bool accepted = false;
+    if (target) {
+        target->dragOver = false;
+        target->RefreshCssState();
+        if (dropped && target->onDropHook) {
+            accepted = true;
+            target->onDropHook(dragPayload_, e);
+        }
+    }
+    if (source && source->onDragEndHook) source->onDragEndHook(accepted);
+    dragPayload_.clear();
+    dragGhostText_.clear();
+    InvalidateNow();
+}
+
+void UiWindowImpl::UpdateImeCompositionPos() {
+    if (!hwnd_ || !focusedWidget_) return;
+    ActiveMeasureContextScope measureScope(measureContext_, renderer_);
+    D2D1_RECT_F cr{};
+    if (!focusedWidget_->GetCaretRect(&cr)) return;
+    HIMC imc = ImmGetContext(hwnd_);
+    if (!imc) return;
+    POINT pt = {static_cast<LONG>(cr.left * dpiScale_),
+                static_cast<LONG>(cr.bottom * dpiScale_) + 2};
+    COMPOSITIONFORM cf{};
+    cf.dwStyle = CFS_POINT;
+    cf.ptCurrentPos = pt;
+    ImmSetCompositionWindow(imc, &cf);
+    CANDIDATEFORM cd{};
+    cd.dwIndex = 0;
+    cd.dwStyle = CFS_CANDIDATEPOS;
+    cd.ptCurrentPos = pt;
+    ImmSetCandidateWindow(imc, &cd);
+    ImmReleaseContext(hwnd_, imc);
+}
+
 void UiWindowImpl::SimRightClick(float dipX, float dipY) {
-    // Matches WM_RBUTTONUP: just fires onRightClick callback.
+    // Matches WM_RBUTTONUP: contextmenu hook dispatch + onRightClick callback.
+    DispatchContextMenu(dipX, dipY);
     if (onRightClick) onRightClick(dipX, dipY);
     InvalidateNow();
 }
 void UiWindowImpl::SimKeyDown(int vk) {
-    DispatchKeyDown(vk);
+    /* 必须跟真实 WM_KEYDOWN 一样, 控件不消费时下传窗口级 onKey —— 应用级
+     * 快捷键 (ui_window_on_key: 翻页 / 缩放 / 切图…) 全挂在那上面。只调
+     * DispatchKeyDown 的话这些快捷键在自动化里完全不可达。
+     * onKey 可能销毁本窗口 (典型 Esc 关窗), 回调后不得再碰 this。 */
+    if (DispatchKeyDown(vk)) return;
+    if (onKey) {
+        HWND h = hwnd_;
+        onKey(vk);
+        if (h && IsWindow(h)) {
+            InvalidateRect(h, nullptr, FALSE);
+            UpdateWindow(h);
+        }
+    }
 }
 
 // 共用的 WM_KEYDOWN 分发逻辑。返回 true 表示事件被消费。
@@ -3058,6 +3444,11 @@ LRESULT UiWindowImpl::OnNcHitTest(int sx, int sy) {
              * (作用 root), 没有外部 caller 自己设过中间节点, 不存在 "中间节点
              * dragWindow=true + 叶子是交互控件" 的现存用法被破坏. */
             for (Widget* w = hit; w != nullptr; w = w->Parent()) {
+                /* hitClient 优先于 dragWindow: canvas mode 里叠在可拖画布上的
+                 * 交互 overlay (如 borderless 关闭热区) 标记后拿回 HTCLIENT,
+                 * 否则整棵树被 root 的 dragWindow 判成 HTCAPTION, widget 层
+                 * 永远收不到 WM_MOUSEMOVE → :hover / @click 全部失效。 */
+                if (w->hitClient) return HTCLIENT;
                 if (w->dragWindow) return HTCAPTION;
             }
             return HTCLIENT;
@@ -3149,6 +3540,8 @@ bool UiWindowImpl::HasFocusedTextInput() const {
         if (ta && ta->focused) { focused = true; return; }
         auto* cw = dynamic_cast<CustomWidget*>(w);
         if (cw && cw->focused) { focused = true; return; }
+        auto* ci = dynamic_cast<ChipsInputWidget*>(w);
+        if (ci && ci->IsFocused()) { focused = true; return; }
     });
     return focused;
 }
@@ -3184,6 +3577,7 @@ void UiWindowImpl::SetFocus(Widget* w) {
         w->RefreshCssState();
         if (auto* ti = dynamic_cast<TextInputWidget*>(w)) { ti->focused = true; ti->ResetCaretBlink(); }
         if (auto* ta = dynamic_cast<TextAreaWidget*>(w)) { ta->focused = true; ta->ResetCaretBlink(); }
+        if (auto* ci = dynamic_cast<ChipsInputWidget*>(w)) ci->ResetCaretBlink();
     }
     UpdateCaretBlinkTimer();
 }

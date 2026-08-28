@@ -2,6 +2,7 @@
 
 #include "css/css_parser.h"
 #include "css/selector.h"
+#include "css/value.h"
 
 #include <windows.h>
 
@@ -11,6 +12,7 @@
 #include <deque>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ui {
@@ -698,6 +700,300 @@ std::string BuildStyledTag(const std::string& svg_xml, size_t tag_s, size_t tag_
     return tag_xml;
 }
 
+struct SvgPaintNormalization {
+    bool        changed    = false;
+    std::string color;
+    bool        hasOpacity = false;
+    std::string opacity;
+};
+
+std::string SvgHexColor(const ui::css::Color& color) {
+    auto channel = [](float v) -> int {
+        return static_cast<int>(std::round(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+    };
+    char buf[8] = {};
+    std::snprintf(buf, sizeof(buf), "#%02X%02X%02X",
+                  channel(color.r), channel(color.g), channel(color.b));
+    return std::string(buf);
+}
+
+std::string SvgOpacityText(float opacity) {
+    char buf[32] = {};
+    std::snprintf(buf, sizeof(buf), "%.6g", std::clamp(opacity, 0.0f, 1.0f));
+    return std::string(buf);
+}
+
+float ParseSvgOpacityText(const std::string& value) {
+    const std::string trimmed = Trim(value);
+    if (trimmed.empty()) return 1.0f;
+    char* end = nullptr;
+    const float opacity = std::strtof(trimmed.c_str(), &end);
+    if (end == trimmed.c_str() || !end || *end != '\0') return 1.0f;
+    return std::clamp(opacity, 0.0f, 1.0f);
+}
+
+/* Direct2D 的 SVG 解析器只认 SVG 1.1 命名色, 不认 CSS 的 transparent:
+ * fill="transparent" 会让 GetAttributeValue(L"fill") 直接返回 E_INVALIDARG,
+ * 跟"根本没写"一样, 于是 fill 回落到初始值黑色。ProcessOn 思维导图导出的
+ * 整幅背景就是 <rect fill="transparent">, 不转就是一整块黑底盖住全图。
+ * transparent 在视觉上等价于 none, 直接换掉即可 (不必补 fill-opacity)。 */
+bool IsTransparentPaintKeyword(const std::string& value) {
+    return ToLowerAscii(Trim(value)) == "transparent";
+}
+
+/* D2D 认得的 paint server 只有 linearGradient / radialGradient。fill="url(#p)"
+ * 指到 <pattern> 或指空时, D2D 既不报错也不跳过, 而是**画成黑色** (实测: 离屏
+ * 渲染 url(#pattern) / url(#missing) 中心像素都是 0,0,0,255)。ProcessOn 导出的
+ * 水印层就是一块盖满全图的 fill="url(#pattern_mark_0)", 于是整幅变黑。
+ *
+ * SVG 的 <paint> 语法允许在 url() 后跟一个回退值, D2D 是认这个回退的
+ * (url(#missing) none 实测不画)。所以对 D2D 解不出来的引用补一个 " none"。
+ *
+ * 例外: 带 <image> 的 pattern 不动 —— 这类文件整图会回落 LunaSVG 光栅渲染
+ * (见 gh_img_view.cpp 的 NeedsLunaSvgMainRenderer_), 那条路径能正常画 pattern。 */
+struct SvgPaintRefs {
+    std::unordered_set<std::string> d2d_resolvable;   // 渐变 id
+    std::unordered_set<std::string> leave_alone;      // 图片填充的 pattern id
+};
+
+bool TagNameIs(const std::string& s, size_t tag_start, size_t tag_end,
+               const char* name) {
+    const size_t n = std::strlen(name);
+    if (tag_start + 1 + n > tag_end) return false;
+    if (s.compare(tag_start + 1, n, name) != 0) return false;
+    const char after = s[tag_start + 1 + n];
+    return IsWs((unsigned char)after) || after == '>' || after == '/';
+}
+
+std::string TagAttrValue(const std::string& s, size_t tag_start, size_t tag_end,
+                         const char* name) {
+    size_t vs = 0, ve = 0;
+    if (!FindAttr(s, tag_start, tag_end, name, vs, ve)) return {};
+    return s.substr(vs, ve - vs);
+}
+
+SvgPaintRefs CollectSvgPaintRefs(const std::string& svg_xml) {
+    SvgPaintRefs refs;
+    size_t i = 0;
+    while ((i = svg_xml.find('<', i)) != std::string::npos) {
+        const size_t tag_end = FindTagEnd(svg_xml, i);
+        if (tag_end == std::string::npos) break;
+
+        const bool is_gradient = TagNameIs(svg_xml, i, tag_end, "linearGradient") ||
+                                 TagNameIs(svg_xml, i, tag_end, "radialGradient");
+        const bool is_pattern = TagNameIs(svg_xml, i, tag_end, "pattern");
+        if (is_gradient || is_pattern) {
+            std::string id = TagAttrValue(svg_xml, i, tag_end, "id");
+            if (!id.empty()) {
+                if (is_gradient) {
+                    refs.d2d_resolvable.insert(std::move(id));
+                } else {
+                    // pattern 里有 <image> = 位图填充, 整图会走 LunaSVG, 别动它。
+                    const size_t close = svg_xml.find("</pattern>", tag_end);
+                    const size_t scan_end = (close == std::string::npos) ? svg_xml.size() : close;
+                    const size_t img = svg_xml.find("<image", tag_end);
+                    if (img != std::string::npos && img < scan_end) {
+                        refs.leave_alone.insert(std::move(id));
+                    }
+                }
+            }
+        }
+        i = tag_end + 1;
+    }
+    return refs;
+}
+
+/* url(#id) 且 D2D 解不出来时回填 "url(#id) none"。已经自带回退值的不动。 */
+bool AddUrlPaintFallback(const std::string& value, const SvgPaintRefs& refs,
+                         std::string& out_value) {
+    const std::string trimmed = Trim(value);
+    if (ToLowerAscii(trimmed.substr(0, 4)) != "url(") return false;
+    const size_t rp = trimmed.find(')');
+    if (rp == std::string::npos) return false;
+    if (Trim(trimmed.substr(rp + 1)).size() > 0) return false;   // 已有回退值
+
+    std::string id = Trim(trimmed.substr(4, rp - 4));
+    if (!id.empty() && (id.front() == '"' || id.front() == '\'')) {
+        if (id.size() < 2) return false;
+        id = id.substr(1, id.size() - 2);
+    }
+    if (id.empty() || id.front() != '#') return false;
+    id.erase(0, 1);
+    if (refs.d2d_resolvable.count(id) || refs.leave_alone.count(id)) return false;
+
+    out_value = trimmed + " none";
+    return true;
+}
+
+bool NormalizeSvgRgbPaint(const std::string& value,
+                          std::string& out_color, float& out_alpha) {
+    const std::string trimmed = Trim(value);
+    const std::string lower = ToLowerAscii(trimmed);
+    const bool is_rgb = lower.compare(0, 4, "rgb(") == 0;
+    const bool is_rgba = lower.compare(0, 5, "rgba(") == 0;
+    if (!is_rgb && !is_rgba) return false;
+
+    ui::css::Color color;
+    if (!ui::css::ParseColor(trimmed, color)) return false;
+    out_color = SvgHexColor(color);
+    out_alpha = std::clamp(color.a, 0.0f, 1.0f);
+    return true;
+}
+
+float SvgTagOpacity(const std::string& tag_xml, const char* name) {
+    size_t value_start = 0, value_end = 0;
+    if (!FindAttr(tag_xml, 0, tag_xml.size() - 1, name, value_start, value_end)) {
+        return 1.0f;
+    }
+    return ParseSvgOpacityText(tag_xml.substr(value_start, value_end - value_start));
+}
+
+void NormalizeSvgPaintAttribute(std::string& tag_xml,
+                                const char* paint_name,
+                                const char* opacity_name,
+                                float original_opacity,
+                                const SvgPaintRefs& refs) {
+    size_t value_start = 0, value_end = 0;
+    if (!FindAttr(tag_xml, 0, tag_xml.size() - 1,
+                  paint_name, value_start, value_end)) {
+        return;
+    }
+
+    const std::string raw = tag_xml.substr(value_start, value_end - value_start);
+    if (IsTransparentPaintKeyword(raw)) {
+        UpsertTagAttr(tag_xml, paint_name, "none");
+        return;
+    }
+    std::string url_fallback;
+    if (AddUrlPaintFallback(raw, refs, url_fallback)) {
+        UpsertTagAttr(tag_xml, paint_name, url_fallback);
+        return;
+    }
+
+    std::string color;
+    float alpha = 1.0f;
+    if (!NormalizeSvgRgbPaint(raw, color, alpha)) {
+        return;
+    }
+    UpsertTagAttr(tag_xml, paint_name, color);
+    if (alpha < 0.999999f) {
+        UpsertTagAttr(tag_xml, opacity_name,
+                      SvgOpacityText(alpha * original_opacity));
+    }
+}
+
+void NormalizeSvgInlinePaint(std::vector<ui::css::Declaration>& declarations,
+                             const char* paint_name,
+                             const char* opacity_name,
+                             float original_opacity,
+                             const SvgPaintRefs& refs,
+                             SvgPaintNormalization& out) {
+    size_t paint_index = declarations.size();
+    size_t opacity_index = declarations.size();
+    for (size_t i = 0; i < declarations.size(); ++i) {
+        const std::string property = ToLowerAscii(Trim(declarations[i].property));
+        if (property == paint_name) paint_index = i;
+        if (property == opacity_name) opacity_index = i;
+    }
+    if (paint_index == declarations.size()) return;
+
+    std::string paint_value = declarations[paint_index].value;
+    const bool paint_important = StripImportantSuffix(paint_value);
+    if (IsTransparentPaintKeyword(paint_value)) {
+        declarations[paint_index].value = paint_important ? "none !important" : "none";
+        out.changed = true;
+        out.color = "none";
+        out.hasOpacity = false;
+        return;
+    }
+    std::string url_fallback;
+    if (AddUrlPaintFallback(paint_value, refs, url_fallback)) {
+        declarations[paint_index].value =
+            paint_important ? url_fallback + " !important" : url_fallback;
+        out.changed = true;
+        out.color = std::move(url_fallback);
+        out.hasOpacity = false;
+        return;
+    }
+    std::string color;
+    float alpha = 1.0f;
+    if (!NormalizeSvgRgbPaint(paint_value, color, alpha)) return;
+
+    float opacity = original_opacity;
+    bool has_opacity = false;
+    bool opacity_important = false;
+    if (opacity_index != declarations.size()) {
+        std::string opacity_value = declarations[opacity_index].value;
+        opacity_important = StripImportantSuffix(opacity_value);
+        opacity = ParseSvgOpacityText(opacity_value);
+        has_opacity = true;
+    }
+    const float combined_opacity = alpha * opacity;
+
+    declarations[paint_index].value = color;
+    if (paint_important) declarations[paint_index].value += " !important";
+    if (has_opacity) {
+        declarations[opacity_index].value = SvgOpacityText(combined_opacity);
+        if (opacity_important) declarations[opacity_index].value += " !important";
+    } else if (combined_opacity < 0.999999f) {
+        declarations.push_back({opacity_name, SvgOpacityText(combined_opacity), 0, 0});
+        has_opacity = true;
+    }
+
+    out.changed = true;
+    out.color = std::move(color);
+    out.hasOpacity = has_opacity || combined_opacity < 0.999999f ||
+                     original_opacity < 0.999999f;
+    if (out.hasOpacity) out.opacity = SvgOpacityText(combined_opacity);
+}
+
+std::string SerializeInlineSvgStyle(const std::vector<ui::css::Declaration>& declarations) {
+    std::string out;
+    for (const auto& decl : declarations) {
+        const std::string property = Trim(decl.property);
+        const std::string value = Trim(decl.value);
+        if (property.empty() || value.empty()) continue;
+        if (!out.empty()) out += ';';
+        out += property;
+        out += ':';
+        out += value;
+    }
+    return out;
+}
+
+void NormalizeSvgPaintColorsInTag(std::string& tag_xml, const SvgPaintRefs& refs) {
+    if (tag_xml.size() < 3 || tag_xml.front() != '<' || tag_xml[1] == '/') return;
+
+    const float fill_opacity = SvgTagOpacity(tag_xml, "fill-opacity");
+    const float stroke_opacity = SvgTagOpacity(tag_xml, "stroke-opacity");
+    NormalizeSvgPaintAttribute(tag_xml, "fill", "fill-opacity", fill_opacity, refs);
+    NormalizeSvgPaintAttribute(tag_xml, "stroke", "stroke-opacity", stroke_opacity, refs);
+
+    size_t style_start = 0, style_end = 0;
+    if (!FindAttr(tag_xml, 0, tag_xml.size() - 1,
+                  "style", style_start, style_end)) {
+        return;
+    }
+
+    auto declarations = ui::css::ParseInlineStyle(
+        tag_xml.substr(style_start, style_end - style_start));
+    SvgPaintNormalization fill;
+    SvgPaintNormalization stroke;
+    NormalizeSvgInlinePaint(declarations, "fill", "fill-opacity", fill_opacity, refs, fill);
+    NormalizeSvgInlinePaint(declarations, "stroke", "stroke-opacity", stroke_opacity, refs, stroke);
+    if (!fill.changed && !stroke.changed) return;
+
+    UpsertTagAttr(tag_xml, "style", SerializeInlineSvgStyle(declarations));
+    if (fill.changed) {
+        UpsertTagAttr(tag_xml, "fill", fill.color);
+        if (fill.hasOpacity) UpsertTagAttr(tag_xml, "fill-opacity", fill.opacity);
+    }
+    if (stroke.changed) {
+        UpsertTagAttr(tag_xml, "stroke", stroke.color);
+        if (stroke.hasOpacity) UpsertTagAttr(tag_xml, "stroke-opacity", stroke.opacity);
+    }
+}
+
 struct SvgStackFrame {
     std::string tag;
     ui::css::MatchNode node;
@@ -953,6 +1249,33 @@ std::string NormalizeSvgRefsAndSymbols(const std::string& xml) {
         i = tag_e + 1;
     }
 
+    return out;
+}
+
+std::string NormalizeSvgPaintColorsForD2D(const std::string& svg_xml) {
+    std::string out;
+    out.reserve(svg_xml.size() + svg_xml.size() / 16);
+
+    const SvgPaintRefs refs = CollectSvgPaintRefs(svg_xml);
+    size_t i = 0;
+    while (i < svg_xml.size()) {
+        if (svg_xml[i] != '<') {
+            out += svg_xml[i++];
+            continue;
+        }
+
+        const size_t tag_start = i;
+        const size_t tag_end = FindTagEnd(svg_xml, tag_start);
+        if (tag_end == std::string::npos) {
+            out.append(svg_xml, tag_start, std::string::npos);
+            break;
+        }
+
+        std::string tag_xml(svg_xml, tag_start, tag_end - tag_start + 1);
+        NormalizeSvgPaintColorsInTag(tag_xml, refs);
+        out += tag_xml;
+        i = tag_end + 1;
+    }
     return out;
 }
 

@@ -113,6 +113,14 @@ public:
     // Remove all animations for a target
     void Cancel(Widget* target);
 
+    // Remove only the animation driving `prop` on `target`.
+    //
+    // 宿主在同一帧里先让属性变到 A (起了 transition 动画) 又改主意直接落值 B 时
+    // 必须调这个: 不掐掉那条在飞的动画, 它下一帧就把值覆盖回 A, 表现成"最后一次
+    // 写丢了"(下游 GuoheView bug-070)。整体 Cancel(target) 不能用 —— 会把同一
+    // widget 上其他属性的动画一起干掉。
+    void Cancel(Widget* target, AnimProperty prop);
+
     bool HasActive() const;
     size_t Count() const { return anims_.size(); }
 

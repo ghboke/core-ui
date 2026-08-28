@@ -70,4 +70,9 @@ std::string InlineSvgStyleClasses(const std::string& svg_xml);
  */
 std::string NormalizeSvgRefsAndSymbols(const std::string& svg_xml);
 
+/* 将 D2D 不稳定的 `rgb()` / `rgba()` 实色 paint 规范化为 SVG 1.1 的
+ * #RRGGBB + {fill,stroke}-opacity。只处理 fill/stroke 的纯色函数值，保留
+ * none、currentColor、url(#gradient) 等非纯色语义。 */
+std::string NormalizeSvgPaintColorsForD2D(const std::string& svg_xml);
+
 } // namespace ui

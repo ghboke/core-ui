@@ -103,7 +103,7 @@ list_clear=clear
 
 # Events page
 events_title=Events
-events_desc=9 wired event types; $event carries {x, y, delta, button} for mouse types.
+events_desc=13 wired event types; mouse $event mirrors DOM MouseEvent: {offsetX, offsetY, clientX, clientY, button, buttons, deltaX, deltaY, ctrlKey, shiftKey, altKey}.
 events_box=click / dblclick / mousedown / mouseup / wheel inside this box
 events_count=events
 events_last=last

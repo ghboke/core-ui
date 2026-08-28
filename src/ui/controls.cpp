@@ -6,10 +6,12 @@
 #include "measure_context.h"
 #include "renderer.h"
 #include "resource_store.h"
+#include "ui_context.h"
 #include <algorithm>
 #include <cmath>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <windows.h>
 #include <cstring>
 #include <cstdlib>
@@ -25,6 +27,30 @@ ImageSampling SamplingForBitmap(bool useHQ, D2D1_BITMAP_INTERPOLATION_MODE inter
         ? ImageSampling::Nearest
         : ImageSampling::Linear;
 }
+
+/* ResourceStore generation is global across widgets: GhImgViewWidget purges
+ * its retired image generation wholesale. Titlebar icons are permanent widget
+ * resources, so a regular local counter (1, 2, ...) can collide with image
+ * loading and be deleted while the titlebar is hidden. ResourceKey still has
+ * a globally unique resource_id, therefore one reserved generation is enough
+ * for every TitleBarWidget icon. Keep it distinct from GhImgView's checker
+ * tile generation (~0ull). */
+constexpr uint64_t kTitleBarIconGeneration =
+    (std::numeric_limits<uint64_t>::max)() - 1;
+
+/* EXE 嵌入图标 (资源 ID=1) 的加载分辨率。图标槽位是 20x20 DIP, 但 DIP ≠ 设备
+ * 像素: 150% 缩放下要 30px, 200% 要 40px。以前按 24 加载, 高 DPI 下等于把
+ * 24px 位图放大 → 标题栏图标发虚 (下游 GuoheView 报的)。这里一次取足 128px,
+ * 配合 HighQualityCubic 缩小采样, 任何缩放比都锐, 也不用跟 WM_DPICHANGED
+ * 联动重载。代价是 128*128*4 = 64KB 常驻, 每个 TitleBar 一份。 */
+constexpr int kTitleBarExeIconSourcePx = 128;
+
+/* 图标绘制槽位 (DIP, 相对 titlebar 左上角)。必须是正方 —— 之前是 18 宽 x 20
+ * 高, 方形图标会被纵向拉伸 11%。titlebar 高 36, 20 高居中即上下各 8。 */
+constexpr float kTitleBarIconLeft = 10.0f;
+constexpr float kTitleBarIconTop  = 8.0f;
+constexpr float kTitleBarIconSize = 20.0f;
+constexpr float kTitleBarTitleGap = 8.0f;   /* 图标右缘到标题文字的间距 */
 
 } // namespace
 
@@ -218,8 +244,19 @@ D2D1_SIZE_F LabelWidget::SizeHint() const {
         } else {
             float asciiW = bold_ ? fontSize_ * 0.66f : fontSize_ * 0.62f;
             for (wchar_t ch : text_) {
-                if (ch >= 0x2E80) estW += fontSize_;       /* CJK / 全角 */
-                else              estW += asciiW;
+                /* build 290: 0x2E80 这条线漏了 **U+2010–U+2027 那段通用标点**
+                 * —— …(2026) —(2014) ‘’(2018/2019) “”(201C/201D) 在中文排版里
+                 * 都是全角, 却因为码点小于 0x2E80 被按 0.62 倍的半角算。
+                 *
+                 * 后果不是"稍微窄一点"而是**文字被截掉**: 估算偏小 → 上层
+                 * (如 ContextMenu::MenuWidth) 按这个宽度布局 → 真正绘制时放不
+                 * 下 → DWrite 的 trimming 把末尾字符换成省略号。实测
+                 * "收集箱…" 显示成 "收集...", 而同样 4 个字符的 "收集箱囧"
+                 * (全部 >= 0x2E80) 完好。 */
+                if (ch >= 0x2E80 || (ch >= 0x2010 && ch <= 0x2027))
+                    estW += fontSize_;                     /* CJK / 全角 */
+                else
+                    estW += asciiW;
             }
         }
         // 不再 floor 到 60px —— 否则 pill / badge / chip 这种"包裹文字"
@@ -703,8 +740,42 @@ D2D1_SIZE_F SliderWidget::SizeHint() const {
 
 // ---- Image ----
 
+namespace {
+
+/* 存活的 ImageWidget 实例表 (build 286)。
+ *
+ * 只为 RetryFailedLoads 服务 —— 否则要为了找几个 <img> 去遍历所有窗口的整棵
+ * widget 树。注册表按实例走, 规模等于页面里 <img> 的个数, 通常几十个。
+ * 只在 UI 线程增删查, 不加锁。 */
+std::unordered_set<ImageWidget*>& LiveImageWidgets() {
+    static std::unordered_set<ImageWidget*> s;
+    return s;
+}
+
+}  // namespace
+
+ImageWidget::ImageWidget() {
+    LiveImageWidgets().insert(this);
+}
+
+ImageWidget::ImageWidget(const std::string& src) : src_(src) {
+    LiveImageWidgets().insert(this);
+}
+
 ImageWidget::~ImageWidget() {
+    LiveImageWidgets().erase(this);
     ClearImageResource();
+}
+
+void ImageWidget::RetryFailedLoads(const std::string& name) {
+    if (name.empty()) return;
+    bool any = false;
+    for (ImageWidget* w : LiveImageWidgets()) {
+        if (!w || !w->loadFailed_ || w->src_ != name) continue;
+        w->loadFailed_ = false;   /* 下一帧 OnDraw 会重新 Resolve */
+        any = true;
+    }
+    if (any) GetContext().RequestInvalidateAll();
 }
 
 void ImageWidget::ClearImageResource() {
@@ -827,6 +898,18 @@ bool TextInputWidget::ShouldShowCaret() const {
     uint64_t now = static_cast<uint64_t>(GetTickCount64());
     uint64_t elapsed = now - caretBlinkStartTick_;
     return ((elapsed / blinkMs) % 2ULL) == 0ULL;
+}
+
+bool TextInputWidget::GetCaretRect(D2D1_RECT_F* out) const {
+    extern MeasureContext* g_activeMeasureContext;
+    if (!g_activeMeasureContext) return false;
+    float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
+    int pos = std::min(std::max(cursorPos_, 0), (int)text_.size());
+    float x = rect.left + 11.0f - scrollX_ +
+              g_activeMeasureContext->MeasureTextWidth(text_.substr(0, pos),
+                                                       fontSize);
+    *out = {x, rect.top + 5, x + 1.5f, rect.bottom - 6};
+    return true;
 }
 
 int TextInputWidget::CharIndexFromX(MeasureContext& measure, float x) const {
@@ -1123,6 +1206,13 @@ bool TextInputWidget::OnKeyDown(int vk) {
         return true;
     }
 
+    /* build 288: ESC 不是编辑键 —— 输入框对它没有任何行为, 却因为本函数末尾
+     * 无条件 return true 把它吞了, 于是宿主的窗口级 on_key 在焦点落在输入框上
+     * 时永远等不到 Esc。Windows 惯例里 Esc 是"取消当前编辑 / 关掉这个框",
+     * 那是宿主的事, 该让它冒泡上去。行内编辑 (列表里放输入框, Enter 提交 /
+     * Esc 放弃) 缺的就是这一条。 */
+    if (vk == VK_ESCAPE) return false;
+
     bool shift = GetKeyState(VK_SHIFT) & 0x8000;
     bool ctrl = GetKeyState(VK_CONTROL) & 0x8000;
 
@@ -1195,6 +1285,17 @@ D2D1_SIZE_F TextInputWidget::SizeHint() const {
 
 UINT TextAreaWidget::EffectiveCaretBlinkMs() {
     return TextInputWidget::EffectiveCaretBlinkMs();
+}
+
+bool TextAreaWidget::GetCaretRect(D2D1_RECT_F* out) const {
+    extern MeasureContext* g_activeMeasureContext;
+    if (!g_activeMeasureContext) return false;
+    float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
+    if (!EnsureLayout(*g_activeMeasureContext, fontSize)) return false;
+    float x = 0, y = 0, h = fontSize * 1.3f;
+    if (!CaretXYForPos(cursorPos_, x, y, h)) return false;
+    *out = {x, y, x + 1.5f, y + h};
+    return true;
 }
 
 void TextAreaWidget::ResetCaretBlink() {
@@ -1657,9 +1758,41 @@ bool TextAreaWidget::OnMouseUp(const MouseEvent& e) {
     if (dragging_) {
         dragging_ = false;
         if (selectionStart_ == selectionEnd_) ClearSelection();
+        /* build 278: 拖选结束通知宿主 (OCR 场景要拿它反查图上位置)。 */
+        if (onSelectionChanged) onSelectionChanged();
         return true;
     }
     return false;
+}
+
+void TextAreaWidget::SetSelectionRange(int start, int end) {
+    const int len = (int)text_.size();
+    if (start > end) { const int t = start; start = end; end = t; }
+    if (start < 0) start = 0;
+    if (end > len) end = len;
+    if (start > len) start = len;
+    if (start == end) {
+        ClearSelection();
+        cursorPos_ = start;
+    } else {
+        selectionStart_ = start;
+        selectionEnd_ = end;
+        cursorPos_ = end;
+    }
+    ResetCaretBlink();
+    /* 选区滚到可见 —— 宿主联动时用户不该还要自己找。 */
+    extern MeasureContext* g_activeMeasureContext;
+    EnsureCursorVisible(g_activeMeasureContext);
+    /* 宿主主动设的选区不回调 onSelectionChanged, 避免联动回环。 */
+}
+
+bool TextAreaWidget::SelectionRange(int* start, int* end) const {
+    if (!HasSelection()) return false;
+    const int lo = selectionStart_ < selectionEnd_ ? selectionStart_ : selectionEnd_;
+    const int hi = selectionStart_ < selectionEnd_ ? selectionEnd_ : selectionStart_;
+    if (start) *start = lo;
+    if (end)   *end = hi;
+    return true;
 }
 
 bool TextAreaWidget::OnMouseWheel(const MouseEvent& e) {
@@ -1705,6 +1838,9 @@ bool TextAreaWidget::OnKeyChar(wchar_t ch) {
 bool TextAreaWidget::OnKeyDown(int vk) {
     if (!focused || !enabled) return false;
 
+    /* build 288: ESC 冒泡给宿主, 理由同 TextInputWidget::OnKeyDown。 */
+    if (vk == VK_ESCAPE) return false;
+
     extern MeasureContext* g_activeMeasureContext;
     if (g_activeMeasureContext) {
         float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
@@ -1746,10 +1882,20 @@ bool TextAreaWidget::OnKeyDown(int vk) {
         selectionStart_ = 0;
         selectionEnd_ = (int)text_.size();
         cursorPos_ = selectionEnd_;
+        if (onSelectionChanged) onSelectionChanged();
         return true;
     }
 
     int oldPos = cursorPos_;
+    const int oldSelStart = selectionStart_, oldSelEnd = selectionEnd_;
+
+    /* build 279: 不认识的键必须交还给窗口 —— 否则文本框一获焦, ESC /
+     * F1 / 自定义快捷键全被吞掉 (OCR 结果窗里 ESC 关不掉窗就是这么来的)。
+     * 认得的只有下面这些导航/编辑键。 */
+    const bool navigation = (vk == 0x25 || vk == 0x27 || vk == 0x26 ||
+                             vk == 0x28 || vk == 0x24 || vk == 0x23);
+    const bool editing = (vk == 0x2E /*DELETE*/ && !readOnly);
+    if (!navigation && !editing) return false;
 
     if (vk == 0x25 /*LEFT*/ && cursorPos_ > 0) cursorPos_--;
     else if (vk == 0x27 /*RIGHT*/ && cursorPos_ < (int)text_.size()) cursorPos_++;
@@ -1776,6 +1922,10 @@ bool TextAreaWidget::OnKeyDown(int vk) {
     EnsureCursorVisible(g_activeMeasureContext);
     if ((vk == 0x2E || (ctrl && vk == 'V') || (ctrl && vk == 'X')) && onTextChanged)
         onTextChanged(text_);
+    if ((selectionStart_ != oldSelStart || selectionEnd_ != oldSelEnd) &&
+        onSelectionChanged) {
+        onSelectionChanged();       /* Shift+方向 改选区 (build 278) */
+    }
     return true;
 }
 
@@ -1825,36 +1975,83 @@ void ComboBoxWidget::OnDraw(Renderer& r) {
     r.DrawIcon(open_ ? L"\xE70E" : L"\xE70D", arrowArea, fg, 10.0f);
 }
 
+ComboBoxWidget::DropdownLayout ComboBoxWidget::ComputeDropdownLayout_() const {
+    const int totalRows = (int)items_.size();
+    if (totalRows <= 0 || itemHeight_ <= 0.0f) return {};
+
+    constexpr float gap = 2.0f;
+    const D2D1_RECT_F vp = Viewport();
+    const float belowTop = rect.bottom + gap;
+    const float aboveBottom = rect.top - gap;
+    const float belowSpace = (std::max)(0.0f, vp.bottom - belowTop);
+    const float aboveSpace = (std::max)(0.0f, aboveBottom - vp.top);
+    const int belowRows = static_cast<int>(std::floor(belowSpace / itemHeight_));
+    const int aboveRows = static_cast<int>(std::floor(aboveSpace / itemHeight_));
+    const int desiredRows = (std::min)(totalRows, kMaxVisibleRows);
+
+    DropdownLayout layout{};
+    if (belowRows >= desiredRows) {
+        layout.visibleRows = desiredRows;
+    } else if (aboveRows >= desiredRows) {
+        layout.visibleRows = desiredRows;
+        layout.opensUpward = true;
+    } else if (aboveRows > belowRows) {
+        layout.visibleRows = (std::min)(totalRows, aboveRows);
+        layout.opensUpward = true;
+    } else {
+        layout.visibleRows = (std::min)(totalRows, belowRows);
+    }
+
+    if (layout.visibleRows <= 0) return layout;
+
+    const float height = layout.visibleRows * itemHeight_;
+    layout.rect = layout.opensUpward
+        ? D2D1_RECT_F{rect.left, aboveBottom - height, rect.right, aboveBottom}
+        : D2D1_RECT_F{rect.left, belowTop, rect.right, belowTop + height};
+    return layout;
+}
+
 D2D1_RECT_F ComboBoxWidget::DropdownRect() const {
-    float dH = itemHeight_ * (float)items_.size();
-    float gap = 2.0f;
+    return ComputeDropdownLayout_().rect;
+}
 
-    // Check if dropdown fits below
-    float belowTop = rect.bottom + gap;
-    float belowBottom = belowTop + dH;
+void ComboBoxWidget::ClampDropdownScroll_(int visibleRows) {
+    const int maxScroll = (std::max)(0, (int)items_.size() - visibleRows);
+    dropdownScrollIndex_ = std::clamp(dropdownScrollIndex_, 0, maxScroll);
+}
 
-    if (belowBottom <= Viewport().bottom) {
-        // Fits below
-        return {rect.left, belowTop, rect.right, belowBottom};
+void ComboBoxWidget::OpenDropdown_() {
+    open_ = true;
+    const auto layout = ComputeDropdownLayout_();
+    ClampDropdownScroll_(layout.visibleRows);
+    if (selectedIndex_ < dropdownScrollIndex_) {
+        dropdownScrollIndex_ = selectedIndex_;
+    } else if (selectedIndex_ >= dropdownScrollIndex_ + layout.visibleRows) {
+        dropdownScrollIndex_ = selectedIndex_ - layout.visibleRows + 1;
     }
+    ClampDropdownScroll_(layout.visibleRows);
+}
 
-    // Try above
-    float aboveBottom = rect.top - gap;
-    float aboveTop = aboveBottom - dH;
-
-    if (aboveTop >= Viewport().top) {
-        return {rect.left, aboveTop, rect.right, aboveBottom};
+int ComboBoxWidget::DropdownItemAt(float x, float y) const {
+    if (!open_) return -1;
+    const auto layout = ComputeDropdownLayout_();
+    const auto& drop = layout.rect;
+    if (layout.visibleRows <= 0 || x < drop.left || x >= drop.right ||
+        y < drop.top || y >= drop.bottom) {
+        return -1;
     }
-
-    // Neither fits perfectly — prefer below but clamp
-    return {rect.left, belowTop, rect.right, std::min(belowBottom, Viewport().bottom)};
+    const int visibleRow = static_cast<int>((y - drop.top) / itemHeight_);
+    const int index = dropdownScrollIndex_ + visibleRow;
+    return index >= 0 && index < (int)items_.size() ? index : -1;
 }
 
 void ComboBoxWidget::OnDrawOverlay(Renderer& r) {
     if (!open_) return;
     bool dark = theme::IsDark();
 
-    D2D1_RECT_F dropBg = DropdownRect();
+    const auto layout = ComputeDropdownLayout_();
+    if (layout.visibleRows <= 0) return;
+    D2D1_RECT_F dropBg = layout.rect;
     // Popup uses the control's border-radius if set; otherwise Fluent 8px.
     float cr = (css.borderRadius >= 0) ? css.borderRadius : 8.0f;
     float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
@@ -1897,8 +2094,12 @@ void ComboBoxWidget::OnDrawOverlay(Renderer& r) {
 
     float itemRadius = 3.0f;
 
-    for (int i = 0; i < (int)items_.size(); i++) {
-        float iy = dropBg.top + itemHeight_ * i;
+    const int totalRows = (int)items_.size();
+    const bool canScroll = totalRows > layout.visibleRows;
+    const float labelRight = canScroll ? dropBg.right - 12.0f : dropBg.right - 4.0f;
+    for (int row = 0; row < layout.visibleRows; ++row) {
+        const int i = dropdownScrollIndex_ + row;
+        float iy = dropBg.top + itemHeight_ * row;
         D2D1_RECT_F itemRect = {dropBg.left + 4, iy + 1, dropBg.right - 4, iy + itemHeight_ - 1};
 
         // Base background (e.g. to make items visually distinct from the
@@ -1910,7 +2111,7 @@ void ComboBoxWidget::OnDrawOverlay(Renderer& r) {
             r.FillRoundedRect(itemRect, itemRadius, itemRadius, hoverBg);
         }
         // Optional per-item divider line below each row (not the last one).
-        if (css.hasItemBorderColor && i < (int)items_.size() - 1) {
+        if (css.hasItemBorderColor && i < totalRows - 1) {
             D2D1_RECT_F div = {dropBg.left + 8, iy + itemHeight_ - 1,
                                dropBg.right - 8, iy + itemHeight_};
             r.FillRect(div, css.itemBorderColor);
@@ -1925,9 +2126,25 @@ void ComboBoxWidget::OnDrawOverlay(Renderer& r) {
             if (css.hasSelectedColor) itemColor = css.selectedColor;
             if (!drawIndicator)       weight = DWRITE_FONT_WEIGHT_SEMI_BOLD;
         }
-        D2D1_RECT_F labelR = {dropBg.left + 16, iy, dropBg.right - 4, iy + itemHeight_};
+        D2D1_RECT_F labelR = {dropBg.left + 16, iy, labelRight, iy + itemHeight_};
         r.DrawText(items_[i], labelR, itemColor, fontSize,
                    DWRITE_TEXT_ALIGNMENT_LEADING, weight);
+    }
+
+    if (canScroll) {
+        const float trackTop = dropBg.top + 4.0f;
+        const float trackBottom = dropBg.bottom - 4.0f;
+        const float trackHeight = trackBottom - trackTop;
+        const float thumbHeight = (std::max)(18.0f,
+            trackHeight * (float)layout.visibleRows / (float)totalRows);
+        const int maxScroll = totalRows - layout.visibleRows;
+        const float ratio = maxScroll > 0
+            ? (float)dropdownScrollIndex_ / (float)maxScroll : 0.0f;
+        const float thumbTop = trackTop + ratio * (trackHeight - thumbHeight);
+        const D2D1_COLOR_F thumb = dark ? theme::Rgba(0xFF, 0xFF, 0xFF, 0.42f)
+                                        : theme::Rgba(0x00, 0x00, 0x00, 0.34f);
+        r.FillRoundedRect({dropBg.right - 7.0f, thumbTop, dropBg.right - 3.0f,
+                           thumbTop + thumbHeight}, 2.0f, 2.0f, thumb);
     }
 
     r.PopRoundedClip();
@@ -1938,7 +2155,7 @@ bool ComboBoxWidget::OnMouseDown(const MouseEvent& e) {
         // Only open here. Closing is handled by main window's
         // outside-click logic (step 2 in OnMouseDown) to avoid
         // double-toggle when step 2 closes then OnMouseDown reopens.
-        open_ = true;
+        OpenDropdown_();
         return true;
     }
     return false;
@@ -1946,14 +2163,7 @@ bool ComboBoxWidget::OnMouseDown(const MouseEvent& e) {
 
 bool ComboBoxWidget::OnMouseMove(const MouseEvent& e) {
     hovered = Contains(e.x, e.y);
-    hoveredIndex_ = -1;
-    if (open_) {
-        auto dr = DropdownRect();
-        if (e.x >= dr.left && e.x < dr.right && e.y >= dr.top && e.y < dr.bottom) {
-            int idx = (int)((e.y - dr.top) / itemHeight_);
-            if (idx >= 0 && idx < (int)items_.size()) hoveredIndex_ = idx;
-        }
-    }
+    hoveredIndex_ = DropdownItemAt(e.x, e.y);
     return hovered || open_;
 }
 
@@ -1965,6 +2175,20 @@ bool ComboBoxWidget::OnMouseUp(const MouseEvent& e) {
         return true;
     }
     return false;
+}
+
+bool ComboBoxWidget::OnMouseWheel(const MouseEvent& e) {
+    if (!open_ || DropdownItemAt(e.x, e.y) < 0) return false;
+    const auto layout = ComputeDropdownLayout_();
+    const int maxScroll = (std::max)(0, (int)items_.size() - layout.visibleRows);
+    if (maxScroll <= 0) return true;
+
+    const int notches = (std::max)(1, static_cast<int>(std::abs(e.delta) / WHEEL_DELTA));
+    const int rows = notches * 3;
+    dropdownScrollIndex_ += e.delta > 0 ? -rows : rows;
+    ClampDropdownScroll_(layout.visibleRows);
+    hoveredIndex_ = DropdownItemAt(e.x, e.y);
+    return true;
 }
 
 D2D1_SIZE_F ComboBoxWidget::SizeHint() const {
@@ -2194,6 +2418,13 @@ void ScrollViewWidget::DoLayout() {
     content_->DoLayout();
 }
 
+void ScrollViewWidget::ApplyScrollDelta_(float oldScrollY) {
+    if (!content_) return;
+    const float dy = -(scrollY_ - oldScrollY);   /* 内容反向移动 */
+    if (dy == 0.0f) return;
+    ShiftSubtreeRects(content_.get(), 0.0f, dy);
+}
+
 void ScrollViewWidget::OnDraw(Renderer& r) {
     Widget::OnDraw(r);
     // Content is drawn in DrawTree with clipping — not here.
@@ -2216,9 +2447,18 @@ void ScrollViewWidget::DrawTree(Renderer& r) {
     // Draw background + scrollbar
     OnDraw(r);
     paintedOnce_ = true;   // L45: mount-phase transition gate
-    // Draw content inside clip region — only once
+    /* Draw content inside clip region — only once.
+     *
+     * PushCull (build 285): clip 只让 D2D 丢掉画出界的像素, 遍历子树和录
+     * display list 的成本一分没省。长列表里这笔钱是主要开销 —— 2000 行实测
+     * 每帧 6.6ms 全花在录制看不见的行上, 拖动滚动条明显不跟手。PushCull 让
+     * Widget::DrawTree 对完全落在视口外的子树直接返回。
+     *
+     * 剔除是 opt-in 的: 只有这里 push, 别处行为完全不变。 */
     r.PushClip(rect);
+    r.PushCull(rect);
     if (content_) content_->DrawTree(r);
+    r.PopCull();
     r.PopClip();
     // Skip Widget::DrawTree's default children iteration (content is already drawn)
 }
@@ -2227,9 +2467,10 @@ bool ScrollViewWidget::OnMouseWheel(const MouseEvent& e) {
     if (!Contains(e.x, e.y)) return false;
     // 内容完全适配视口时不消耗滚轮事件，让父容器处理
     if (!NeedsScrollbar()) return false;
+    const float oldScroll = scrollY_;
     scrollY_ -= e.delta * 0.3f;
     ClampScroll();
-    DoLayout();
+    ApplyScrollDelta_(oldScroll);   /* 纯偏移变化, 不重跑布局 */
     return true;
 }
 
@@ -2244,11 +2485,12 @@ bool ScrollViewWidget::OnMouseDown(const MouseEvent& e) {
         float visH = VisibleHeight();
         float trackRange = visH - thumbH;
         if (trackRange > 0 && (e.y < thumb.top || e.y > thumb.bottom)) {
+            const float oldScroll = scrollY_;
             float targetY = e.y - thumbH / 2 - rect.top;
             float maxScroll = contentHeight_ - visH;
             scrollY_ = targetY / (visH - thumbH) * maxScroll;
             ClampScroll();
-            DoLayout();
+            ApplyScrollDelta_(oldScroll);
         }
         dragStartScroll_ = scrollY_;
         return true;
@@ -2264,11 +2506,12 @@ bool ScrollViewWidget::OnMouseMove(const MouseEvent& e) {
         float thumbH = std::max(20.0f, visH * ratio);
         float trackRange = visH - thumbH;
         if (trackRange > 0) {
+            const float oldScroll = scrollY_;
             float dy = e.y - dragStartY_;
             float maxScroll = contentHeight_ - visH;
             scrollY_ = dragStartScroll_ + dy * (maxScroll / trackRange);
             ClampScroll();
-            DoLayout();
+            ApplyScrollDelta_(oldScroll);
         }
         return true;
     }
@@ -3828,23 +4071,42 @@ void TitleBarWidget::OnDraw(Renderer& r) {
     // 三段图标查找：1) 用户显式设的 RGBA  2) EXE 嵌入资源 ID=1  3) 不画
     float titleLeft = rect.left + 12;
     if (showIcon_) {
+        /* ResourceStore::Clear/PurgeGeneration can invalidate a ResourceKey
+         * without notifying this widget. Drop stale keys before selecting an
+         * icon; otherwise exeIconAttempted_ suppresses the only reload path
+         * forever and RecordImage records a resource that no longer exists. */
+        auto hasResource = [](const ResourceKey& key) {
+            auto resource = GlobalResourceStore().Acquire(key);
+            return resource && resource->bytes;
+        };
+        if (userIconResourceKey_.IsValid() && !hasResource(userIconResourceKey_)) {
+            userIconResourceKey_ = {};
+            userIconW_ = userIconH_ = 0;
+            iconBitmap_.Reset();
+        }
+        if (exeIconResourceKey_.IsValid() && !hasResource(exeIconResourceKey_)) {
+            exeIconResourceKey_ = {};
+            exeIconAttempted_ = false;
+            iconBitmap_.Reset();
+        }
+
         // 懒加载 EXE 资源到 CPU store（只尝试一次，失败就不再 retry）
         if (!userIconResourceKey_.IsValid() && !exeIconResourceKey_.IsValid() && !exeIconAttempted_) {
             exeIconAttempted_ = true;
             HICON h = (HICON)LoadImageW(GetModuleHandleW(nullptr),
                                         MAKEINTRESOURCEW(1), IMAGE_ICON,
-                                        24, 24, LR_DEFAULTCOLOR);
+                                        kTitleBarExeIconSourcePx,
+                                        kTitleBarExeIconSourcePx,
+                                        LR_DEFAULTCOLOR);
             if (h) {
                 std::vector<uint8_t> pixels;
                 int w = 0, hgt = 0, stride = 0;
                 if (r.DecodeHICONToBgraPremul(h, pixels, w, hgt, stride)) {
-                    const uint64_t nextGeneration = exeIconGeneration_ + 1;
                     ResourceKey resourceKey = GlobalResourceStore().AddImage(
-                        ResourceKind::Icon, nextGeneration, w, hgt, stride,
+                        ResourceKind::Icon, kTitleBarIconGeneration, w, hgt, stride,
                         PixelFormat::BgraPremul, pixels.data(), true);
                     if (resourceKey.IsValid()) {
                         exeIconResourceKey_ = resourceKey;
-                        exeIconGeneration_ = nextGeneration;
                     }
                 }
                 DestroyIcon(h);
@@ -3854,21 +4116,27 @@ void TitleBarWidget::OnDraw(Renderer& r) {
         const ResourceKey iconResourceKey = userIconResourceKey_.IsValid()
             ? userIconResourceKey_
             : exeIconResourceKey_;
+        auto iconResource = GlobalResourceStore().Acquire(iconResourceKey);
 
         // 懒加载 icon resource → D2D 位图；纯录制阶段没有 RT 时只保留 ResourceKey。
-        if (!iconBitmap_ && iconResourceKey.IsValid()) {
-            auto res = GlobalResourceStore().Acquire(iconResourceKey);
-            if (res && res->bytes) {
-                iconBitmap_ = r.CreateBitmapFromPixels(
-                    res->bytes->data(), res->width, res->height, res->stride);
-            }
+        if (!iconBitmap_ && iconResource && iconResource->bytes) {
+            iconBitmap_ = r.CreateBitmapFromPixels(
+                iconResource->bytes->data(), iconResource->width,
+                iconResource->height, iconResource->stride);
         }
-        if (iconBitmap_ || iconResourceKey.IsValid()) {
-            D2D1_RECT_F iconRect = {rect.left + 10, rect.top + 8,
-                                    rect.left + 28, rect.top + 28};
-            r.RecordImage(iconResourceKey, iconRect, ImageSampling::Linear);
-            if (iconBitmap_) r.DrawBitmap(iconBitmap_.Get(), iconRect, 1.0f);
-            titleLeft = rect.left + 36;
+        if (iconResource && iconResource->bytes) {
+            /* 源位图 (EXE 图标 128px / 用户设的高分辨率图) 一律缩小到槽位,
+             * 用 HighQualityCubic —— Linear 只采 2x2, 缩小比大于 2 会丢细节
+             * 发虚 / 抖动。 */
+            const float iconLeft = rect.left + kTitleBarIconLeft;
+            const float iconTop  = rect.top  + kTitleBarIconTop;
+            D2D1_RECT_F iconRect = {iconLeft, iconTop,
+                                    iconLeft + kTitleBarIconSize,
+                                    iconTop  + kTitleBarIconSize};
+            r.RecordImage(iconResourceKey, iconRect,
+                          ImageSampling::HighQualityCubic);
+            if (iconBitmap_) r.DrawBitmapHQ(iconBitmap_.Get(), iconRect, 1.0f);
+            titleLeft = iconRect.right + kTitleBarTitleGap;
         }
         // 没图就什么都不画，title 留在 left+12
     }
@@ -3896,16 +4164,18 @@ void TitleBarWidget::SetIconFromPixels(const uint8_t* rgba, int w, int h) {
         return;
     }
 
-    const uint64_t nextGeneration = userIconGeneration_ + 1;
+    /* 入参字节序是 BGRA 预乘 (跟 32bpp DIB / DecodeHICONToBgraPremul 一致)。
+     * 以前这里写 PixelFormat::Rgba —— 那个枚举名是错的, 它在 renderer 里跟
+     * BgraPremul 走同一条 CreateBitmapFromPixels 分支, 从来没做过 R/B 交换。
+     * 名字误导下游按字面 swap R/B, 橙色图标画成了蓝色 (GuoheView 踩过)。 */
     ResourceKey resourceKey = GlobalResourceStore().AddImage(
-        ResourceKind::Icon, nextGeneration, w, h, w * 4,
-        PixelFormat::Rgba, rgba, true);
+        ResourceKind::Icon, kTitleBarIconGeneration, w, h, w * 4,
+        PixelFormat::BgraPremul, rgba, true);
     if (!resourceKey.IsValid()) {
         userIconW_ = userIconH_ = 0;
         return;
     }
     userIconResourceKey_ = resourceKey;
-    userIconGeneration_ = nextGeneration;
     userIconW_ = w;
     userIconH_ = h;
 }
@@ -5121,6 +5391,651 @@ bool SplitViewWidget::OnMouseUp(const MouseEvent& e) {
 
 D2D1_SIZE_F SplitViewWidget::SizeHint() const {
     return {fixedW > 0 ? fixedW : 800.0f, fixedH > 0 ? fixedH : 600.0f};
+}
+
+// ==================== ChipsInputWidget ====================
+//
+// Geometry model: the content is a run of elements (chip or single char)
+// laid out left→right inside the text area (same insets as TextInput).
+// Boundary i sits before element i; the caret / drop indicator live on
+// boundaries, so chips are atomic by construction.
+
+namespace {
+constexpr float kChipsPadX     = 11.0f;  // text area inset (matches TextInput)
+constexpr float kChipPadH      = 8.0f;   // horizontal padding inside a chip
+constexpr float kChipMargin    = 3.0f;   // gap around a chip
+constexpr float kChipCloseW    = 14.0f;  // × hit zone at a hovered chip's right
+constexpr float kChipsDragThreshold = 4.0f;
+
+std::wstring ChipsGetClipboard() {
+    std::wstring out;
+    if (!OpenClipboard(nullptr)) return out;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (auto* p = static_cast<wchar_t*>(GlobalLock(h))) {
+            out = p;
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    return out;
+}
+
+void ChipsSetClipboard(const std::wstring& s) {
+    if (!OpenClipboard(nullptr)) return;
+    EmptyClipboard();
+    size_t bytes = (s.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        if (void* p = GlobalLock(h)) {
+            memcpy(p, s.c_str(), bytes);
+            GlobalUnlock(h);
+            SetClipboardData(CF_UNICODETEXT, h);
+        } else {
+            GlobalFree(h);
+        }
+    }
+    CloseClipboard();
+}
+}  // namespace
+
+ChipsInputWidget::ChipsInputWidget(const std::wstring& placeholder)
+    : placeholder_(placeholder) {
+    focusable = true;
+    cssTag = "chips-input";
+    // Native drop target for the window DnD framework: an external drag
+    // (payload = chip key) shows an insertion caret while hovering and
+    // drops in as a chip. Pages should NOT bind @drop/@dragover on the
+    // widget — that would overwrite these hooks; listen to @change instead.
+    dropTarget = true;
+    onDragOverHook = [this](const MouseEvent& e) {
+        extern MeasureContext* g_activeMeasureContext;
+        if (g_activeMeasureContext)
+            dropCaret_ = BoundaryFromX(*g_activeMeasureContext,
+                                       e.x - rect.left - kChipsPadX + scrollX_);
+    };
+    onDragLeaveHook = [this]() { dropCaret_ = -1; };
+    onDropHook = [this](const std::wstring& data, const MouseEvent& e) {
+        extern MeasureContext* g_activeMeasureContext;
+        int at = dropCaret_;
+        if (at < 0 && g_activeMeasureContext)
+            at = BoundaryFromX(*g_activeMeasureContext,
+                               e.x - rect.left - kChipsPadX + scrollX_);
+        if (at < 0 || at > (int)elems_.size()) at = (int)elems_.size();
+        dropCaret_ = -1;
+        if (readOnly || data.empty()) return;
+        ClearSelection();
+        elems_.insert(elems_.begin() + at, Elem{true, data});
+        caret_ = at + 1;
+        selectedChip_ = -1;
+        Mutated();
+    };
+}
+
+void ChipsInputWidget::ResetCaretBlink() {
+    caretBlinkStartTick_ = static_cast<uint64_t>(GetTickCount64());
+}
+
+bool ChipsInputWidget::ShouldShowCaret() const {
+    UINT blinkMs = TextInputWidget::EffectiveCaretBlinkMs();
+    if (caretBlinkStartTick_ == 0) return true;
+    uint64_t elapsed = static_cast<uint64_t>(GetTickCount64()) - caretBlinkStartTick_;
+    return ((elapsed / blinkMs) % 2ULL) == 0ULL;
+}
+
+bool ChipsInputWidget::GetCaretRect(D2D1_RECT_F* out) const {
+    extern MeasureContext* g_activeMeasureContext;
+    if (!g_activeMeasureContext) return false;
+    std::vector<float> xs;
+    BoundaryXs(*g_activeMeasureContext, xs);
+    int c = std::min(std::max(caret_, 0), (int)xs.size() - 1);
+    float x = rect.left + kChipsPadX - scrollX_ + xs[c];
+    *out = {x, rect.top + 6, x + 1.5f, rect.bottom - 7};
+    return true;
+}
+
+bool ChipsInputWidget::IsOverChip(MeasureContext& m, float windowX) const {
+    return ChipIndexAt(m, windowX - rect.left - kChipsPadX + scrollX_,
+                       0, nullptr) >= 0;
+}
+
+bool ChipsInputWidget::IsOverChipClose(MeasureContext& m, float windowX) const {
+    bool onClose = false;
+    ChipIndexAt(m, windowX - rect.left - kChipsPadX + scrollX_, 0, &onClose);
+    return onClose;
+}
+
+std::wstring ChipsInputWidget::Value() const {
+    std::wstring out;
+    for (const auto& el : elems_) {
+        if (el.chip) { out += L'{'; out += el.s; out += L'}'; }
+        else out += el.s;
+    }
+    return out;
+}
+
+void ChipsInputWidget::SetValue(const std::wstring& tpl) {
+    elems_.clear();
+    for (size_t i = 0; i < tpl.size();) {
+        if (tpl[i] == L'{') {
+            size_t close = tpl.find(L'}', i + 1);
+            if (close != std::wstring::npos && close > i + 1 &&
+                tpl.find(L'{', i + 1) > close) {
+                elems_.push_back({true, tpl.substr(i + 1, close - i - 1)});
+                i = close + 1;
+                continue;
+            }
+        }
+        elems_.push_back({false, std::wstring(1, tpl[i])});
+        i++;
+    }
+    caret_ = (int)elems_.size();
+    selectedChip_ = -1;
+    ClearSelection();
+    scrollX_ = 0;
+}
+
+void ChipsInputWidget::SetChipLabels(const std::wstring& spec) {
+    chipLabels_.clear();
+    size_t i = 0;
+    while (i < spec.size()) {
+        size_t sep = spec.find(L';', i);
+        if (sep == std::wstring::npos) sep = spec.size();
+        std::wstring pair = spec.substr(i, sep - i);
+        size_t eq = pair.find(L'=');
+        if (eq != std::wstring::npos && eq > 0)
+            chipLabels_.emplace_back(pair.substr(0, eq), pair.substr(eq + 1));
+        i = sep + 1;
+    }
+}
+
+void ChipsInputWidget::InsertChip(const std::wstring& key) {
+    if (readOnly || key.empty()) return;
+    if (HasSelection()) DeleteSelection();
+    if (caret_ < 0 || caret_ > (int)elems_.size()) caret_ = (int)elems_.size();
+    elems_.insert(elems_.begin() + caret_, Elem{true, key});
+    caret_++;
+    selectedChip_ = -1;
+    Mutated();
+}
+
+const std::wstring& ChipsInputWidget::ChipLabel(const std::wstring& key) const {
+    for (const auto& kv : chipLabels_)
+        if (kv.first == key) return kv.second;
+    return key;
+}
+
+float ChipsInputWidget::ChipFontSize() const {
+    float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
+    return fontSize - 1.0f;
+}
+
+float ChipsInputWidget::ElemWidth(MeasureContext& m, const Elem& el,
+                                  float fontSize) const {
+    if (el.chip)
+        /* 常驻预留 × 区域 — 悬停显示 × 时不遮文字也不改变宽度 (布局不抖). */
+        return m.MeasureTextWidth(ChipLabel(el.s), ChipFontSize()) +
+               kChipPadH * 2 + kChipCloseW + kChipMargin * 2;
+    return m.MeasureTextWidth(el.s, fontSize);
+}
+
+void ChipsInputWidget::BoundaryXs(MeasureContext& m,
+                                  std::vector<float>& out) const {
+    float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
+    out.clear();
+    out.reserve(elems_.size() + 1);
+    float x = 0;
+    out.push_back(x);
+    for (const auto& el : elems_) {
+        x += ElemWidth(m, el, fontSize);
+        out.push_back(x);
+    }
+}
+
+int ChipsInputWidget::BoundaryFromX(MeasureContext& m, float localX) const {
+    std::vector<float> xs;
+    BoundaryXs(m, xs);
+    int best = 0;
+    float bestDist = 1e9f;
+    for (int i = 0; i < (int)xs.size(); i++) {
+        float d = std::fabs(xs[i] - localX);
+        if (d < bestDist) { bestDist = d; best = i; }
+    }
+    return best;
+}
+
+int ChipsInputWidget::ChipIndexAt(MeasureContext& m, float localX,
+                                  float localY, bool* onClose) const {
+    (void)localY;
+    if (onClose) *onClose = false;
+    std::vector<float> xs;
+    BoundaryXs(m, xs);
+    for (int i = 0; i < (int)elems_.size(); i++) {
+        if (!elems_[i].chip) continue;
+        float l = xs[i] + kChipMargin, r2 = xs[i + 1] - kChipMargin;
+        if (localX >= l && localX < r2) {
+            if (onClose && hoverChip_ == i && localX >= r2 - kChipCloseW)
+                *onClose = true;
+            return i;
+        }
+    }
+    return -1;
+}
+
+void ChipsInputWidget::EnsureCaretVisible(MeasureContext& m) {
+    std::vector<float> xs;
+    BoundaryXs(m, xs);
+    float viewW = std::max(0.0f, rect.right - rect.left - kChipsPadX * 2);
+    float total = xs.back();
+    if (total <= viewW) { scrollX_ = 0; return; }
+    float cx = xs[std::min(std::max(caret_, 0), (int)xs.size() - 1)];
+    if (cx - scrollX_ < 0) scrollX_ = cx;
+    if (cx - scrollX_ > viewW) scrollX_ = cx - viewW;
+    if (scrollX_ > total - viewW) scrollX_ = total - viewW;
+    if (scrollX_ < 0) scrollX_ = 0;
+}
+
+void ChipsInputWidget::Mutated() {
+    if (onTextChanged) onTextChanged(Value());
+}
+
+void ChipsInputWidget::DeleteSelection() {
+    if (!HasSelection()) return;
+    int a = std::min(selAnchor_, caret_);
+    int b = std::max(selAnchor_, caret_);
+    elems_.erase(elems_.begin() + a, elems_.begin() + b);
+    caret_ = a;
+    ClearSelection();
+    selectedChip_ = -1;
+    Mutated();
+}
+
+std::wstring ChipsInputWidget::SerializeRange(int a, int b) const {
+    std::wstring out;
+    for (int i = a; i < b && i < (int)elems_.size(); i++) {
+        const Elem& el = elems_[i];
+        if (el.chip) { out += L'{'; out += el.s; out += L'}'; }
+        else out += el.s;
+    }
+    return out;
+}
+
+void ChipsInputWidget::RemoveChip(int idx) {
+    if (idx < 0 || idx >= (int)elems_.size() || !elems_[idx].chip) return;
+    elems_.erase(elems_.begin() + idx);
+    if (caret_ > idx) caret_--;
+    selectedChip_ = -1;
+    hoverChip_ = -1;
+    Mutated();
+}
+
+void ChipsInputWidget::OnDraw(Renderer& r) {
+    bool dark = theme::IsDark();
+    float cr = (css.borderRadius >= 0) ? css.borderRadius : theme::radius::medium;
+    float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
+    D2D1_COLOR_F accent = css.hasAccent ? css.accent : theme::kAccent();
+    D2D1_COLOR_F fg = css.hasFg ? css.fg : theme::kBtnText();
+    bool focused = IsFocused();
+
+    // Frame: same state machine as TextInput.
+    bool customBg = bgColor.a > 0;
+    D2D1_COLOR_F bg;
+    if (customBg) {
+        bg = bgColor;
+    } else {
+        if (!enabled)     bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.03f) : theme::Rgba(0xF0,0xF0,0xF0,0.90f);
+        else if (focused) bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.03f) : theme::Rgba(0xFF,0xFF,0xFF,1.0f);
+        else if (hovered) bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.08f) : theme::Rgba(0xF9,0xF9,0xF9,0.97f);
+        else              bg = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.06f) : theme::Rgba(0xFF,0xFF,0xFF,0.95f);
+    }
+    r.FillRoundedRect(rect, cr, cr, bg);
+    if (dragOver) {
+        r.DrawRoundedRect(rect, cr, cr, accent, 1.5f);
+    } else {
+        D2D1_COLOR_F borderTop = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.08f) : theme::Rgba(0x00,0x00,0x00,0.06f);
+        r.DrawRoundedRect(rect, cr, cr, borderTop, 1.0f);
+        if (focused) {
+            D2D1_RECT_F bottomLine = {rect.left + 1, rect.bottom - 2, rect.right - 1, rect.bottom};
+            r.FillRect(bottomLine, accent);
+        } else {
+            D2D1_COLOR_F borderBot = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.54f) : theme::Rgba(0x00,0x00,0x00,0.45f);
+            D2D1_RECT_F botLine = {rect.left + 2, rect.bottom - 1.0f, rect.right - 2, rect.bottom};
+            r.FillRect(botLine, borderBot);
+        }
+    }
+
+    /* 裁剪区只收水平 (滚动裁切用), 垂直几乎放满 — 高度紧张时 chip 下缘
+     * 不再被裁掉几个像素. */
+    D2D1_RECT_F area = {rect.left + kChipsPadX, rect.top + 1,
+                        rect.right - kChipsPadX, rect.bottom - 2};
+    r.PushClip(area);
+
+    if (elems_.empty()) {
+        D2D1_COLOR_F phColor = css.hasPlaceholderColor ? css.placeholderColor
+                                                       : theme::kContentText();
+        D2D1_RECT_F phArea = {area.left, rect.top + 5, area.right, rect.bottom - 6};
+        r.DrawText(placeholder_, phArea, phColor, fontSize);
+    }
+
+    extern MeasureContext* g_activeMeasureContext;
+    MeasureContext local;
+    MeasureContext* m = g_activeMeasureContext;
+    if (!m) { local.BindRenderer(&r); m = &local; }
+
+    std::vector<float> xs;
+    BoundaryXs(*m, xs);
+    float baseX = area.left - scrollX_;
+    float chipFont = ChipFontSize();
+    float midY = (rect.top + rect.bottom) * 0.5f;
+
+    // Selection band (behind elements) — accent when focused, gray otherwise.
+    if (HasSelection()) {
+        int a = std::min(selAnchor_, caret_);
+        int b = std::max(selAnchor_, caret_);
+        D2D1_COLOR_F selBg = focused
+            ? D2D1_COLOR_F{accent.r, accent.g, accent.b, 0.30f}
+            : (dark ? theme::Rgba(0xFF, 0xFF, 0xFF, 0.18f)
+                    : theme::Rgba(0x00, 0x00, 0x00, 0.18f));
+        r.FillRect({baseX + xs[a], rect.top + 4,
+                    baseX + xs[b], rect.bottom - 5}, selBg);
+    }
+
+    for (int i = 0; i < (int)elems_.size(); i++) {
+        const Elem& el = elems_[i];
+        float x0 = baseX + xs[i], x1 = baseX + xs[i + 1];
+        if (x1 < area.left || x0 > area.right) continue;
+        if (el.chip) {
+            D2D1_RECT_F pill = {x0 + kChipMargin, midY - (chipFont + 12.0f) * 0.5f,
+                                x1 - kChipMargin, midY + (chipFont + 12.0f) * 0.5f};
+            float pr = (pill.bottom - pill.top) * 0.5f;
+            bool sel = (i == selectedChip_);
+            D2D1_COLOR_F pillBg = sel ? accent
+                : (dark ? theme::Rgba(0xFF,0xFF,0xFF,0.10f)
+                        : theme::Rgba(0x00,0x00,0x00,0.06f));
+            D2D1_COLOR_F pillFg = sel ? theme::white : fg;
+            r.FillRoundedRect(pill, pr, pr, pillBg);
+            if (!sel) {
+                D2D1_COLOR_F pillBorder = dark ? theme::Rgba(0xFF,0xFF,0xFF,0.16f)
+                                               : theme::Rgba(0x00,0x00,0x00,0.12f);
+                r.DrawRoundedRect(pill, pr, pr, pillBorder, 1.0f);
+            }
+            D2D1_RECT_F tr = {pill.left + kChipPadH, midY - chipFont * 0.72f,
+                              pill.right - kChipPadH - kChipCloseW,
+                              midY + chipFont * 0.72f};
+            r.DrawText(ChipLabel(el.s), tr, pillFg, chipFont);
+            if (hovered && i == hoverChip_ && !readOnly) {
+                // × affordance in the reserved right zone. Drawn as two
+                // lines — text glyph metrics never center exactly.
+                float cxm = pill.right - 2 - kChipCloseW * 0.5f;
+                float arm = 3.2f;
+                r.DrawLine(cxm - arm, midY - arm, cxm + arm, midY + arm,
+                           pillFg, 1.2f);
+                r.DrawLine(cxm - arm, midY + arm, cxm + arm, midY - arm,
+                           pillFg, 1.2f);
+            }
+        } else {
+            D2D1_RECT_F tr = {x0, rect.top + 5, x0 + 10000, rect.bottom - 6};
+            r.DrawText(el.s, tr, fg, fontSize);
+        }
+    }
+
+    // Caret (blinks like TextInput; hidden while a chip is armed for delete)
+    if (focused && enabled && selectedChip_ < 0 && dragChip_ < 0 &&
+        ShouldShowCaret()) {
+        float cx = baseX + xs[std::min(std::max(caret_, 0), (int)xs.size() - 1)];
+        D2D1_COLOR_F caretColor = css.hasCaretColor ? css.caretColor : accent;
+        r.FillRect({cx, rect.top + 6, cx + 1.2f, rect.bottom - 7}, caretColor);
+    }
+
+    // Drop / reorder insertion indicator
+    if (dropCaret_ >= 0 && dropCaret_ < (int)xs.size()) {
+        float cx = baseX + xs[dropCaret_];
+        r.FillRect({cx - 1, rect.top + 4, cx + 1.5f, rect.bottom - 5}, accent);
+    }
+
+    // Reorder ghost: the dragged chip follows the cursor (centered),
+    // semi-transparent — without it the gesture reads as "nothing happens".
+    if (IsDraggingChip() && dragChip_ < (int)elems_.size()) {
+        const std::wstring& glabel = ChipLabel(elems_[dragChip_].s);
+        float gw = m->MeasureTextWidth(glabel, chipFont) + kChipPadH * 2;
+        float gh = chipFont + 12.0f;
+        D2D1_RECT_F gp = {dragMx_ - gw * 0.5f, dragMy_ - gh * 0.5f,
+                          dragMx_ + gw * 0.5f, dragMy_ + gh * 0.5f};
+        float gpr = gh * 0.5f;
+        r.FillRoundedRect(gp, gpr, gpr,
+                          {accent.r, accent.g, accent.b, 0.75f});
+        D2D1_RECT_F gt = {gp.left + kChipPadH, dragMy_ - chipFont * 0.72f,
+                          gp.right - kChipPadH, dragMy_ + chipFont * 0.72f};
+        r.DrawText(glabel, gt, theme::white, chipFont);
+    }
+
+    r.PopClip();
+}
+
+bool ChipsInputWidget::OnMouseDown(const MouseEvent& e) {
+    if (!enabled) return false;
+    if (!Contains(e.x, e.y)) return false;
+    extern MeasureContext* g_activeMeasureContext;
+    if (!g_activeMeasureContext) return true;
+    MeasureContext& m = *g_activeMeasureContext;
+    float localX = e.x - rect.left - kChipsPadX + scrollX_;
+
+    bool onClose = false;
+    int chip = ChipIndexAt(m, localX, e.y - rect.top, &onClose);
+    pressX_ = e.x; pressY_ = e.y;
+    dragMoved_ = false;
+    if (chip >= 0 && !readOnly) {
+        if (onClose) {
+            RemoveChip(chip);
+            return true;
+        }
+        dragChip_ = chip;
+        selectedChip_ = chip;
+    } else {
+        dragChip_ = -1;
+        selectedChip_ = -1;
+        const int pos = BoundaryFromX(m, localX);
+        if (e.shift && selAnchor_ >= 0) {
+            /* Shift+click: extend from existing anchor */
+        } else if (e.shift) {
+            selAnchor_ = caret_;
+        } else {
+            selAnchor_ = pos;   /* drag-selection anchor; collapses on mouse-up */
+        }
+        selecting_ = true;
+        caret_ = pos;
+        EnsureCaretVisible(m);
+        ResetCaretBlink();
+    }
+    return true;
+}
+
+bool ChipsInputWidget::OnMouseMove(const MouseEvent& e) {
+    extern MeasureContext* g_activeMeasureContext;
+    if (!g_activeMeasureContext) return false;
+    MeasureContext& m = *g_activeMeasureContext;
+    float localX = e.x - rect.left - kChipsPadX + scrollX_;
+
+    if (dragChip_ >= 0) {
+        float ddx = e.x - pressX_, ddy = e.y - pressY_;
+        if (!dragMoved_ &&
+            ddx * ddx + ddy * ddy >= kChipsDragThreshold * kChipsDragThreshold)
+            dragMoved_ = true;
+        if (dragMoved_) {
+            dragMx_ = e.x; dragMy_ = e.y;
+            dropCaret_ = BoundaryFromX(m, localX);
+            return true;
+        }
+        return false;
+    }
+    if (selecting_) {
+        int pos = BoundaryFromX(m, localX);
+        if (pos != caret_) {
+            caret_ = pos;
+            EnsureCaretVisible(m);
+            return true;
+        }
+        return false;
+    }
+    int prevHover = hoverChip_;
+    hoverChip_ = Contains(e.x, e.y)
+                     ? ChipIndexAt(m, localX, e.y - rect.top, nullptr)
+                     : -1;
+    return hoverChip_ != prevHover;
+}
+
+bool ChipsInputWidget::OnMouseUp(const MouseEvent& e) {
+    (void)e;
+    if (dragChip_ >= 0 && dragMoved_ && dropCaret_ >= 0) {
+        // Reorder: remove the chip, re-insert at the drop boundary.
+        int from = dragChip_;
+        int to = dropCaret_;
+        Elem el = elems_[from];
+        elems_.erase(elems_.begin() + from);
+        if (to > from) to--;
+        if (to > (int)elems_.size()) to = (int)elems_.size();
+        elems_.insert(elems_.begin() + to, el);
+        caret_ = to + 1;
+        selectedChip_ = -1;
+        Mutated();
+    }
+    dragChip_ = -1;
+    dragMoved_ = false;
+    dropCaret_ = -1;
+    if (selecting_) {
+        selecting_ = false;
+        if (selAnchor_ == caret_) selAnchor_ = -1;  /* plain click, no range */
+    }
+    return true;
+}
+
+bool ChipsInputWidget::OnKeyChar(wchar_t ch) {
+    if (!IsFocused() || readOnly) return false;
+    if (ch < 32) return false;
+    if (HasSelection()) DeleteSelection();
+    if (caret_ < 0 || caret_ > (int)elems_.size()) caret_ = (int)elems_.size();
+    elems_.insert(elems_.begin() + caret_, Elem{false, std::wstring(1, ch)});
+    caret_++;
+    selectedChip_ = -1;
+    ResetCaretBlink();
+    extern MeasureContext* g_activeMeasureContext;
+    if (g_activeMeasureContext) EnsureCaretVisible(*g_activeMeasureContext);
+    Mutated();
+    return true;
+}
+
+bool ChipsInputWidget::OnKeyDown(int vk) {
+    if (!IsFocused()) return false;
+    int n = (int)elems_.size();
+    bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+
+    if (ctrl && vk == 'A') {
+        selAnchor_ = 0;
+        caret_ = n;
+        selectedChip_ = -1;
+        return true;
+    }
+    if (ctrl && vk == 'C') {
+        ChipsSetClipboard(HasSelection()
+            ? SerializeRange(std::min(selAnchor_, caret_),
+                             std::max(selAnchor_, caret_))
+            : Value());
+        return true;
+    }
+    if (ctrl && vk == 'X' && !readOnly) {
+        if (HasSelection()) {
+            ChipsSetClipboard(SerializeRange(std::min(selAnchor_, caret_),
+                                             std::max(selAnchor_, caret_)));
+            DeleteSelection();
+        }
+        return true;
+    }
+    if (ctrl && vk == 'V' && !readOnly) {
+        // Paste parses `{key}` back into chips (same grammar as SetValue).
+        std::wstring clip = ChipsGetClipboard();
+        if (clip.empty()) return true;
+        if (HasSelection()) DeleteSelection();
+        ChipsInputWidget tmp;
+        tmp.SetValue(clip);
+        n = (int)elems_.size();
+        if (caret_ < 0 || caret_ > n) caret_ = n;
+        elems_.insert(elems_.begin() + caret_, tmp.elems_.begin(), tmp.elems_.end());
+        caret_ += (int)tmp.elems_.size();
+        selectedChip_ = -1;
+        Mutated();
+        return true;
+    }
+
+    const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    auto beginShiftMove = [&]() {
+        if (shift) { if (selAnchor_ < 0) selAnchor_ = caret_; }
+        else ClearSelection();
+    };
+
+    switch (vk) {
+    case VK_LEFT:
+        selectedChip_ = -1;
+        if (!shift && HasSelection()) {
+            caret_ = std::min(selAnchor_, caret_);  /* collapse to range start */
+            ClearSelection();
+            break;
+        }
+        beginShiftMove();
+        if (caret_ > 0) caret_--;
+        break;
+    case VK_RIGHT:
+        selectedChip_ = -1;
+        if (!shift && HasSelection()) {
+            caret_ = std::max(selAnchor_, caret_);
+            ClearSelection();
+            break;
+        }
+        beginShiftMove();
+        if (caret_ < n) caret_++;
+        break;
+    case VK_HOME: selectedChip_ = -1; beginShiftMove(); caret_ = 0; break;
+    case VK_END:  selectedChip_ = -1; beginShiftMove(); caret_ = n; break;
+    case VK_BACK:
+        if (readOnly) return true;
+        if (HasSelection()) { DeleteSelection(); break; }
+        if (selectedChip_ >= 0) { RemoveChip(selectedChip_); break; }
+        if (caret_ > 0) {
+            if (elems_[caret_ - 1].chip) {
+                selectedChip_ = caret_ - 1;  // stage 1: arm the chip
+            } else {
+                elems_.erase(elems_.begin() + caret_ - 1);
+                caret_--;
+                Mutated();
+            }
+        }
+        break;
+    case VK_DELETE:
+        if (readOnly) return true;
+        if (HasSelection()) { DeleteSelection(); break; }
+        if (selectedChip_ >= 0) { RemoveChip(selectedChip_); break; }
+        if (caret_ < n) {
+            if (elems_[caret_].chip) {
+                selectedChip_ = caret_;
+            } else {
+                elems_.erase(elems_.begin() + caret_);
+                Mutated();
+            }
+        }
+        break;
+    case VK_ESCAPE:
+        selectedChip_ = -1;
+        ClearSelection();
+        break;
+    default:
+        return false;
+    }
+    ResetCaretBlink();
+    extern MeasureContext* g_activeMeasureContext;
+    if (g_activeMeasureContext) EnsureCaretVisible(*g_activeMeasureContext);
+    return true;
+}
+
+D2D1_SIZE_F ChipsInputWidget::SizeHint() const {
+    /* 36: chip 胶囊 (chipFont+12 ≈ 25) 上下各留 ≥5px, 下缘不贴边. */
+    return {fixedW > 0 ? fixedW : 240.0f, fixedH > 0 ? fixedH : 36.0f};
 }
 
 } // namespace ui

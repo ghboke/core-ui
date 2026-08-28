@@ -342,9 +342,29 @@ SVG `<g>` 分组、SVG `<filter>`/`<mask>`/`<clipPath>`、SMIL animate。
 <button @click="remove(item.id)">Delete</button>
 ```
 
-支持的事件：`@click`、`@mousedown`、`@mousemove`、`@mouseup`、`@wheel`、
-`@dblclick`、`@submit`、`@focus`、`@blur`、`@change`、`@input`。鼠标事件的
-handler 会收到 `$event` 对象（`x/y/delta/button`），`change/input` 收到控件标量值。
+支持的事件：`@click`、`@mousedown`、`@mousemove`、`@mouseup`、`@mouseenter`、
+`@mouseleave`、`@contextmenu`、`@wheel`、`@dblclick`、`@submit`、`@focus`、
+`@blur`、`@change`、`@input`。
+
+鼠标事件的 handler 收到对标 DOM MouseEvent 的 `$event` 对象：
+`offsetX/offsetY`（控件局部 DIP 坐标）、`clientX/clientY`（窗口坐标）、
+`button`（0 左 / 1 中 / 2 右，move/wheel 为 -1）、`buttons`（位掩码 1 左 2 右 4 中）、
+`ctrlKey/shiftKey/altKey`；`@wheel` 另有 `deltaY`（正值 = 向下滚，web 约定）和
+`deltaX`（横向滚轮）。旧字段 `x/y/delta` 保留兼容。`@mouseleave` 无 `$event`
+（光标已不在控件上，无有意义坐标）。`@mousemove` 与 DOM 一致悬停即触发；按住
+拖动期间事件持续发给按下的控件（等价 pointer capture）。`@contextmenu` 在右键
+释放时沿父链冒泡到最近的监听者，不影响宿主窗口的原生右键菜单回调。
+`change/input` 收到控件标量值。
+
+**拖放（HTML5 风格）**：任意元素设 `draggable="true"`（或直接给
+`drag-data="payload"`，含载荷即隐含可拖）后按住移过 4 DIP 即开始拖动，窗口画
+拖影胶囊。目标侧声明 `drop-target="true"` 或绑定 `@drop` 即接受投放（不需要
+HTML 的 dragover-preventDefault）；拖动悬停时目标进入 CSS `:drag-over` 伪类。
+事件：源侧 `@dragstart`（`$event.data` 为载荷，可改写——等价
+dataTransfer.setData）、`@dragend`（`$event` 为 bool，是否成功投放）；目标侧
+`@dragenter`、`@dragover`、`@dragleave`、`@drop`（`$event.data` + 鼠标坐标字段）。
+拖动结束不触发 `@click`。C++ 宿主对应 `ui_widget_set_draggable /
+set_drag_data / set_drop_target / on_drop / on_drag_end`。
 
 ### 5.4 `v-if="cond"`
 
@@ -567,6 +587,8 @@ obj.unknown          # 返回 null（不报错）
 | `<Expander>header</Expander>` | `ExpanderWidget` | 可展开头部 |
 | `<Separator/>` | `SeparatorWidget` | |
 | `<svg>` + `<path>`/`<circle>`/`<rect>`/`<ellipse>`/`<line>`/`<polygon>`/`<polyline>` | `SvgWidget` + `SvgShape` | 子图形 fold 进 widget；CSS 命中 path（自 build 12）|
+| `<gh-img-view id="..."/>` | `GhImgViewWidget` | 通用瓦块画布；数据全部由宿主经 `ui_gh_img_view_*` C API 喂 |
+| `<ocr-img-view id="..."/>` | `OcrImgViewWidget` | 图片划词画布；数据经 `ui_ocr_img_view_*` C API 喂（自 build 277，见下方 §8.1）|
 | 未知 `CamelCase` 标签 | 报错，给 edit-distance 提示 | 只有预注册的 C++ widget 能映射 |
 
 ### 特殊构造属性
@@ -579,6 +601,52 @@ obj.unknown          # 返回 null（不报错）
 | `<input type="number">` | `min`、`max`、`value`、`step` | step 决定显示小数位 |
 | `<input type="radio">` | `name` | 单选组标识；同 group 互斥跨整树（不限同 parent） |
 | `<svg>` | `width`、`height`、`viewBox` | viewBox 决定坐标系，width/height 决定 widget rect |
+| `<ocr-img-view>` | `highlight-color`（CSS 颜色，含 `#RRGGBBAA`）、`rotation`（90° 倍数）| 构造时解析；不传则用主题 accent + 0.35 alpha |
+
+### 8.1 `<ocr-img-view>` — 图片划词画布（自 build 277）
+
+标签只负责把 widget 放进布局树；**图像和 OCR 文本项全部由宿主经 C API 喂**，
+跟 `<gh-img-view>` 同款分工。别名：`ocr-img-view` / `ocr_img_view` /
+`OcrImgView` / `ocr-img`。
+
+```html
+<div class="body">
+  <ocr-img-view id="ocr" class="canvas" highlight-color="#2680ebA0"/>
+  <ScrollView class="side">
+    <label id="line_row" :class="l.cls" v-for="l in lines">{{ l.text }}</label>
+  </ScrollView>
+</div>
+```
+
+宿主侧（C）：
+
+```c
+UiWidget view = ui_widget_find_by_id(ui_page_root(page), "ocr");
+ui_ocr_img_view_set_image(view, win, bgra, w, h, w * 4);   /* 检查返回值！ */
+ui_ocr_img_view_set_text(view, items, count, sizeof(UiOcrTextItem),
+                          UI_OCR_GRANULARITY_BLOCK);
+ui_ocr_img_view_fit(view);
+```
+
+**列表 ↔ 画布双向联动**（`select_range` / `selection_range` / `item_meta`）：
+
+```c
+/* 列表 → 画布: 点第 i 行 → 找出该行的字下标区间 → 选中 */
+ui_ocr_img_view_select_range(view, firstItemOfLine, lastItemOfLine);
+
+/* 画布 → 列表: 划词后反查行号 */
+uint32_t first, last, block, line, word;
+if (ui_ocr_img_view_selection_range(view, &first, &last) &&
+    ui_ocr_img_view_item_meta(view, first, &block, &line, &word)) {
+    /* line == 宿主喂入时写的 line 字段 —— BLOCK 粒度拆字后仍然保留 */
+}
+```
+
+下标空间是**拆字后**的 item（`ui_ocr_img_view_item_count`），BLOCK 粒度下
+远大于宿主喂入的块数，必须靠 `item_meta` 建映射，不能假设一一对应。
+
+完整可运行例子：`demo/ocr_uix_demo.cpp` + `demo/ocr_uix_demo.uix`，
+自动化回归 `test/scripts/ocr_uix_demo_test.ps1`。
 
 ---
 

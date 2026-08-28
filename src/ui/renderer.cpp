@@ -766,16 +766,92 @@ bool Renderer::CreateSvgDocumentFromXml(const std::string& xml,
     return true;
 }
 
-bool Renderer::RenderSvgDocumentToBgra(
-    const std::string& xml,
+/* 三个绘制点共用的唯一一份"按文档顺序逐段画"实现。见 renderer.h 的声明注释:
+ * steps 的顺序就是 z 序, 阴影必须紧贴它自己那一步。 */
+void Renderer::DrawSvgStepsOrdered(
+    ID2D1DeviceContext5* ctx5,
+    const std::vector<SvgDocumentRef::Step>& steps,
     float viewportW, float viewportH,
-    const std::vector<SvgDocumentRef::DropShadowLayer>& dropShadowLayers,
+    const D2D1_MATRIX_3X2_F& svgXform,
+    std::vector<ComPtr<ID2D1SvgDocument>>* contentDocs,
+    std::vector<ComPtr<ID2D1SvgDocument>>* shadowDocs) {
+    if (!ctx5 || steps.empty() || viewportW <= 0.0f || viewportH <= 0.0f) return;
+    if (contentDocs) contentDocs->resize(steps.size());
+    if (shadowDocs) shadowDocs->resize(steps.size());
+
+    auto makeDoc = [&](const std::string& data,
+                       ComPtr<ID2D1SvgDocument>& outDoc) -> bool {
+        if (outDoc) return true;                       // 缓存命中
+        if (data.empty() ||
+            data.size() > static_cast<size_t>((std::numeric_limits<UINT>::max)())) {
+            return false;
+        }
+        ComPtr<IStream> stream;
+        stream.Attach(SHCreateMemStream(
+            reinterpret_cast<const BYTE*>(data.data()),
+            static_cast<UINT>(data.size())));
+        if (!stream) return false;
+        return SUCCEEDED(ctx5->CreateSvgDocument(
+                   stream.Get(), D2D1::SizeF(viewportW, viewportH),
+                   outDoc.GetAddressOf())) && outDoc;
+    };
+
+    for (size_t i = 0; i < steps.size(); ++i) {
+        const SvgDocumentRef::Step& step = steps[i];
+
+        ComPtr<ID2D1SvgDocument> localContent;
+        ComPtr<ID2D1SvgDocument>& content =
+            contentDocs ? (*contentDocs)[i] : localContent;
+        if (!makeDoc(step.xml, content)) continue;
+
+        if (!step.shadow_xml.empty()) {
+            ComPtr<ID2D1SvgDocument> localShadow;
+            ComPtr<ID2D1SvgDocument>& shadow =
+                shadowDocs ? (*shadowDocs)[i] : localShadow;
+            ComPtr<ID2D1CommandList> shadowList;
+            if (makeDoc(step.shadow_xml, shadow) &&
+                SUCCEEDED(ctx5->CreateCommandList(shadowList.GetAddressOf())) &&
+                shadowList) {
+                ComPtr<ID2D1Image> oldTarget;
+                ctx5->GetTarget(&oldTarget);
+                ctx5->SetTarget(shadowList.Get());
+                ctx5->SetTransform(D2D1::Matrix3x2F::Identity());
+                ctx5->Clear(D2D1::ColorF(0, 0, 0, 0));
+                shadow->SetViewportSize(D2D1::SizeF(viewportW, viewportH));
+                ctx5->DrawSvgDocument(shadow.Get());
+                ctx5->SetTarget(oldTarget.Get());
+
+                ComPtr<ID2D1Effect> blur;
+                if (SUCCEEDED(shadowList->Close()) &&
+                    SUCCEEDED(ctx5->CreateEffect(CLSID_D2D1GaussianBlur,
+                                                 blur.GetAddressOf())) && blur) {
+                    blur->SetInput(0, shadowList.Get());
+                    blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
+                                   step.std_deviation);
+                    blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
+                                   D2D1_BORDER_MODE_SOFT);
+                    ctx5->SetTransform(
+                        D2D1::Matrix3x2F::Translation(step.dx, step.dy) * svgXform);
+                    ctx5->DrawImage(blur.Get(), D2D1::Point2F(0, 0),
+                                    D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+                }
+            }
+        }
+
+        ctx5->SetTransform(svgXform);
+        content->SetViewportSize(D2D1::SizeF(viewportW, viewportH));
+        ctx5->DrawSvgDocument(content.Get());
+    }
+}
+
+bool Renderer::RenderSvgDocumentToBgra(
+    const std::vector<SvgDocumentRef::Step>& steps,
+    float viewportW, float viewportH,
     uint32_t width, uint32_t height,
     uint8_t* outBgra) {
     SharedD2DGuard d2dGuard;
-    if (xml.empty() || viewportW <= 0.0f || viewportH <= 0.0f ||
-        width == 0 || height == 0 || !outBgra ||
-        xml.size() > static_cast<size_t>(std::numeric_limits<UINT>::max())) {
+    if (steps.empty() || viewportW <= 0.0f || viewportH <= 0.0f ||
+        width == 0 || height == 0 || !outBgra) {
         return false;
     }
 
@@ -794,27 +870,6 @@ bool Renderer::RenderSvgDocumentToBgra(
     ComPtr<ID2D1DeviceContext5> ctx5;
     ctx.As(&ctx5);
     if (!ctx5) return false;
-
-    auto createSvgDocument = [&](const std::string& data,
-                                 ComPtr<ID2D1SvgDocument>& outDoc) -> bool {
-        if (data.empty() ||
-            data.size() > static_cast<size_t>(std::numeric_limits<UINT>::max())) {
-            return false;
-        }
-        ComPtr<IStream> stream;
-        stream.Attach(SHCreateMemStream(
-            reinterpret_cast<const BYTE*>(data.data()),
-            static_cast<UINT>(data.size())));
-        if (!stream) return false;
-
-        outDoc.Reset();
-        return SUCCEEDED(ctx5->CreateSvgDocument(
-                   stream.Get(), D2D1::SizeF(viewportW, viewportH),
-                   outDoc.GetAddressOf())) && outDoc;
-    };
-
-    ComPtr<ID2D1SvgDocument> doc;
-    if (!createSvgDocument(xml, doc)) return false;
 
     constexpr float kDpi = 96.0f;
     ctx5->SetDpi(kDpi, kDpi);
@@ -838,59 +893,8 @@ bool Renderer::RenderSvgDocumentToBgra(
     const float sx = static_cast<float>(width) / viewportW;
     const float sy = static_cast<float>(height) / viewportH;
     const D2D1_MATRIX_3X2_F svgXform = D2D1::Matrix3x2F::Scale(sx, sy);
-    ctx5->SetTransform(svgXform);
-    doc->SetViewportSize(D2D1::SizeF(viewportW, viewportH));
-    ctx5->DrawSvgDocument(doc.Get());
-
-    for (const auto& layer : dropShadowLayers) {
-        ComPtr<ID2D1SvgDocument> shadowDoc;
-        ComPtr<ID2D1SvgDocument> coverDoc;
-        if (!createSvgDocument(layer.shadow_xml, shadowDoc) ||
-            !createSvgDocument(layer.cover_xml, coverDoc)) {
-            continue;
-        }
-
-        ComPtr<ID2D1CommandList> shadowList;
-        if (FAILED(ctx5->CreateCommandList(shadowList.GetAddressOf())) || !shadowList) {
-            continue;
-        }
-
-        ComPtr<ID2D1Image> oldTarget;
-        ctx5->GetTarget(&oldTarget);
-        ctx5->SetTarget(shadowList.Get());
-        ctx5->SetTransform(D2D1::Matrix3x2F::Identity());
-        ctx5->Clear(D2D1::ColorF(0, 0, 0, 0));
-        shadowDoc->SetViewportSize(D2D1::SizeF(viewportW, viewportH));
-        ctx5->DrawSvgDocument(shadowDoc.Get());
-        ctx5->SetTarget(oldTarget.Get());
-        if (FAILED(shadowList->Close())) {
-            ctx5->SetTransform(svgXform);
-            continue;
-        }
-
-        ComPtr<ID2D1Effect> blur;
-        if (FAILED(ctx5->CreateEffect(CLSID_D2D1GaussianBlur, blur.GetAddressOf())) ||
-            !blur) {
-            ctx5->SetTransform(svgXform);
-            continue;
-        }
-
-        blur->SetInput(0, shadowList.Get());
-        blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
-                       layer.std_deviation);
-        blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
-                       D2D1_BORDER_MODE_SOFT);
-
-        D2D1_MATRIX_3X2_F shadowXform =
-            D2D1::Matrix3x2F::Translation(layer.dx, layer.dy) * svgXform;
-        ctx5->SetTransform(shadowXform);
-        ctx5->DrawImage(blur.Get(), D2D1::Point2F(0, 0),
-                        D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
-
-        ctx5->SetTransform(svgXform);
-        coverDoc->SetViewportSize(D2D1::SizeF(viewportW, viewportH));
-        ctx5->DrawSvgDocument(coverDoc.Get());
-    }
+    DrawSvgStepsOrdered(ctx5.Get(), steps, viewportW, viewportH, svgXform,
+                        nullptr, nullptr);
 
     ctx5->SetTransform(D2D1::Matrix3x2F::Identity());
     hr = ctx5->EndDraw();
@@ -1138,6 +1142,24 @@ void Renderer::FillRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color) {
     if (brush) ctx_->FillRectangle(rect, brush.Get());
 }
 
+void Renderer::FillQuad(const D2D1_POINT_2F pts[4], const D2D1_COLOR_F& color) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->FillQuad(pts, color);
+    }
+    if (!ctx_ || !factory_) return;
+    ComPtr<ID2D1PathGeometry> geom;
+    if (FAILED(factory_->CreatePathGeometry(geom.GetAddressOf())) || !geom) return;
+    ComPtr<ID2D1GeometrySink> sink;
+    if (FAILED(geom->Open(sink.GetAddressOf())) || !sink) return;
+    sink->BeginFigure(pts[0], D2D1_FIGURE_BEGIN_FILLED);
+    const D2D1_POINT_2F rest[3] = { pts[1], pts[2], pts[3] };
+    sink->AddLines(rest, 3);
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    if (FAILED(sink->Close())) return;
+    auto brush = GetBrush(color);
+    if (brush) ctx_->FillGeometry(geom.Get(), brush.Get());
+}
+
 void Renderer::FillRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, const D2D1_COLOR_F& color) {
     if (auto* recorder = ActiveDisplayListRecorder()) {
         recorder->FillRoundedRect(rect, rx, ry, color);
@@ -1151,12 +1173,25 @@ void Renderer::FillRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, cons
 
 bool Renderer::DrawBlurredRoundedRect(const D2D1_RECT_F& rect, float rx, float ry,
                                       float blurRadius, const D2D1_COLOR_F& color) {
-    if (!ctx_ || !ctx5_ || color.a <= 0.0f) return false;
+    if (color.a <= 0.0f) return false;
     if (rect.right <= rect.left || rect.bottom <= rect.top) return false;
     if (blurRadius < 0.5f) {
         FillRoundedRect(rect, rx, ry, color);
         return true;
     }
+
+    /* display list 必须先录, 再判 ctx_ —— 这是本文件所有图元的既定顺序
+     * (对照 PushClip / DrawRect)。此处原本反过来: `if (!ctx_ || !ctx5_) return
+     * false` 写在最前面, 于是渲染线程 present 接管、UI 线程 RT 释放之后, 这条
+     * 命令**永远进不了 display list**, 调用方只看到 false。表现是 gh_img_view
+     * 的图片阴影完全不画、widget box-shadow 静默退化到 fallback。
+     * 返回值语义随之明确: 录进 display list 就算成功, 由渲染线程负责真正画。 */
+    bool recorded = false;
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->DrawBlurredRoundedRect(rect, rx, ry, blurRadius, color);
+        recorded = true;
+    }
+    if (!ctx_ || !ctx5_) return recorded;
 
     ComPtr<ID2D1CommandList> mask;
     if (FAILED(ctx5_->CreateCommandList(mask.GetAddressOf())) || !mask) {
@@ -1194,10 +1229,6 @@ bool Renderer::DrawBlurredRoundedRect(const D2D1_RECT_F& rect, float rx, float r
     ctx5_->DrawImage(blur.Get(), D2D1::Point2F(0, 0),
                      D2D1_INTERPOLATION_MODE_LINEAR,
                      D2D1_COMPOSITE_MODE_SOURCE_OVER);
-
-    if (auto* recorder = ActiveDisplayListRecorder()) {
-        recorder->DrawBlurredRoundedRect(rect, rx, ry, blurRadius, color);
-    }
     return true;
 }
 
@@ -1898,6 +1929,22 @@ void Renderer::DrawBitmapHQ(ID2D1Bitmap* bitmap, const D2D1_RECT_F& destRect,
     }
 }
 
+void Renderer::DrawBitmapClamped(ID2D1Bitmap* bitmap, const D2D1_RECT_F& destRect,
+                                 float opacity, D2D1_INTERPOLATION_MODE interp) {
+    if (!bitmap || !ctx_) return;
+    /* 采样与 DrawBitmapHQ 完全一致 (含 HQ 缩小 prefilter; DrawBitmap 的源
+     * 采样本身在位图边缘 clamp, 不渗透明) — 只关掉矩形边缘 AA:
+     * PER_PRIMITIVE AA 在相邻瓦块共享边界给两边各画一条部分覆盖边, over
+     * 合成后该行 alpha ≈ 0.75 < 1 → 拼缝一条半透明缝线 (放大时一目了然,
+     * 透明图透出背景)。aliased 光栅化按同一舍入规则分配边界像素, 无缝。
+     * 注: 曾试过 BitmapBrush1+EXTEND_CLAMP+FillRectangle — 画刷路径没有
+     * DrawBitmap 的 HQ prefilter, 缩小/上采 gradient 处出复制行细线, 弃用。 */
+    const D2D1_ANTIALIAS_MODE oldAA = ctx_->GetAntialiasMode();
+    ctx_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+    DrawBitmapHQ(bitmap, destRect, opacity, interp);
+    ctx_->SetAntialiasMode(oldAA);
+}
+
 void Renderer::DrawBitmapSharpened(ID2D1Bitmap* bitmap, const D2D1_RECT_F& destRect,
                                     float sharpenAmount, D2D1_INTERPOLATION_MODE interp) {
     if (!bitmap || !ctx_) return;
@@ -1997,7 +2044,13 @@ void Renderer::DrawImageResource(ResourceKey key, const D2D1_RECT_F& destRect,
     auto bitmap = GetCachedImageBitmap(key);
     if (!bitmap) return;
 
-    if (sampling == ImageSampling::HighQualityCubic) {
+    if (sampling == ImageSampling::HighQualityCubicClamp ||
+        sampling == ImageSampling::LinearClamp) {
+        DrawBitmapClamped(bitmap.Get(), destRect, opacity,
+                          sampling == ImageSampling::HighQualityCubicClamp
+                              ? D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
+                              : D2D1_INTERPOLATION_MODE_LINEAR);
+    } else if (sampling == ImageSampling::HighQualityCubic) {
         DrawBitmapHQ(bitmap.Get(), destRect, opacity,
                      D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
     } else {
@@ -2067,18 +2120,25 @@ void Renderer::FillGradientRect(GradientRef gradient, const D2D1_RECT_F& rect, f
     PaintDisplayListGradient(ctx_.Get(), rect, gradient, radius);
 }
 
-void Renderer::RecordSvgDocument(std::string xml, float viewportW, float viewportH,
-                                 D2D1_MATRIX_3X2_F transform,
-                                 std::vector<SvgDocumentRef::DropShadowLayer> dropShadowLayers) {
+void Renderer::RecordSvgDocument(std::vector<SvgDocumentRef::Step> steps,
+                                 float viewportW, float viewportH,
+                                 D2D1_MATRIX_3X2_F transform) {
     auto* recorder = ActiveDisplayListRecorder();
-    if (!recorder || xml.empty() || viewportW <= 0.0f || viewportH <= 0.0f) return;
+    if (!recorder || steps.empty() || viewportW <= 0.0f || viewportH <= 0.0f) return;
 
     SvgDocumentRef ref;
-    ref.xml = std::move(xml);
+    ref.steps = std::move(steps);
     ref.viewport_w = viewportW;
     ref.viewport_h = viewportH;
-    ref.drop_shadow_layers = std::move(dropShadowLayers);
     recorder->DrawSvgDocument(std::move(ref), transform);
+}
+
+void Renderer::RecordSvgDocument(std::string xml, float viewportW, float viewportH,
+                                 D2D1_MATRIX_3X2_F transform) {
+    if (xml.empty()) return;
+    std::vector<SvgDocumentRef::Step> steps(1);
+    steps[0].xml = std::move(xml);
+    RecordSvgDocument(std::move(steps), viewportW, viewportH, transform);
 }
 
 bool Renderer::DrawBackdropBlur(const D2D1_RECT_F& rect, float radius, float blurRadius) {
@@ -2218,6 +2278,43 @@ void Renderer::PushClip(const D2D1_RECT_F& rect) {
     ctx_->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 }
 
+void Renderer::PushCull(const D2D1_RECT_F& rect) {
+    /* 与外层求交: 嵌套滚动容器时内层可见范围不可能大于外层。 */
+    if (cullStack_.empty()) {
+        cullStack_.push_back(rect);
+        return;
+    }
+    const D2D1_RECT_F& outer = cullStack_.back();
+    cullStack_.push_back({
+        (std::max)(rect.left,   outer.left),
+        (std::max)(rect.top,    outer.top),
+        (std::min)(rect.right,  outer.right),
+        (std::min)(rect.bottom, outer.bottom)});
+}
+
+void Renderer::PopCull() {
+    if (!cullStack_.empty()) cullStack_.pop_back();
+}
+
+bool Renderer::IsCulled(const D2D1_RECT_F& rect) const {
+    if (cullStack_.empty()) return false;   /* opt-in: 没人 push 就不剔除 */
+    const D2D1_RECT_F& c = cullStack_.back();
+    /* 完全不相交才剔除。边界相接 (right == c.left) 视为不可见 —— 零宽重叠
+     * 画不出任何像素。 */
+    return rect.right  <= c.left  || rect.left >= c.right ||
+           rect.bottom <= c.top   || rect.top  >= c.bottom;
+}
+
+void Renderer::PushClipAliased(const D2D1_RECT_F& rect) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->PushClipAliased(rect);
+    }
+    if (!ctx_) return;
+    /* ALIASED: 相邻 clip 矩形拼接绘制同一内容时, PER_PRIMITIVE 会在共享
+     * 边界两侧各画一条部分覆盖边 → 合成出一条半透明缝线。 */
+    ctx_->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_ALIASED);
+}
+
 void Renderer::PopClip() {
     if (auto* recorder = ActiveDisplayListRecorder()) {
         recorder->PopClip();
@@ -2320,6 +2417,9 @@ void Renderer::ReplayDisplayList(const DisplayList& list) {
         case DrawCommandType::PushClip:
             PushClip(cmd.rect);
             break;
+        case DrawCommandType::PushClipAliased:
+            PushClipAliased(cmd.rect);
+            break;
         case DrawCommandType::PopClip:
             PopClip();
             break;
@@ -2350,6 +2450,10 @@ void Renderer::ReplayDisplayList(const DisplayList& list) {
             break;
         case DrawCommandType::FillRect:
             FillRect(cmd.rect, cmd.color);
+            break;
+        case DrawCommandType::FillQuad:
+            if (cmd.quad_index < list.quad_refs.size())
+                FillQuad(list.quad_refs[cmd.quad_index].pts, cmd.color);
             break;
         case DrawCommandType::DrawRect:
             DrawRect(cmd.rect, cmd.color, cmd.stroke_width);
@@ -2452,91 +2556,16 @@ void Renderer::ReplayDisplayList(const DisplayList& list) {
         case DrawCommandType::DrawSvgDocument: {
             if (cmd.svg_document_ref_index >= list.svg_document_refs.size()) break;
             const auto& ref = list.svg_document_refs[cmd.svg_document_ref_index];
-            if (!ctx5_ || ref.xml.empty() || ref.viewport_w <= 0.0f || ref.viewport_h <= 0.0f) {
-                break;
-            }
-
-            auto createSvgDocument = [&](const std::string& xml,
-                                         ComPtr<ID2D1SvgDocument>& outDoc) -> bool {
-                if (xml.empty() ||
-                    xml.size() > static_cast<size_t>(std::numeric_limits<UINT>::max())) {
-                    return false;
-                }
-                ComPtr<IStream> stream;
-                stream.Attach(SHCreateMemStream(
-                    reinterpret_cast<const BYTE*>(xml.data()),
-                    static_cast<UINT>(xml.size())));
-                if (!stream) return false;
-
-                outDoc.Reset();
-                return SUCCEEDED(ctx5_->CreateSvgDocument(
-                           stream.Get(), D2D1::SizeF(ref.viewport_w, ref.viewport_h),
-                           outDoc.GetAddressOf())) && outDoc;
-            };
-
-            ComPtr<ID2D1SvgDocument> doc;
-            if (!createSvgDocument(ref.xml, doc)) {
+            if (!ctx5_ || ref.steps.empty() || ref.viewport_w <= 0.0f ||
+                ref.viewport_h <= 0.0f) {
                 break;
             }
 
             D2D1_MATRIX_3X2_F oldXform = D2D1::Matrix3x2F::Identity();
             ctx5_->GetTransform(&oldXform);
-            D2D1_MATRIX_3X2_F svgXform = cmd.transform * oldXform;
-            ctx5_->SetTransform(svgXform);
-            doc->SetViewportSize(D2D1::SizeF(ref.viewport_w, ref.viewport_h));
-            ctx5_->DrawSvgDocument(doc.Get());
-
-            for (const auto& layer : ref.drop_shadow_layers) {
-                ComPtr<ID2D1SvgDocument> shadowDoc;
-                ComPtr<ID2D1SvgDocument> coverDoc;
-                if (!createSvgDocument(layer.shadow_xml, shadowDoc) ||
-                    !createSvgDocument(layer.cover_xml, coverDoc)) {
-                    continue;
-                }
-
-                ComPtr<ID2D1CommandList> shadowList;
-                if (FAILED(ctx5_->CreateCommandList(shadowList.GetAddressOf()))) {
-                    continue;
-                }
-
-                ComPtr<ID2D1Image> oldTarget;
-                ctx5_->GetTarget(&oldTarget);
-                ctx5_->SetTarget(shadowList.Get());
-                ctx5_->SetTransform(D2D1::Matrix3x2F::Identity());
-                ctx5_->Clear(D2D1::ColorF(0, 0, 0, 0));
-                shadowDoc->SetViewportSize(D2D1::SizeF(ref.viewport_w, ref.viewport_h));
-                ctx5_->DrawSvgDocument(shadowDoc.Get());
-                ctx5_->SetTarget(oldTarget.Get());
-
-                if (FAILED(shadowList->Close())) {
-                    ctx5_->SetTransform(svgXform);
-                    continue;
-                }
-
-                ComPtr<ID2D1Effect> blur;
-                if (FAILED(ctx5_->CreateEffect(CLSID_D2D1GaussianBlur, blur.GetAddressOf())) ||
-                    !blur) {
-                    ctx5_->SetTransform(svgXform);
-                    continue;
-                }
-
-                blur->SetInput(0, shadowList.Get());
-                blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
-                               layer.std_deviation);
-                blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
-                               D2D1_BORDER_MODE_SOFT);
-
-                D2D1_MATRIX_3X2_F shadowXform =
-                    D2D1::Matrix3x2F::Translation(layer.dx, layer.dy) * svgXform;
-                ctx5_->SetTransform(shadowXform);
-                ctx5_->DrawImage(blur.Get(), D2D1::Point2F(0, 0),
-                                 D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
-
-                ctx5_->SetTransform(svgXform);
-                coverDoc->SetViewportSize(D2D1::SizeF(ref.viewport_w, ref.viewport_h));
-                ctx5_->DrawSvgDocument(coverDoc.Get());
-            }
-
+            DrawSvgStepsOrdered(ctx5_.Get(), ref.steps, ref.viewport_w,
+                                ref.viewport_h, cmd.transform * oldXform,
+                                nullptr, nullptr);
             ctx5_->SetTransform(oldXform);
             break;
         }
@@ -4925,15 +4954,25 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
 
         /* L122: 含 <tspan> —— 每个 tspan 当"带定位的子 run"。逐 tspan 用自带
          * x/y(绝对) + dx/dy(相对) 定位, 字体/style/fill 自带优先否则继承 text 级;
-         * 只取 tspan 自身文本(不含 tspan 间的换行/缩进空白 → 修掉"每字一行"竖排
-         * bug)。按 fill 分组累积成 <path>(保留首见顺序), 原地内联保 z 序。
-         * text-anchor 在多 tspan 场景按 start 处理(matplotlib 用法)。 */
+         * 文本按 fill 分组累积成 <path>(保留首见顺序), 原地内联保 z 序。
+         * text-anchor 在多 tspan 场景按 start 处理(matplotlib 用法)。
+         *
+         * L292: tspan 可以嵌套 —— ProcessOn 思维导图导出的是
+         *   <tspan x y><tspan dx="0">文字</tspan></tspan>
+         * 旧实现找 </tspan> 不做深度配对, 外层拿到的"文本"把内层标记一起吃进去,
+         * 于是 `<tspan dx="0">` 被当正文画出来, 每行凭空变宽、压住图框。现在改成
+         * 递归遍历: 遇到子 tspan 就带着继承下来的字体/位置往下走。 */
         std::vector<std::pair<std::string,std::string>> byFill;   // fill -> 累积 d
         auto addD = [&](const std::string& fill, const std::string& d) {
             for (auto& kv : byFill) if (kv.first == fill) { kv.second += d; return; }
             byFill.push_back({fill, d});
         };
         float penX = tx, penY = ty;
+        /* 锚点是 chunk 级的: 某个 tspan 写了绝对 x 就开一个新 chunk, 该 chunk 的
+         * 第一段文字按 text-anchor 对齐, 之后的接续段一律 start。挂起状态要能跨
+         * 嵌套传下去 —— x 在外层、文字在内层时不传就会漏掉 middle/end 对齐。 */
+        bool anchorPending = false;
+        int  pendingAnchor = 0;
         auto xmlSpacePreserve = [&](const std::string& elementTag, bool inherited) {
             std::string space = extractAttrFromTag(elementTag, "xml:space");
             if (space.empty()) space = extractAttrFromTag(elementTag, "space");
@@ -4942,63 +4981,106 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
             return inherited;
         };
         const bool textPreserveSpace = xmlSpacePreserve(tag, false);
-        size_t tp = te + 1;
-        while (tp < contentEnd) {
-            size_t lt2 = svg.find("<tspan", tp);
-            if (lt2 == std::string::npos || lt2 >= contentEnd) break;
-            size_t tgEnd = svg.find('>', lt2);
-            if (tgEnd == std::string::npos || tgEnd >= contentEnd) break;
-            std::string ttag = svg.substr(lt2, tgEnd - lt2 + 1);
-            bool tSelf = (tgEnd > 0 && svg[tgEnd-1] == '/');
-            size_t tClose = tSelf ? tgEnd : svg.find("</tspan>", tgEnd);
-            size_t tCEnd  = (tClose == std::string::npos) ? contentEnd : tClose;
 
-            GFont es = ts;                              // 继承 text 级 + tspan 覆盖
-            std::string tstyle = extractAttrFromTag(ttag, "style");
-            applyFont(es, ttag, tstyle);
-            float fs = es.fontSize > 0 ? es.fontSize : tFontSize;
-            const std::vector<std::wstring>& fam =
-                (es.familySet && !es.families.empty()) ? es.families : tFam;
-            DWRITE_FONT_WEIGHT wt = es.weightSet ? es.weight : tWeight;
-            DWRITE_FONT_STYLE  st2 = es.styleSet  ? es.fstyle : tStyle;
-            std::string fill = (es.fillSet && !es.fill.empty()) ? es.fill : tFill;
-
-            std::string sx = extractAttrFromTag(ttag, "x"),  sy = extractAttrFromTag(ttag, "y");
-            std::string sdx = extractAttrFromTag(ttag, "dx"), sdy = extractAttrFromTag(ttag, "dy");
-            int runAnchor = (!sx.empty() || !sy.empty()) ? anchor : 0;
-            std::string ta = extractAttrFromTag(ttag, "text-anchor");
-            if (ta.empty()) ta = CssProp(tstyle, "text-anchor");
-            if (ta == "middle") runAnchor = 1;
-            else if (ta == "end") runAnchor = 2;
-            else if (ta == "start") runAnchor = 0;
-            if (!sx.empty())  penX = ParseSvgCssLength(sx, fs, penX);
-            if (!sy.empty())  penY = ParseSvgCssLength(sy, fs, penY);
-            if (!sdx.empty()) penX += ParseSvgCssLength(sdx, fs, 0.0f);
-            if (!sdy.empty()) penY += ParseSvgCssLength(sdy, fs, 0.0f);
-
+        // 一个文本节点 → 一段 run。空白节点(tspan 间的换行缩进)折叠后为空, 自动丢弃。
+        auto emitRun = [&](const std::string& rawSlice, const GFont& st, bool preserve) {
+            std::string decoded; AppendDecoded(decoded, rawSlice);
             std::wstring txt;
-            if (!tSelf) {
-                std::string raw; AppendDecoded(raw, svg.substr(tgEnd + 1, tCEnd - (tgEnd + 1)));
-                if (xmlSpacePreserve(ttag, textPreserveSpace)) {
-                    txt = Utf8ToWide(raw);
-                } else {
-                    std::string norm; bool sp = false, started = false;   // collapse whitespace + trim
-                    for (char c : raw) {
-                        if (c==' '||c=='\t'||c=='\n'||c=='\r') { if (started) sp = true; }
-                        else { if (sp) { norm += ' '; sp = false; } norm += c; started = true; }
-                    }
-                    txt = Utf8ToWide(norm);
+            if (preserve) {
+                txt = Utf8ToWide(decoded);
+            } else {
+                std::string norm; bool sp = false, started = false;   // collapse whitespace + trim
+                for (char c : decoded) {
+                    if (c==' '||c=='\t'||c=='\n'||c=='\r') { if (started) sp = true; }
+                    else { if (sp) { norm += ' '; sp = false; } norm += c; started = true; }
                 }
+                txt = Utf8ToWide(norm);
             }
+            if (txt.empty()) return;
+            float fs = st.fontSize > 0 ? st.fontSize : tFontSize;
+            const std::vector<std::wstring>& fam =
+                (st.familySet && !st.families.empty()) ? st.families : tFam;
+            DWRITE_FONT_WEIGHT wt = st.weightSet ? st.weight : tWeight;
+            DWRITE_FONT_STYLE  st2 = st.styleSet  ? st.fstyle : tStyle;
+            std::string fill = (st.fillSet && !st.fill.empty()) ? st.fill : tFill;
+            const int runAnchor = anchorPending ? pendingAnchor : 0;
+            anchorPending = false;
             float adv = 0.0f;
-            if (!txt.empty()) {
-                std::string d = renderRun(txt, fs, fam, wt, st2, penX, penY,
-                                          runAnchor, false, 0, &adv);
-                if (!d.empty()) addD(fill, d);
-            }
+            std::string d = renderRun(txt, fs, fam, wt, st2, penX, penY,
+                                      runAnchor, false, 0, &adv);
+            if (!d.empty()) addD(fill, d);
             penX += adv;                                // 无下个显式 x 时接续
-            tp = tSelf ? tgEnd + 1 : (tClose == std::string::npos ? contentEnd : tClose + 8);
-        }
+        };
+
+        // 深度配对的 </tspan>: 跳过嵌套子 tspan, 返回自身闭合标签的 '<' 位置。
+        auto findTspanClose = [&](size_t from, size_t to) -> size_t {
+            int depth = 1;
+            size_t p = from;
+            while (p < to) {
+                size_t lt2 = svg.find('<', p);
+                if (lt2 == std::string::npos || lt2 >= to) break;
+                if (svg.compare(lt2, 8, "</tspan>") == 0) {
+                    if (--depth == 0) return lt2;
+                    p = lt2 + 8; continue;
+                }
+                if (svg.compare(lt2, 6, "<tspan") == 0) {
+                    size_t g = svg.find('>', lt2);
+                    if (g == std::string::npos || g >= to) break;
+                    if (!(g > 0 && svg[g-1] == '/')) ++depth;
+                    p = g + 1; continue;
+                }
+                p = lt2 + 1;
+            }
+            return std::string::npos;
+        };
+
+        auto walkTspans = [&](auto&& self, size_t from, size_t to,
+                              const GFont& parentFont, bool parentPreserve) -> void {
+            size_t p = from;
+            while (p < to) {
+                size_t lt2 = svg.find('<', p);
+                if (lt2 == std::string::npos || lt2 >= to) {
+                    emitRun(svg.substr(p, to - p), parentFont, parentPreserve);
+                    return;
+                }
+                if (lt2 > p) emitRun(svg.substr(p, lt2 - p), parentFont, parentPreserve);
+                size_t tgEnd = svg.find('>', lt2);
+                if (tgEnd == std::string::npos || tgEnd >= to) return;
+                const bool isTspan =
+                    lt2 + 6 < svg.size() && svg.compare(lt2, 6, "<tspan") == 0 &&
+                    (svg[lt2+6]==' ' || svg[lt2+6]=='>' || svg[lt2+6]=='/' ||
+                     svg[lt2+6]=='\t' || svg[lt2+6]=='\n' || svg[lt2+6]=='\r');
+                if (!isTspan) { p = tgEnd + 1; continue; }   // <title> 等: 跳过标签本身
+
+                std::string ttag = svg.substr(lt2, tgEnd - lt2 + 1);
+                const bool tSelf = (tgEnd > 0 && svg[tgEnd-1] == '/');
+
+                GFont es = parentFont;                  // 继承外层 + 本 tspan 覆盖
+                std::string tstyle = extractAttrFromTag(ttag, "style");
+                applyFont(es, ttag, tstyle);
+                const float fs = es.fontSize > 0 ? es.fontSize : tFontSize;
+
+                std::string sx = extractAttrFromTag(ttag, "x"),  sy = extractAttrFromTag(ttag, "y");
+                std::string sdx = extractAttrFromTag(ttag, "dx"), sdy = extractAttrFromTag(ttag, "dy");
+                if (!sx.empty() || !sy.empty()) { anchorPending = true; pendingAnchor = anchor; }
+                std::string ta = extractAttrFromTag(ttag, "text-anchor");
+                if (ta.empty()) ta = CssProp(tstyle, "text-anchor");
+                if (ta == "middle")     { anchorPending = true; pendingAnchor = 1; }
+                else if (ta == "end")   { anchorPending = true; pendingAnchor = 2; }
+                else if (ta == "start") { anchorPending = true; pendingAnchor = 0; }
+                if (!sx.empty())  penX = ParseSvgCssLength(sx, fs, penX);
+                if (!sy.empty())  penY = ParseSvgCssLength(sy, fs, penY);
+                if (!sdx.empty()) penX += ParseSvgCssLength(sdx, fs, 0.0f);
+                if (!sdy.empty()) penY += ParseSvgCssLength(sdy, fs, 0.0f);
+
+                if (tSelf) { p = tgEnd + 1; continue; }
+                const size_t close = findTspanClose(tgEnd + 1, to);
+                self(self, tgEnd + 1, close == std::string::npos ? to : close, es,
+                     xmlSpacePreserve(ttag, parentPreserve));
+                p = (close == std::string::npos) ? to : close + 8;
+            }
+        };
+        walkTspans(walkTspans, te + 1, contentEnd, ts, textPreserveSpace);
         if (byFill.empty()) continue;
         std::string allPaths;
         if (isFO) allPaths += buildRect(foX, foY, foW, foH, foBg, xfStr);

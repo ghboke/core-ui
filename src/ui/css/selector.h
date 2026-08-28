@@ -15,6 +15,7 @@ constexpr uint32_t Focus    = 1u << 2;
 constexpr uint32_t Disabled = 1u << 3;
 constexpr uint32_t Checked  = 1u << 4;
 constexpr uint32_t Root     = 1u << 5;
+constexpr uint32_t DragOver = 1u << 6;  // drop target under an active drag
 }
 
 // Lightweight descriptor passed to the matcher.

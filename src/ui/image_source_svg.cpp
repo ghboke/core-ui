@@ -135,6 +135,11 @@ CreateSvgSourceFromFile(const std::wstring& path, Renderer& r) {
     std::string xml = LoadSvgWithInlinedStyles(path);
     if (xml.empty()) return nullptr;
 
+    /* L292: D2D 认不出 rgb()/rgba()/transparent 这几种 CSS 写法, 解析失败后
+     * fill 回落到初始值黑色 (fill="transparent" 的整幅背景就会变成黑底)。
+     * 跟 gh_img_view 的主视图走同一道归一化。 */
+    xml = NormalizeSvgPaintColorsForD2D(xml);
+
     /* L121: <text>/<foreignObject> → <path> 字形轮廓内联回 DOM, 让 D2D 按文档
      * 顺序统一渲染 (z 序正确). 转换后已无 <text>, 原生路径不再需要 DirectWrite
      * 叠加, fallback 的 ParseSvgIcon 也直接把文字当形状画 (一并修好). */

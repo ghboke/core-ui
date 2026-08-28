@@ -101,6 +101,40 @@ void Widget::RemoveChild(Widget* child) {
         children_.end());
 }
 
+void Widget::RemoveChildren(const std::unordered_set<Widget*>& victims) {
+    if (victims.empty() || children_.empty()) return;
+    children_.erase(
+        std::remove_if(children_.begin(), children_.end(),
+            [&victims](const WidgetPtr& p) {
+                return p && victims.count(p.get()) != 0;
+            }),
+        children_.end());
+}
+
+void Widget::ReplaceChildRange(size_t at, size_t removeCount,
+                               std::vector<WidgetPtr> replacement) {
+    if (at > children_.size()) at = children_.size();
+    if (removeCount > children_.size() - at) removeCount = children_.size() - at;
+
+    /* 一趟 erase (整段, 一次 memmove) */
+    if (removeCount > 0) {
+        children_.erase(children_.begin() + static_cast<ptrdiff_t>(at),
+                        children_.begin() + static_cast<ptrdiff_t>(at + removeCount));
+    }
+
+    /* 空指针剔掉再整块插入 —— 保证一次 range-insert, 不退化成逐个插 */
+    replacement.erase(
+        std::remove_if(replacement.begin(), replacement.end(),
+                       [](const WidgetPtr& p) { return !p; }),
+        replacement.end());
+    if (replacement.empty()) return;
+
+    for (auto& c : replacement) c->parent_ = this;
+    children_.insert(children_.begin() + static_cast<ptrdiff_t>(at),
+                     std::make_move_iterator(replacement.begin()),
+                     std::make_move_iterator(replacement.end()));
+}
+
 // ---- Default draw ----
 
 namespace {
@@ -309,7 +343,21 @@ uint32_t Widget::CurrentStateBits() const {
     if (pressed)   b |= (1u << 1);  // Pressed
     if (focused_)  b |= (1u << 2);  // Focus
     if (!enabled)  b |= (1u << 3);  // Disabled
+    if (dragOver)  b |= (1u << 6);  // DragOver
     return b;
+}
+
+// 状态位变化后, 除自身外还要让整棵子树重算样式 —— 后代选择器可以引用祖先
+// 伪类 (如 `.zone:hover .btn`), 祖先 hover/pressed 翻转时后代自身 bits 不变,
+// 不级联的话后代样式永远不刷新。
+static void RecomputeSubtreeStyles(Widget* w) {
+    for (auto& child : w->Children()) {
+        if (child->recomputeStyle) {
+            child->lastStateBits = child->CurrentStateBits();
+            child->recomputeStyle(child->lastStateBits);
+        }
+        RecomputeSubtreeStyles(child.get());
+    }
 }
 
 void Widget::RefreshCssState() {
@@ -318,6 +366,7 @@ void Widget::RefreshCssState() {
     if (bits == lastStateBits) return;
     lastStateBits = bits;
     recomputeStyle(bits);
+    RecomputeSubtreeStyles(this);
 }
 
 // NOTE: hook firing (onMouseXxxHook → @mousedown / @mouseup / etc.) used to
@@ -379,19 +428,52 @@ void Widget::DoLayout() {
 
 // ---- Draw tree ----
 
-namespace {
 // Recursively shift a widget's rect and all descendants' rects by (dx, dy).
-// Used to apply CSS transform: translate(x, y) before drawing, then undone after.
+// Used to apply CSS transform: translate(x, y) before drawing, then undone
+// after; ScrollViewWidget also uses it to move content on pure scroll without
+// re-running layout (build 285).
 void ShiftSubtreeRects(Widget* w, float dx, float dy) {
     if (!w) return;
     w->rect.left += dx; w->rect.right += dx;
     w->rect.top  += dy; w->rect.bottom += dy;
     for (auto& c : w->Children()) ShiftSubtreeRects(c.get(), dx, dy);
 }
-}  // namespace
+
+/* 该 widget 会画到自己 rect 之外多远 (只算外扩型 box-shadow)。剔除判定按这个
+ * 量放宽, 否则贴着视口边缘的行, 阴影会被整条剪掉。 */
+static float OutsetPaintExtent(const Widget& w) {
+    float ext = 0.0f;
+    auto acc = [&ext](float ox, float oy, float blur, float spread) {
+        const float reach = (std::max)(std::abs(ox), std::abs(oy)) + blur + spread;
+        if (reach > ext) ext = reach;
+    };
+    for (const auto& sh : w.boxShadows) {
+        if (sh.inset) continue;          /* inset 画在内部, 不外扩 */
+        acc(sh.offsetX, sh.offsetY, sh.blur, sh.spread);
+    }
+    if (w.boxShadows.empty() && w.boxShadow.set) {
+        acc(w.boxShadow.offsetX, w.boxShadow.offsetY,
+            w.boxShadow.blur, w.boxShadow.spread);
+    }
+    return ext;
+}
 
 void Widget::DrawTree(Renderer& r) {
     if (!visible || opacity <= 0.0f) return;
+
+    /* 视口剔除 (build 285, opt-in — 只在祖先 PushCull 过时生效)。
+     * 带 transform 的 widget 不参与: translate 会在下面 ShiftSubtreeRects 里
+     * 改写整棵子树的 rect, rotate/scale 更会让实际覆盖范围超出 rect, 此时
+     * 拿未变换的 rect 判定会误剪。列表行不带 transform, 不影响收益。 */
+    const bool hasAnyTransform = (transformX != 0.0f || transformY != 0.0f) ||
+                                 (rotateDeg != 0.0f) ||
+                                 (scaleX != 1.0f) || (scaleY != 1.0f);
+    if (!hasAnyTransform) {
+        const float ext = OutsetPaintExtent(*this);
+        const D2D1_RECT_F probe{rect.left - ext, rect.top - ext,
+                                rect.right + ext, rect.bottom + ext};
+        if (r.IsCulled(probe)) return;
+    }
 
     bool useLayer = (opacity < 1.0f);
     if (useLayer) r.PushOpacity(opacity, WidgetOpacityBounds(*this));

@@ -193,6 +193,34 @@ void Context::RelayoutAllWindows() {
     }
 }
 
+void Context::BeginBatch() {
+    ++batchDepth_;
+}
+
+void Context::EndBatch() {
+    if (batchDepth_ > 0) --batchDepth_;
+    if (batchDepth_ != 0) return;
+
+    /* 先清 flag 再执行 —— 执行过程中若又触发 Request*, 此时已不在批量里,
+     * 会立即执行, 不会丢。 */
+    const bool doInvalidate = batchPendingInvalidate_;
+    const bool doAnimTimers = batchPendingAnimTimers_;
+    batchPendingInvalidate_ = false;
+    batchPendingAnimTimers_ = false;
+    if (doInvalidate) InvalidateAllWindows();
+    if (doAnimTimers) UpdateAnimTimers();
+}
+
+void Context::RequestInvalidateAll() {
+    if (batchDepth_ > 0) { batchPendingInvalidate_ = true; return; }
+    InvalidateAllWindows();
+}
+
+void Context::RequestAnimTimerUpdate() {
+    if (batchDepth_ > 0) { batchPendingAnimTimers_ = true; return; }
+    UpdateAnimTimers();
+}
+
 void Context::UpdateAnimTimers() {
     for (auto& [id, win] : windows_) {
         if (win) win->UpdateToggleAnimTimer();

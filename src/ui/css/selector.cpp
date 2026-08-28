@@ -10,6 +10,7 @@ uint32_t PseudoToBit(const std::string& name) {
     if (name == "disabled") return state::Disabled;
     if (name == "checked")  return state::Checked;
     if (name == "root")     return state::Root;
+    if (name == "drag-over") return state::DragOver;
     return 0;
 }
 

@@ -128,7 +128,29 @@ int parseVk(const std::string& s) {
     if (lo == "down")  return VK_DOWN;
     if (lo == "home")  return VK_HOME;
     if (lo == "end")   return VK_END;
+    /* 单个字母 → 对应 VK ('a' → VK 0x41)。纯数字仍按 VK 码解释 (key 65 = 'A'),
+     * 保持既有语义。 */
+    if (lo.size() == 1 && lo[0] >= 'a' && lo[0] <= 'z')
+        return (int)(lo[0] - 'a' + 'A');
     return std::atoi(s.c_str());
+}
+
+/* 解析 "ctrl+shift+c" 形式: 剥掉修饰键前缀, 余下的交给 parseVk。 */
+int parseVkWithMods(const std::string& s, int& ctrl, int& shift, int& alt) {
+    ctrl = shift = alt = 0;
+    std::string cur = s, key = s;
+    size_t pos;
+    while ((pos = cur.find('+')) != std::string::npos && pos + 1 < cur.size()) {
+        std::string mod = cur.substr(0, pos);
+        for (auto& c : mod) c = (char)tolower((unsigned char)c);
+        if      (mod == "ctrl" || mod == "control") ctrl  = 1;
+        else if (mod == "shift")                    shift = 1;
+        else if (mod == "alt")                      alt   = 1;
+        else break;                       // 不是修饰键, 剩下整体当键名
+        cur = cur.substr(pos + 1);
+        key = cur;
+    }
+    return parseVk(key);
 }
 
 int parseBoolArg(const std::string& s, int deflt) {
@@ -250,6 +272,13 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         if (!w) return errJson("widget not found");
         return ui_debug_double_click(win, w) == 0 ? okJson() : errJson("dbl_click failed");
     }
+    if (cmd == "dbl_click_at") {
+        if (arg(1).empty()) return errJson("usage: dbl_click_at <x> <y>");
+        float x = (float)std::atof(arg(0).c_str());
+        float y = (float)std::atof(arg(1).c_str());
+        return ui_debug_double_click_at(win, x, y) == 0 ? okJson()
+                                                        : errJson("dbl_click_at failed");
+    }
     if (cmd == "rclick") {
         UiWidget w = WidgetByIdHandle(win, arg(0));
         if (!w) return errJson("widget not found");
@@ -274,6 +303,18 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         float x = (float)std::atof(arg(0).c_str());
         float y = (float)std::atof(arg(1).c_str());
         return ui_debug_mouse_move(win, x, y) == 0 ? okJson() : errJson("move failed");
+    }
+    if (cmd == "mouse_down") {
+        if (arg(1).empty()) return errJson("usage: mouse_down <x> <y>");
+        float x = (float)std::atof(arg(0).c_str());
+        float y = (float)std::atof(arg(1).c_str());
+        return ui_debug_mouse_down(win, x, y) == 0 ? okJson() : errJson("mouse_down failed");
+    }
+    if (cmd == "mouse_up") {
+        if (arg(1).empty()) return errJson("usage: mouse_up <x> <y>");
+        float x = (float)std::atof(arg(0).c_str());
+        float y = (float)std::atof(arg(1).c_str());
+        return ui_debug_mouse_up(win, x, y) == 0 ? okJson() : errJson("mouse_up failed");
     }
     if (cmd == "drag") {
         if (arg(2).empty()) return errJson("usage: drag <id> <dx> <dy>");
@@ -315,7 +356,11 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
     }
     if (cmd == "key") {
         if (arg(0).empty()) return errJson("usage: key <vk-or-name>");
-        return ui_debug_key(win, parseVk(arg(0))) == 0 ? okJson() : errJson("key failed");
+        int kc = 0, ks = 0, ka = 0;
+        const int vk = parseVkWithMods(arg(0), kc, ks, ka);
+        const int rc = (kc || ks || ka) ? ui_debug_key_mod(win, vk, kc, ks, ka)
+                                        : ui_debug_key(win, vk);
+        return rc == 0 ? okJson() : errJson("key failed");
     }
     if (cmd == "type") {
         if (rest.empty()) return errJson("usage: type <text>");
@@ -680,7 +725,7 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         "{\"commands\":["
         "\"tree\",\"widget <id>\",\"highlight <id>\",\"screenshot <path>\","
         "\"screenshot_widget <id> <path>\",\"invalidate\",\"pump\","
-        "\"click <id>\",\"click_at <x> <y>\",\"dbl_click <id>\","
+        "\"click <id>\",\"click_at <x> <y>\",\"dbl_click <id>\",\"dbl_click_at <x> <y>\","
         "\"rclick <id>\",\"rclick_at <x> <y>\",\"hover <id>\",\"move <x> <y>\","
         "\"drag <id> <dx> <dy>\",\"drag_to <x1> <y1> <x2> <y2>\","
         "\"wheel <id> <delta>\",\"wheel_at <x> <y> <delta>\","

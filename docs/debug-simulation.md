@@ -69,6 +69,7 @@
 | Context Menu | `ui_debug_menu_close` | `menu_close` | |
 | Context Menu | `ui_debug_screenshot_menu` | `screenshot_menu <path>` | 截 popup RT, 验证 icon / submenu 实际渲染 |
 | ImageView | `ui_image_set_zoom/pan/rotation` | `zoom/pan/rotate <id> ...` | |
+| OcrImgView | `ui_debug_drag_to` / `ui_debug_double_click_at` / `ui_debug_key_mod` | `drag_to` / `dbl_click_at` / `key ctrl+c` | 划词=在文本 quad 上拖；**单击是清选区**（PDF 惯例），要选中某块用 `dbl_click_at`，三击选整行=`dbl_click_at` 后紧跟一次 `click_at`。坐标换算用 `ui_ocr_img_view_image_to_screen`。回归见 `test/scripts/ocr_demo_test.ps1`（62 项，五场景 + 四个旋转角），demo 为 `ocr-demo` target。**选择粒度是字**，所以拖动端点要用 `word_edge <i> <0\|1>`（块的左/右缘）而非 `word_center`，后者只落在块中间某个字上 |
 | NavItem | `ui_debug_click` | `click nav_home` | 点击即切换 |
 | MenuBar | `ui_debug_click` | `click <menubar_id>` | 点击按钮区触发菜单 |
 | Splitter | `ui_debug_drag` | `drag <id> <dx> <dy>` | 拖动分隔条改比例 |
@@ -85,6 +86,7 @@
 int  ui_debug_click(UiWindow win, UiWidget w);
 int  ui_debug_click_at(UiWindow win, float x, float y);
 int  ui_debug_double_click(UiWindow win, UiWidget w);
+int  ui_debug_double_click_at(UiWindow win, float x, float y);
 int  ui_debug_right_click(UiWindow win, UiWidget w);
 int  ui_debug_right_click_at(UiWindow win, float x, float y);
 int  ui_debug_hover(UiWindow win, UiWidget w);
@@ -97,15 +99,32 @@ int  ui_debug_wheel(UiWindow win, UiWidget w, float delta);
 int  ui_debug_wheel_at(UiWindow win, float x, float y, float delta);
 ```
 
+双击走真实的 `WM_LBUTTONDBLCLK` 路径（`@dblclick` hook + `Widget::OnMouseDoubleClick`
+冒泡）。**连点两次 `ui_debug_click` 不等价** —— 那条路只触发 `onClick`，永远进
+不了双击分支。位置敏感的双击（图片划词选整行、时间轴打点之类）必须用
+`_at` 变体，`ui_debug_double_click` 只能点 widget 中心。
+
+滚轮由 `UiWindowImpl::OnMouseWheel` 里一条硬编码的 `dynamic_cast` 链分发到
+已知 widget 类型。**新写的可缩放/可滚动 widget 必须把自己加进那条链**，否则
+`ui_debug_wheel*` 和真实滚轮都不会调到它的 `OnMouseWheel`（表现为"滚轮没反应"
+但事件确实发出去了）。
+
 ### 焦点 / 键盘
 
 ```c
 int  ui_debug_focus(UiWindow win, UiWidget w);
 int  ui_debug_blur(UiWindow win);
 int  ui_debug_key(UiWindow win, int vk);           /* 发送 WM_KEYDOWN 到焦点控件 */
+int  ui_debug_key_mod(UiWindow win, int vk, int ctrl, int shift, int alt);
 int  ui_debug_type_char(UiWindow win, unsigned int ch);
 int  ui_debug_type_text(UiWindow win, const wchar_t* text);
 ```
+
+**组合键必须用 `ui_debug_key_mod`。** widget 的 `OnKeyDown` 普遍用
+`GetKeyState(VK_CONTROL)` 判修饰键，而 `ui_debug_key` 只送 vk —— 修饰键读出来
+永远是"没按下"，`Ctrl+C` / `Ctrl+A` 这类分支在自动化里等同死代码。
+`ui_debug_key_mod` 在注入期间用 `SetKeyboardState` 临时置位**线程**键盘状态表
+（debug 命令本就跑在 UI 线程，和 `GetKeyState` 同线程），调用后还原。
 
 ### 高层控件
 
@@ -207,7 +226,8 @@ int  ui_debug_widget_is_visible(UiWidget w);
 | `flyout [show\|hide\|toggle]` | `flyout toggle` | 对 demo 里 `demoFlyout` 操作 |
 | `click <id>` | `click flyoutBtn` | 点击（触发 onClick） |
 | `click_at <x> <y>` | `click_at 300 400` | 窗口坐标点击 |
-| `dbl_click <id>` | | |
+| `dbl_click <id>` | | 双击控件中心；走真实 WM_LBUTTONDBLCLK 路径 |
+| `dbl_click_at <x> <y>` | `dbl_click_at 150 178` | 按坐标双击；位置敏感的双击用这个 |
 | `rclick <id>` / `rclick_at <x> <y>` | | 右键；等同 WM_RBUTTONUP |
 | `hover <id>` | | 鼠标移到控件中心 |
 | `move <x> <y>` | | |
@@ -216,7 +236,8 @@ int  ui_debug_widget_is_visible(UiWidget w);
 | `wheel <id> <delta>` | `wheel pages -120` | 滚轮 |
 | `wheel_at <x> <y> <delta>` | | |
 | `focus <id>` / `blur` | | |
-| `key <vk\|name>` | `key enter` | 发虚拟键；名称：enter/esc/tab/space/back/del/left/right/up/down/home/end |
+| `key <vk\|name>` | `key enter` | 发虚拟键；名称：enter/esc/tab/space/back/del/left/right/up/down/home/end；单个字母按字面解（`key a` = VK 0x41），纯数字仍按 VK 码解（`key 65` = 'A'） |
+| `key <mod>+<key>` | `key ctrl+a` · `key ctrl+shift+c` | 组合键；修饰键 ctrl/shift/alt 可叠加。走 `ui_debug_key_mod`，`GetKeyState` 能读到修饰键状态 |
 | `type <text>` | `type Hello` | 逐字符发送 WM_CHAR 等效；需先 focus |
 | `check <id> [0\|1\|toggle]` | `check chkA toggle` | |
 | `toggle <id> [0\|1\|toggle]` | | |
@@ -314,9 +335,14 @@ void demoAutomation(UiWindow win) {
   送到 UI 线程。
 - **键盘模拟**：`ui_debug_key(vk)` 和真实 WM_KEYDOWN 走同一条 `DispatchKeyDown`
   分发，因此 Tab 焦点轮换、Enter/Space 激活 Button/CheckBox/Toggle、方向键控制
-  Slider/Radio、Esc 关 ComboBox 都会被模拟触发。需要 Ctrl/Alt 组合的快捷键由
-  于 `GetKeyState` 读取的是真实键盘，注入时需要用户同时按住修饰键，或用
-  `ui_window_register_shortcut` 直接绑定回调再由脚本触发那个回调。
+  Slider/Radio、Esc 关 ComboBox 都会被模拟触发。**组合键用 `ui_debug_key_mod`
+  / `key ctrl+a`** —— 它在注入期间用 `SetKeyboardState` 临时置位
+  线程键盘状态表，让 widget 里的 `GetKeyState(VK_CONTROL)` 读到修饰键，调用后
+  还原。此前只能靠用户手动按住修饰键，或 `ui_window_register_shortcut` 绕过。
+- **滚轮分发**：`UiWindowImpl::OnMouseWheel` 用一条硬编码 `dynamic_cast` 链找
+  接收者。**新增可滚动/可缩放 widget 必须把自己加进那条链**，否则真实滚轮和
+  `ui_debug_wheel*` 都不会调到它的 `OnMouseWheel`。症状是"滚轮完全没反应"而事件
+  确实发出去了——排查时先确认自己在不在链里，别去怀疑事件注入。
 - **子菜单**：`menu_click_path` 支持任意深度，但目前不真正"展开"子菜单的 HWND
   弹窗（模拟点击不会有过场动画 / 可见的子菜单窗口）。如果需要像真实用户那样逐层
   hover 打开，用 `ui_debug_hover` + 坐标去触发 `ContextMenu::HandleMouseMove`。

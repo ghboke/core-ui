@@ -1,0 +1,91 @@
+<window title="ocr-img-view · uix 集成 demo" width="1060" height="700"
+        min-width="720" min-height="480" resizable="true"/>
+
+<script>
+/* lines 由 C++ 端 ui_page_set_json 推入, 形状:
+ *   [{ text: "第一行文字", cls: "row" | "row active" }, ...]
+ * 页面只做 v-for 渲染; 点击行的处理在 C++ (ui_page_on_widget_mount 绑
+ * on_click → ui_ocr_img_view_select_range)。 */
+export default {
+  data() {
+    return {
+      lines: [],
+      status: "加载中…"
+    };
+  }
+};
+</script>
+
+<style>
+  .shell {
+    flex-direction: column;
+    width: 100%;
+    height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font-size: 13px;
+  }
+  .bar {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px 10px 12px;
+  }
+  .status {
+    flex: 1;
+    font-size: 12px;
+    color: var(--fg-2);
+    white-space: nowrap;
+  }
+  .body {
+    flex: 1;
+    flex-direction: row;
+    min-height: 0;
+    gap: 0;
+  }
+  /* 画布: .uix 直接声明 <ocr-img-view>, 宿主只按 id 找到它喂数据。 */
+  .canvas {
+    flex: 1;
+    min-width: 0;
+    background: var(--bg-2);
+  }
+  .side {
+    width: 300px;
+    flex: none;
+    border-left: 1px solid var(--border-subtle);
+  }
+  .rows {
+    flex-direction: column;
+    padding: 8px;
+    gap: 2px;
+  }
+  .row {
+    padding: 6px 8px 6px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .row:hover { background: var(--fill-hover); }
+  .active    { background: var(--accent-soft); color: var(--accent); }
+</style>
+
+<template>
+  <div class="shell">
+    <div class="bar">
+      <button id="btn_fit">适应窗口</button>
+      <button id="btn_reset">原始大小</button>
+      <button id="btn_rotate">旋转 90°</button>
+      <button id="btn_all">全选</button>
+      <button id="btn_clear">清除选区</button>
+      <label class="status">{{ status }}</label>
+    </div>
+    <div class="body">
+      <ocr-img-view id="ocr" class="canvas" highlight-color="#2680ebA0"/>
+      <ScrollView class="side">
+        <div class="rows">
+          <label id="line_row" :class="l.cls" v-for="l in lines">{{ l.text }}</label>
+        </div>
+      </ScrollView>
+    </div>
+  </div>
+</template>

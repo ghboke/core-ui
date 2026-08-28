@@ -6,6 +6,7 @@
 #endif
 #include "../controls.h"
 #include "../gh_img_view.h"
+#include "../ocr_img_view.h"
 #include "../css/value.h"
 #include "svg_widget.h"
 
@@ -1001,6 +1002,24 @@ WidgetPtr ConstructByTag(const std::string& tag, const std::string& text,
         tag == "gh_img" || tag == "gh-img") {
         return std::make_shared<GhImgViewWidget>();
     }
+    // <ocr-img-view>: 图片划词画布。数据 (图像 + OCR 文本项) 全部走
+    // ui_ocr_img_view_* C API 由宿主喂 —— 跟 gh-img-view 一样, 标签只负责
+    // 把 widget 放进布局树, 宿主 ui_widget_find_by_id 拿到句柄后照常调用
+    // 全部 C API。静态属性 highlight-color 可直接在 .uix 里定高亮色。
+    if (tag == "ocr_img_view" || tag == "ocr-img-view" ||
+        tag == "OcrImgView"   || tag == "ocr-img") {
+        auto ov = std::make_shared<OcrImgViewWidget>();
+        for (const auto& a : node.attrs) {
+            if (a.kind != ui::uix::AttrKind::Static) continue;
+            if (a.name == "highlight-color") {
+                ui::css::Color c{};
+                if (ui::css::ParseColor(a.rawValue, c)) ov->SetHighlightColor(ToD2DColor(c));
+            } else if (a.name == "rotation") {
+                try { ov->SetRotation(std::stoi(a.rawValue)); } catch (...) {}
+            }
+        }
+        return ov;
+    }
     if (tag == "Toggle" || tag == "toggle") {
         auto tg = std::make_shared<ToggleWidget>(wtext);
         tg->cursor = ui::CursorKind::Pointer;
@@ -1057,6 +1076,20 @@ WidgetPtr ConstructByTag(const std::string& tag, const std::string& text,
         ta->SetWrap(wrap);
         (void)wtext;  // text handled separately
         return ta;
+    }
+    if (tag == "chips-input" || tag == "ChipsInput") {
+        std::wstring ph, labels, value;
+        for (const auto& a : node.attrs) {
+            if (a.kind != ui::uix::AttrKind::Static) continue;
+            if (a.name == "placeholder") ph = ToWide(a.rawValue);
+            else if (a.name == "chip-labels" || a.name == "chipLabels")
+                labels = ToWide(a.rawValue);
+            else if (a.name == "value") value = ToWide(a.rawValue);
+        }
+        auto ci = std::make_shared<ChipsInputWidget>(ph);
+        if (!labels.empty()) ci->SetChipLabels(labels);
+        if (!value.empty()) ci->SetValue(value);
+        return ci;
     }
     if (tag == "select") {
         // ComboBox needs an item list; populated later from <option> children in compiler.
@@ -1274,6 +1307,20 @@ WidgetPtr BuildWidget(const ui::uix::Node& node, const ui::css::ComputedStyle& s
             else if (a.name == "hitTransparent" || a.name == "hit-transparent") {
                 w->hitTransparent = ParseBoolAttr(a.rawValue);
             }
+            else if (a.name == "hitClient" || a.name == "hit-client") {
+                w->hitClient = ParseBoolAttr(a.rawValue);
+            }
+            // HTML5-style drag & drop (dispatched by UiWindowImpl)
+            else if (a.name == "draggable") {
+                w->draggable = ParseBoolAttr(a.rawValue);
+            }
+            else if (a.name == "drag-data" || a.name == "dragData") {
+                w->draggable = true;  // payload implies draggable
+                w->dragData = ToWide(a.rawValue);
+            }
+            else if (a.name == "drop-target" || a.name == "dropTarget") {
+                w->dropTarget = ParseBoolAttr(a.rawValue);
+            }
             // For text-like widgets: value attribute for input, alt for img, etc. — skipped in v0
         }
     }
@@ -1292,6 +1339,7 @@ WidgetPtr BuildWidget(const ui::uix::Node& node, const ui::css::ComputedStyle& s
         dynamic_cast<SvgWidget*>(w.get())             ||
         dynamic_cast<TextInputWidget*>(w.get())       ||
         dynamic_cast<TextAreaWidget*>(w.get())        ||
+        dynamic_cast<ChipsInputWidget*>(w.get())      ||
         dynamic_cast<NumberBoxWidget*>(w.get())       ||
         dynamic_cast<ComboBoxWidget*>(w.get())        ||
         dynamic_cast<ToggleWidget*>(w.get())          ||

@@ -24,6 +24,7 @@
 #include <functional>
 #include <cstdint>
 #include <string>
+#include <vector>
 #include <memory>
 
 // L173 / core-ui Phase 4: SVG 矢量源改用 LunaSVG (统一引擎)。前向声明, 完整定义
@@ -86,7 +87,7 @@ public:
     bool SetSvgFromFile(const std::wstring& path, Renderer& r);
 
     // SVG 模式判断 — 当前 source 是 SVG 还是瓦块 pyramid.
-    bool IsSvgMode() const { return svgD2DDoc_ != nullptr || svgDoc_ != nullptr; }
+    bool IsSvgMode() const { return !svgD2DSteps_.empty() || svgDoc_ != nullptr; }
 
     // 把当前加载的 SVG 矢量源光栅化到 caller 缓冲, 用于鸟瞰图缩略图等场景.
     // fit 到 target_w×target_h 保 aspect (短边贴边, 长边等比缩), 实际像素尺寸
@@ -105,6 +106,24 @@ public:
     // 逐像素查看). 下采始终走平滑路径不受此影响.
     void     SetAntialias(bool on)        { antialias_ = on; }
     bool     Antialias() const            { return antialias_; }
+    // Checkerboard: 在图片矩形 (旋转后的可见 AABB) 底下垫主题色棋盘格, 给
+    // 透明像素一个对比背景。默认 false — letterbox 与图区都不画, 由宿主
+    // CSS 背景决定。不透明图开着也无视觉差异 (被完全盖住), 宿主可只按
+    // "背景是否纯色" 决定开关, 无需探测图片 alpha。
+    void     SetCheckerboard(bool on)     { checkerboard_ = on; }
+    bool     Checkerboard() const         { return checkerboard_; }
+    // Shadow (图片阴影): 在图片矩形**外圈**画投影 + 一道 1dip 描边, 让图片边界
+    // 从画布背景里浮出来。默认 false。参数按当前主题取 (浅色以投影为主, 深色
+    // 以描边为主), 尺寸是 dip、不随 zoom 变 —— 它是屏幕空间的装饰。
+    // 只画外圈是硬要求: 整块模糊铺在图片底下的话, 透明 PNG 在关棋盘时会透出
+    // 一整块暗色矩形。几何见 image_shadow_geom.h (有单测)。
+    void     SetShadow(bool on)           { shadow_ = on; }
+    bool     Shadow() const               { return shadow_; }
+    // FitPadding (dip): Fit() 计算 zoom 时四周留出的内边距。默认 0 = 长边贴满
+    // 视口 (旧行为)。开了图片阴影就必须留一点, 否则阴影整条画在视口外看不见。
+    // 画布很小时按短边 25% 自动夹紧, 见 imgshadow::ClampFitPadding。
+    void     SetFitPadding(float dip)     { fitPadding_ = dip > 0.0f ? dip : 0.0f; }
+    float    FitPadding() const           { return fitPadding_; }
     // WheelZoomEnabled: 内部 OnMouseWheel 是否缩放. true (默认) = 滚轮缩放;
     // false = 不缩放, 让宿主用 ui_widget_on_mouse_wheel hook 自行接管滚轮
     // (hook 在 OnMouseWheel 分发开头无条件 fire, 不受此开关影响).
@@ -139,6 +158,10 @@ public:
     float PanY() const               { return panY_; }
     void  SetPan(float x, float y);   // L47 follow-up: fire NotifyViewport, 见 .cpp
     void  SetZoomRange(float lo, float hi) { minZoom_ = lo; maxZoom_ = hi; }
+    /* 渲染线程模式下 SetImageInfo 在 UI 线程拿不到 RT (GetDpi 不可用),
+     * dpi_scale_ 会停留在 1.0 — PickAutoLevel 的物理密度判定和整数倍
+     * 缩放的像素对齐都会失真。host 显式喂入窗口 DPI scale。 */
+    void  SetDpiScale(float s);
     void  Fit();    // 长边贴合视口（rotation-aware: 用 effective W/H）
     void  Reset();  // 1:1 居中
 
@@ -200,6 +223,9 @@ private:
     bool     wheelZoomEnabled_ = true; // 内部滚轮缩放 (默认); false 让宿主接管
     bool     panLockX_ = false;        // 拖动平移按轴锁 (默认两轴自由); true = 该轴拖动不动
     bool     panLockY_ = false;
+    bool     checkerboard_ = false;    // 图区垫棋盘 (透明像素对比背景); 默认关
+    bool     shadow_ = false;          // 图片外圈投影 + 描边 (显示图片边界); 默认关
+    float    fitPadding_ = 0.0f;       // Fit() 留的内边距 (dip); 默认 0 = 贴满视口
     uint32_t activeLevel_ = 0;
     // L115: 上一个 active level — 切级时 TrimToViewport_ 保留它的 tile, 让 OnDraw
     // 多级 fallback 用旧级清晰图覆盖新级未到达的 tile (切级清晰→更清晰, 无波浪/无空白)。
@@ -252,6 +278,20 @@ private:
     };
     std::unordered_map<TileKey, Tile, TileKeyHash> tiles_;
     ResourceKey previewResourceKey_;
+
+    /* 棋盘瓦片 (16×16, 8px 方格, 主题感知)。generation 用保留常量
+     * kCheckerTileGeneration (~0ull) — ResourceStore::PurgeGeneration 按
+     * generation 号全局清理, 不能跟 imageGeneration_ (1,2,3,…) 撞号, 否则
+     * 切图 Begin 时棋盘资源被误清。 */
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> checkerTile_;
+    ResourceKey checkerTileResourceKey_;
+    int checkerTheme_ = -1;            // 上次建瓦片时的 theme::Mode, 变了重建
+    void EnsureCheckerboardTile_(Renderer& r);
+    void DrawCheckerboard_(Renderer& r, const D2D1_RECT_F& area);
+    /* 图片外圈投影 + 描边。visual = 旋转后的图片矩形 (SetRotation 已把角度
+     * round 到 90 度倍数, 所以这就是精确边界); viewport = widget rect。 */
+    void DrawImageShadow_(Renderer& r, const D2D1_RECT_F& visual,
+                          const D2D1_RECT_F& viewport);
     uint32_t previewW_ = 0, previewH_ = 0;
     uint64_t imageGeneration_ = 0;
 
@@ -268,20 +308,16 @@ private:
      * document 时的视口栅格化降级。svgW_/svgH_ = SVG natural size, 跟
      * info_.fullWidth/Height 同步。 */
     std::shared_ptr<lunasvg::Document> svgDoc_;   /* shared: 后台栅格化线程安全持有 */
-    Microsoft::WRL::ComPtr<ID2D1SvgDocument> svgD2DDoc_;
-    std::string svgD2DXml_;
+    /* D2D 直绘按文档顺序切出的有序步骤 (见 ui/svg_d2d_segments.h)。不带 filter
+     * 的 SVG 就是单独一步 = 整份文档; 带 filter 的按绘制顺序分段, 顺序即 z 序。
+     * 分段器命中红线时 svgRasterMain_ 置位, 主视图回落 LunaSVG 光栅。 */
+    std::vector<SvgDocumentRef::Step> svgD2DSteps_;
+    /* 与 svgD2DSteps_ 等长的 ID2D1SvgDocument 懒建缓存 —— 只给 UI 线程即时绘制
+     * 路径用, 免得每帧重解析 SVG。换图时随 steps 一起清。 */
+    std::vector<Microsoft::WRL::ComPtr<ID2D1SvgDocument>> svgD2DStepDocs_;
+    std::vector<Microsoft::WRL::ComPtr<ID2D1SvgDocument>> svgD2DStepShadowDocs_;
     std::string svgThumbXml_;      /* 缩略图专用: 剥图元 filter, 保留本体 */
     bool svgRasterMain_ = false;   /* 内嵌 PNG/JPG 等位图 SVG: 主视图走 LunaSVG 栅格 */
-    struct SvgD2DDropShadowLayer {
-        std::string shadowXml;
-        std::string coverXml;
-        Microsoft::WRL::ComPtr<ID2D1SvgDocument> shadowDoc;
-        Microsoft::WRL::ComPtr<ID2D1SvgDocument> coverDoc;
-        float dx = 0.0f;
-        float dy = 0.0f;
-        float stdDeviation = 0.0f;
-    };
-    std::vector<SvgD2DDropShadowLayer> svgD2DShadowLayers_;
     uint32_t svgW_ = 0;
     uint32_t svgH_ = 0;
     /* 视口栅格化缓存位图 (UI 线程持有/绘制)。svgRasterSrc* 是这张位图覆盖的
@@ -314,7 +350,20 @@ private:
     void ClearSvgRaster_();
 
     // ---- 渲染辅助 ----
-    void     DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& dest);
+    // cull 非空时只画与其相交的瓦块（垫层按缺口矩形 clip 绘制时省 draw call）。
+    void     DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& dest,
+                       const D2D1_RECT_F* cull = nullptr);
+    // 某 level 在当前 viewport 内的可见瓦块网格范围 [tx0,tx1)x[ty0,ty1)。
+    // 返回 false = 该级尺寸无效（level 不存在或 scale 退化）。
+    bool     VisibleTileRange_(uint32_t level, const D2D1_RECT_F& dest,
+                               int& tx0, int& ty0, int& tx1, int& ty1) const;
+    // 收集 active level 可见区内【缺瓦片】格子的屏幕矩形（同行连续缺口合并
+    // 为一条）。OnDraw 用它把 preview 兜底层/低清 fallback 层 clip 到缺口内
+    // 绘制 — 透明图下垫层若画在已覆盖区域, 会从瓦块透明像素处透出低清毛边
+    // （L230/L231 透明边缘 bug）。返回 false = 该级无效或可见区没有格子。
+    bool     MissingCellRects_(uint32_t level, const D2D1_RECT_F& dest,
+                               std::vector<D2D1_RECT_F>& out,
+                               int* presentTiles = nullptr) const;
 
     // ---- 几何辅助 ----
     // 当前 level 下的图像总尺寸（顶级 = info.fullW/H；每降一级 /2）

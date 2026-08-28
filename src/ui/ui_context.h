@@ -84,6 +84,32 @@ public:
         AnimationInvalidation invalidation = AnimationInvalidation::Paint);
     bool HasWindows() const { return !windows_.empty(); }
 
+    /* ---- 批量绑定合批 (build 285) ---------------------------------------
+     * 背景: PageState::ApplyBindingToWidget 每应用一条绑定就
+     * InvalidateAllWindows() + UpdateAnimTimers()。后者会**遍历整棵 widget 树**
+     * 并对每个节点做 6 次以上 dynamic_cast —— 单次是 O(树大小)。
+     * v-for 一次性建 2000 行时要应用约 16000 条绑定, 树里又正好有约 12000 个
+     * widget, 于是整体退化成 O(n^2): 实测 2000 行 8.9 秒, 5000 行 56 秒。
+     *
+     * 合批: 批量期间只记"待办", 批结束统一各做一次。语义不变 —— 中途没有
+     * 任何一帧会上屏。
+     *
+     * 用 BatchScope 而不要手工配对 Begin/End: 调用点有多处 early return。 */
+    void BeginBatch();
+    void EndBatch();
+    bool InBatch() const { return batchDepth_ > 0; }
+    /* 批量期间记待办, 否则立即执行。 */
+    void RequestInvalidateAll();
+    void RequestAnimTimerUpdate();
+
+    struct BatchScope {
+        Context& ctx;
+        explicit BatchScope(Context& c) : ctx(c) { ctx.BeginBatch(); }
+        ~BatchScope() { ctx.EndBatch(); }
+        BatchScope(const BatchScope&) = delete;
+        BatchScope& operator=(const BatchScope&) = delete;
+    };
+
     // Called by Widget destructor so windows can null out any cached
     // raw pointer to the dying widget (hovered / pressed / focused /
     // tooltip). Avoids UAF when v-for / v-if destroys an iteration
@@ -117,6 +143,11 @@ private:
 
     std::unordered_map<uint64_t, std::unique_ptr<UiWindowImpl>> windows_;
     uint64_t nextWindowId_ = 1;
+
+    /* 批量绑定合批 (build 285) — 见上方 BeginBatch 注释 */
+    int  batchDepth_             = 0;
+    bool batchPendingInvalidate_ = false;
+    bool batchPendingAnimTimers_ = false;
 
     // Persistent widget callback registry — survives v-if/v-for remount.
     std::unordered_map<std::string, WidgetCallbacks> widgetCallbacks_;

@@ -404,6 +404,20 @@ UI_API UiWidget ui_separator(void);
 UI_API UiWidget ui_vseparator(void);
 UI_API UiWidget ui_text_input(const wchar_t* placeholder);
 UI_API UiWidget ui_text_area(const wchar_t* placeholder);
+/* chips-input (build 259+): 单行模板编辑器 — 原子 chip + 自由文本混排.
+ * value 序列化为模板串, chip 记作 {key}. .uix 标签 <chips-input
+ * placeholder=".." chip-labels="key=显示名;..">, 支持 :value / v-model /
+ * @change. 是窗口拖放框架的原生投放目标 (载荷=chip key). */
+UI_API UiWidget ui_chips_input(const wchar_t* placeholder);
+UI_API void     ui_chips_input_set_value(UiWidget w, const wchar_t* tpl);
+/* 返回内部缓冲, 下次调用前有效. */
+UI_API const wchar_t* ui_chips_input_get_value(UiWidget w);
+UI_API void     ui_chips_input_set_chip_labels(UiWidget w, const wchar_t* spec);
+UI_API void     ui_chips_input_insert_chip(UiWidget w, const wchar_t* key);
+typedef void (*UiChipsChangedCallback)(UiWidget w, const wchar_t* value,
+                                        void* userdata);
+UI_API void     ui_chips_input_on_changed(UiWidget w, UiChipsChangedCallback cb,
+                                           void* userdata);
 UI_API UiWidget ui_combobox(const wchar_t** items, int count);
 UI_API UiWidget ui_radio_button(const wchar_t* text, const char* group);
 UI_API UiWidget ui_toggle(const wchar_t* text);
@@ -645,6 +659,22 @@ UI_API uint32_t ui_gh_img_view_get_active_level(UiWidget w);
  * NEAREST_NEIGHBOR, 像素边界清晰 (像素画 / 逐像素查看). 下采始终平滑. */
 UI_API void     ui_gh_img_view_set_antialias(UiWidget w, int on);
 UI_API int      ui_gh_img_view_get_antialias(UiWidget w);
+/* 棋盘垫层. on=1 在图片矩形 (旋转后可见 AABB) 底下画主题色棋盘格, 透明像素
+ * 透出棋盘; on=0 (默认) 不画。不透明图开着无视觉差异 (被完全盖住), 宿主可只按
+ * "画布背景是否纯色" 决定开关, 无需探测图片 alpha. letterbox 区永不画. */
+UI_API void     ui_gh_img_view_set_checkerboard(UiWidget w, int on);
+UI_API int      ui_gh_img_view_get_checkerboard(UiWidget w);
+/* 图片阴影 (build 283+): 在图片矩形**外圈**画投影 + 一道 1dip 描边, 让图片边界
+ * 从画布背景里浮出来。默认关。参数按当前主题自动取 (浅色以投影为主, 深色以描边
+ * 为主 —— 黑投影在深色画布上几乎不可见), 尺寸按 dip、不随缩放变。
+ * 只画外圈: 整块模糊铺在图片底下的话, 透明 PNG 在关棋盘时会透出暗块。 */
+UI_API void     ui_gh_img_view_set_shadow(UiWidget w, int on);
+UI_API int      ui_gh_img_view_get_shadow(UiWidget w);
+/* 适应窗口 (ui_gh_img_view_fit) 时四周留出的内边距 (dip)。默认 0 = 长边贴满视口。
+ * **开了图片阴影就必须留一点**, 否则图片贴着视口边, 阴影整条画在视口外看不见。
+ * 画布很小时按短边 25% 自动夹紧, 不会把可用空间吃光。 */
+UI_API void     ui_gh_img_view_set_fit_padding(UiWidget w, float dip);
+UI_API float    ui_gh_img_view_get_fit_padding(UiWidget w);
 /* 内部滚轮缩放开关. on=1 (默认) 滚轮缩放; on=0 widget 不内部缩放, 宿主用
  * ui_widget_on_mouse_wheel hook 自行接管滚轮 (如缩放 / 切图二选一). 命令式
  * 缩放 API (set_zoom / set_zoom_around 等) 不受此开关影响. */
@@ -658,6 +688,9 @@ UI_API void     ui_gh_img_view_set_pan_lock(UiWidget w, int lock_x, int lock_y);
 UI_API void     ui_gh_img_view_get_pan_lock(UiWidget w, int* out_lock_x, int* out_lock_y);
 
 UI_API float    ui_gh_img_view_get_zoom(UiWidget w);
+/* 渲染线程模式下 widget 拿不到 RT DPI, host 需喂入窗口 DPI scale
+   (ui_window_dpi_scale) — 影响 mip 级选择与整数倍缩放的像素对齐. */
+UI_API void     ui_gh_img_view_set_dpi_scale(UiWidget w, float scale);
 UI_API void     ui_gh_img_view_set_zoom(UiWidget w, float zoom);
 UI_API void     ui_gh_img_view_set_zoom_around(UiWidget w, float zoom,
                                                 float anchor_x, float anchor_y);
@@ -696,6 +729,152 @@ UI_API void     ui_gh_img_view_on_tile_evicted(UiWidget w,
                                                  void* userdata);
 
 /* ------------------------------------------------------------------ */
+/* OcrImgView — 图片划词 (OCR 文本选择画布)                            */
+/*                                                                    */
+/* 宿主加载图 → 调任意 OCR 引擎 → 把 [文本 + quad 坐标] 喂进来 →      */
+/* 用户像 PDF 阅读器一样在图上拖动划词、Ctrl+C 复制。                  */
+/*                                                                    */
+/* 数据契约:                                                          */
+/*   - 图像: 单张 BGRA8 premultiplied 整图 (v1; 瓦块大图留扩展)        */
+/*   - quad: 顶级图像像素坐标, 4 顶点 TL,TR,BR,BL; 轴对齐 bbox 是      */
+/*     其特例, 支持任意凸四边形 (倾斜/透视文本)                        */
+/*   - items 数组顺序 == 阅读序 (宿主保证; 竖排/RTL 同理)              */
+/*   - 层级: block(段) > line(行) > item(词/行, OCR 给什么粒度就是什么)*/
+/*                                                                    */
+/* 复制拼接: 同行直连; 带 SPACE_AFTER 的词后加空格 (拉丁文); 跨行 \n;  */
+/* 跨 block \n\n; 选区末词不留尾分隔。                                 */
+/*                                                                    */
+/* 交互 (对齐 PDF 阅读器惯例):                                        */
+/*   单击(文字上或空白) = 清选区    文本上拖动 = 逐【字】划选          */
+/*   空白拖动 = 平移画布            双击 = 选中该词                    */
+/*   三击 = 选整行                  滚轮 = 以光标为锚缩放              */
+/*   旋转 90° 倍数 (set_rotation), 选区与高亮自动跟随                  */
+/*   Ctrl+C 复制 / Ctrl+A 全选 / Esc 清选区                            */
+/* 选择粒度恒为【字】: CHAR 粒度下宿主直喂字坐标, BLOCK 粒度下 lib 在  */
+/* 入口把块拆成字。双击靠 word 分组还原出"词"。                        */
+/* 所有 API 仅 UI 线程。                                              */
+/* ------------------------------------------------------------------ */
+
+/* item.flags 位定义 */
+#define UI_OCR_ITEM_SPACE_AFTER  (1u << 0)   /* 复制时该词后补一个空格 */
+
+typedef struct UiOcrTextItem {
+    const char* text;      /* UTF-8, lib 深拷贝, 调用后宿主可释放 */
+    float       quad[8];   /* 图像像素坐标: TLx,TLy, TRx,TRy, BRx,BRy, BLx,BLy */
+    uint32_t    block;     /* 段落分组 */
+    uint32_t    line;      /* 行分组 */
+    uint32_t    word;      /* 词分组: 同 block+line+word 的相邻 item = 一个词。
+                              CHAR 粒度下双击选词靠它 (一个词的各字填同值);
+                              BLOCK 粒度下忽略 (每个 item 自成一词)。
+                              注意: CHAR 粒度下若整行都填 0 (常见于零初始化
+                              后忘了赋值), 双击会选中【整行】—— 因为整行确实
+                              被当成了一个词。lib 不猜词边界, 这是宿主的责任。*/
+    uint32_t    flags;     /* UI_OCR_ITEM_* 位 */
+    uint32_t    reserved;  /* 置零 (对齐 + 预留) */
+} UiOcrTextItem;
+
+/* 喂入粒度。选择粒度始终是【字】—— 差别只在字坐标从哪来。 */
+typedef enum UiOcrGranularity {
+    /* 每个 item 是一个字 (主路径)。多数 OCR 引擎给得出单字坐标, 直接喂
+     * 最准。用 word 字段把字分成词, 双击才能选中整词。 */
+    UI_OCR_GRANULARITY_CHAR  = 0,
+    /* 每个 item 是一个词/行/块 (兼容路径)。lib 在入口把块按 UTF-8 码点拆
+     * 成字, quad 沿字向按字宽权重插值 (CJK/全角 1.0, 空白 0.35, 其余 0.55)。
+     * 中文全角等宽 → 拆分几乎精确, 而整行返回正是中文 OCR 常态; 拉丁文是
+     * 近似, 但拉丁引擎普遍已按词返回, 块很短, 误差影响小。
+     * 块内以 ASCII 空白分词, 中文无法分词故整块归一个词 (双击选整块)。 */
+    UI_OCR_GRANULARITY_BLOCK = 1,
+} UiOcrGranularity;
+
+/* 选区变化时同步 fire (UI 线程)。拿文本用 ui_ocr_img_view_selected_text。 */
+typedef void (*UiOcrSelectionCallback)(UiWidget w, void* userdata);
+
+UI_API UiWidget ui_ocr_img_view(void);
+
+/* 喂单张 BGRA8 premul 整图 (stride==0 按 w*4)。喂图后自动 Fit 并清空
+ * 旧文本/选区 (换图语义) — 先 set_image 再 set_text。
+ *
+ * 返回 0 成功, 非 0 失败:
+ *   -1 参数非法 (空指针 / 宽高为 0)
+ *   -2 尺寸超出 GPU 单张纹理上限 (典型 16384) —— 宿主须先降采样
+ *   -3 资源创建失败 (内存不足等)
+ * 务必检查返回值: 尺寸超限在旧版本里表现为"喂图成功但画面空白", 因为
+ * 资源存储只存 CPU 字节、D2D 位图要到绘制时才建。现在改为喂入即报错。*/
+UI_API int      ui_ocr_img_view_set_image(UiWidget w, UiWindow win,
+                                           const void* bgra, uint32_t width,
+                                           uint32_t height, uint32_t stride);
+UI_API void     ui_ocr_img_view_clear_image(UiWidget w);
+
+/* 喂/替换 OCR 结果。item_stride 传 sizeof(UiOcrTextItem) — 结构体尾部
+ * 未来加字段时, 旧编译的宿主传旧 stride 依然正确 (前向兼容惯用法)。
+ * granularity 见 UiOcrGranularity: 有单字坐标传 CHAR, 只有行/块框传 BLOCK。*/
+UI_API void     ui_ocr_img_view_set_text(UiWidget w, const UiOcrTextItem* items,
+                                          uint32_t count, size_t item_stride,
+                                          UiOcrGranularity granularity);
+UI_API void     ui_ocr_img_view_clear_text(UiWidget w);
+/* 当前生效的文本项数 = 【字】数。BLOCK 粒度下这是拆分后的结果, 通常远大于
+ * 宿主传入的 count; CHAR 粒度下等于传入的 count。 */
+UI_API uint32_t ui_ocr_img_view_item_count(UiWidget w);
+
+/* 当前选中文本 UTF-8。内部缓冲, 下次选区变化前有效; 无选区返 "" (非 NULL)。*/
+UI_API const char* ui_ocr_img_view_selected_text(UiWidget w);
+UI_API void     ui_ocr_img_view_select_all(UiWidget w);
+UI_API void     ui_ocr_img_view_clear_selection(UiWidget w);
+UI_API int      ui_ocr_img_view_has_selection(UiWidget w);
+/* 选中文本写系统剪贴板 (CF_UNICODETEXT), 等同用户按 Ctrl+C。返 1 成功。 */
+UI_API int      ui_ocr_img_view_copy_selection(UiWidget w);
+UI_API void     ui_ocr_img_view_on_selection_changed(UiWidget w,
+                                                      UiOcrSelectionCallback cb,
+                                                      void* userdata);
+
+/* ---- 宿主侧列表 ↔ 画布 双向联动 (build 277+) ----------------------
+ * 典型场景: 窗口左边是本 widget, 右边是宿主自己排的"识别结果行列表"。
+ * 点列表行 → select_range 让图上高亮对应文字; 图上划词 → selection_range
+ * + item_meta 反查行号 → 滚动/高亮右侧列表。
+ *
+ * 下标空间 = 【当前生效的字级 item】(item_count 的那个空间)。BLOCK 粒度
+ * 喂入时 lib 已把块拆成字, 宿主传入的块下标 ≠ 这里的下标 —— 用 item_meta
+ * 的 block/line/word 建映射, 别假设一一对应。 */
+
+/* 按阅读序闭区间设选区 [first,last]。first>last 自动交换, 越界 clamp 到
+ * 末项, 无数据时 no-op。走的是跟用户拖选同一条状态机, 会 fire
+ * selection_changed 回调。 */
+UI_API void     ui_ocr_img_view_select_range(UiWidget w, uint32_t first,
+                                              uint32_t last);
+/* 当前选区的 item 下标闭区间。有选区返 1 并写出 first/last; 无选区返 0
+ * (不写出参)。指针可为 NULL。 */
+UI_API int      ui_ocr_img_view_selection_range(UiWidget w, uint32_t* first,
+                                                 uint32_t* last);
+/* 取第 index 个 item 的分组元数据 (BLOCK 粒度拆字后仍保留原 block/line/
+ * word)。index 越界返 0, 成功返 1。指针可为 NULL。 */
+UI_API int      ui_ocr_img_view_item_meta(UiWidget w, uint32_t index,
+                                           uint32_t* block, uint32_t* line,
+                                           uint32_t* word);
+
+/* 视口 (语义对齐 ui_gh_img_view 同名 API) */
+UI_API void     ui_ocr_img_view_fit(UiWidget w);
+UI_API void     ui_ocr_img_view_reset(UiWidget w);
+UI_API void     ui_ocr_img_view_set_zoom(UiWidget w, float zoom);
+UI_API float    ui_ocr_img_view_get_zoom(UiWidget w);
+UI_API void     ui_ocr_img_view_set_pan(UiWidget w, float px, float py);
+UI_API void     ui_ocr_img_view_get_pan(UiWidget w, float* px, float* py);
+/* 旋转 (90° 倍数, 顺时针度数)。任意 int 会被规整到 0/90/180/270。
+ * zoom/pan 在旋转后保留; pan 存屏幕空间, 所以鼠标拖动方向始终匹配视觉方向。
+ * 选区与高亮自动跟随旋转 —— 文本 quad 是图像坐标, 换算时已含旋转。
+ * 典型用法: 手机横拍的照片 OCR 后转正阅读。 */
+UI_API void     ui_ocr_img_view_set_rotation(UiWidget w, int angle);
+UI_API int      ui_ocr_img_view_get_rotation(UiWidget w);
+/* 图像像素坐标 → 窗口 DIP 坐标 (随当前 zoom/pan)。宿主在选区旁定位
+ * 弹窗/工具条用。反向换算用 screen_to_image。 */
+UI_API void     ui_ocr_img_view_image_to_screen(UiWidget w, float ix, float iy,
+                                                 float* sx, float* sy);
+UI_API void     ui_ocr_img_view_screen_to_image(UiWidget w, float sx, float sy,
+                                                 float* ix, float* iy);
+/* 高亮填充色 RGBA (0~1)。不调用则用主题 accent + 0.35 alpha。 */
+UI_API void     ui_ocr_img_view_set_highlight_color(UiWidget w, float rr, float gg,
+                                                     float bb, float aa);
+
+/* ------------------------------------------------------------------ */
 /* IconButton (SVG icon button)                                      */
 /* ------------------------------------------------------------------ */
 UI_API UiWidget ui_icon_button(const char* svg, int ghost);
@@ -719,8 +898,16 @@ UI_API void     ui_titlebar_show_buttons(UiWidget titlebar, int showMin, int sho
 /* show=0 完全不画图标，标题文字滑到最左；show=1 走"用户设的→EXE 嵌入资源
    ID=1→不画"三段查找。默认 show=1。 */
 UI_API void     ui_titlebar_show_icon(UiWidget titlebar, int show);
-/* 显式设标题栏图标，覆盖 EXE 嵌入图标的自动加载。pixels 为 RGBA8888，
-   传 NULL 清掉，回到自动加载行为。 */
+/* 显式设标题栏图标，覆盖 EXE 嵌入图标的自动加载。传 NULL 清掉，回到自动
+   加载行为。
+
+   pixels 字节序是 **BGRA（预乘 alpha）**，即 0xAARRGGBB 的内存序，跟 Windows
+   32bpp top-down DIB / DrawIconEx 的输出一致 —— 从 HICON 拿像素可以直接传，
+   不要手动 swap R/B（build 291 之前这里的文档写成 "RGBA8888"，下游照字面
+   交换通道，橙色图标画成了蓝色）。
+
+   一般不需要调用：build 291 起 EXE 嵌入图标（资源 ID=1）自动加载走 128px
+   高分辨率 + 高质量缩小，任何 DPI 缩放都清晰。 */
 UI_API void     ui_titlebar_set_icon_pixels(UiWidget titlebar,
                                              const void* rgba, int width, int height);
 UI_API void     ui_titlebar_set_bg_color(UiWidget titlebar, UiColor color);
@@ -821,6 +1008,18 @@ UI_API const wchar_t* ui_text_area_get_text(UiWidget w);
 UI_API void           ui_text_area_set_text(UiWidget w, const wchar_t* text);
 UI_API void           ui_text_area_set_read_only(UiWidget w, int read_only);
 
+/* 宿主驱动的选区 (build 278) —— 外部数据源 ↔ 文本双向联动。典型场景:
+ * OCR 结果窗里图上划词 → 宿主把右侧文本框对应区间选中并滚到可见; 反过来
+ * 用户在文本框里拖选 → on_selection_changed 回调里读区间反查图上位置。
+ * start/end 是 UTF-16 码元下标; 顺序自动交换, 越界 clamp, 相等=清选区。
+ * set_selection 不会触发 on_selection_changed (避免联动回环)。 */
+UI_API void           ui_text_area_set_selection(UiWidget w, int start, int end);
+UI_API int            ui_text_area_get_selection(UiWidget w, int* start, int* end);
+typedef void (*UiTextAreaSelectionCallback)(UiWidget w, void* userdata);
+UI_API void           ui_text_area_on_selection_changed(UiWidget w,
+                                                         UiTextAreaSelectionCallback cb,
+                                                         void* userdata);
+
 /* ------------------------------------------------------------------ */
 /* ComboBox                                                           */
 /* ------------------------------------------------------------------ */
@@ -920,6 +1119,19 @@ UI_API void ui_widget_on_blur (UiWidget w,
                                 UiWidgetFocusCallback cb,
                                 void* userdata);
 
+/* build 287: 提交回调 (TextInput / TextArea 里按 Enter)。接
+ * Widget::onSubmitHook —— 跟 .uix 的 @submit 同一条路径。
+ *
+ * 存在理由: v-for 迭代体内的事件走 WireLoopScopeEvent, 那里只认 click /
+ * change / input / dblclick, @submit 接不上; 窗口级 ui_window_on_key 也够不着,
+ * 因为 TextInputWidget 的 OnKeyDown 会先把 VK_RETURN 消费掉并返回 true。
+ * 于是"在 v-for 里放输入框做行内编辑"这类界面拿不到 Enter。宿主用
+ * ui_widget_find_by_id 拿到输入框后直接挂这个回调即可。cb=NULL 解绑。
+ * 配合已有的 ui_widget_on_blur 就能做完整的行内编辑 (Enter 提交 / 失焦提交)。 */
+UI_API void ui_widget_on_submit(UiWidget w,
+                                 UiWidgetFocusCallback cb,
+                                 void* userdata);
+
 /* build 174: 编程式把键盘焦点设到 widget w (并亮焦点环, 视同键盘导航)。w=0 清焦点。
  * 供模态对话框初始焦点落在按钮上 + 方向键移焦点 (msgbox)。 */
 UI_API void ui_window_focus_widget(UiWindow win, UiWidget w);
@@ -940,6 +1152,41 @@ UI_API void ui_widget_on_mouse_wheel(UiWidget w,
                                        void* userdata);
 
 UI_API void ui_widget_on_click(UiWidget w, UiClickCallback cb, void* userdata);
+
+/* build 287: widget 级右键 (contextmenu) 回调。接 Widget::onContextMenuHook,
+ * 跟 .uix 的 @contextmenu 同一条路径 —— 右键抬起时从命中 widget 沿父链向上
+ * 冒泡, 第一个挂了 hook 的消费掉。x/y 是窗口 DIP 坐标, 可直接喂 ui_menu_show。
+ *
+ * 存在理由: `<menu trigger="#foo" event="rclick">` 的 trigger 是在页面初次
+ * wire 时按 selector 解析一次的。#foo 若在 v-if 里且当时没挂载, 解析失败后
+ * 不会补挂, 那个右键菜单从此永远打不开。列表类界面 (空态用 v-if 换一块提示)
+ * 正好撞上。逐行挂这个回调既绕开了 selector 的时序坑, 也顺带解决了"点的是
+ * 哪一行"—— 不用再靠 mouse_move 猜。cb=NULL 解绑。 */
+typedef void (*UiWidgetContextMenuCallback)(UiWidget w, float x, float y,
+                                             void* userdata);
+UI_API void ui_widget_on_context_menu(UiWidget w,
+                                       UiWidgetContextMenuCallback cb,
+                                       void* userdata);
+
+/* ------------------------------------------------------------------ */
+/* Drag & drop (build 259+) — HTML5 语义的控件间拖放                    */
+/* ------------------------------------------------------------------ */
+/* 源侧: set_draggable 后按住超过阈值(4 DIP)即开始拖动, 窗口画拖影;
+ * drag_data 是随拖动携带的字符串载荷 (UTF-8), 设置载荷隐含 draggable.
+ * 目标侧: set_drop_target 或挂 on_drop 即接受投放; 拖动悬停时 widget 进入
+ * CSS `:drag-over` 伪类状态. 对应 .uix 属性 draggable / drag-data /
+ * drop-target 和事件 @dragstart/@dragend/@dragenter/@dragover/@dragleave/
+ * @drop ($event.data 为载荷; @dragstart 里可改写 $event.data). */
+UI_API void ui_widget_set_draggable(UiWidget w, int draggable);
+UI_API void ui_widget_set_drag_data(UiWidget w, const wchar_t* data);
+UI_API void ui_widget_set_drop_target(UiWidget w, int accept);
+/* x/y 为 widget-local DIP. cb=NULL 解绑 (同时清除 on_drop 隐含的可投放态). */
+typedef void (*UiDropCallback)(UiWidget w, const wchar_t* data,
+                                float x, float y, void* userdata);
+UI_API void ui_widget_on_drop(UiWidget w, UiDropCallback cb, void* userdata);
+/* dropped: 1=落在有效目标并触发了 drop, 0=取消/落空. cb=NULL 解绑. */
+typedef void (*UiDragEndCallback)(UiWidget w, int dropped, void* userdata);
+UI_API void ui_widget_on_drag_end(UiWidget w, UiDragEndCallback cb, void* userdata);
 UI_API void ui_checkbox_on_changed(UiWidget w, UiValueCallback cb, void* userdata);
 UI_API void ui_slider_on_changed(UiWidget w, UiFloatCallback cb, void* userdata);
 UI_API void ui_toggle_on_changed(UiWidget w, UiValueCallback cb, void* userdata);
@@ -1075,6 +1322,14 @@ UI_API int   ui_debug_widget_is_visible(UiWidget w);
 UI_API int   ui_debug_click(UiWindow win, UiWidget w);
 UI_API int   ui_debug_click_at(UiWindow win, float x, float y);
 UI_API int   ui_debug_double_click(UiWindow win, UiWidget w);
+/* 按窗口坐标双击。走真实 WM_LBUTTONDBLCLK 路径 (@dblclick hook +
+ * Widget::OnMouseDoubleClick), 位置敏感的双击 (如图片划词选整行) 必须用
+ * 这个而不是 ui_debug_double_click (后者只能点 widget 中心)。 */
+UI_API int   ui_debug_double_click_at(UiWindow win, float x, float y);
+/* 带修饰键的按键注入。widget 的 OnKeyDown 多用 GetKeyState 判 Ctrl/Shift/
+ * Alt, 普通 ui_debug_key 只送 vk、修饰键读出来永远是"没按下" —— 组合键
+ * (Ctrl+C / Ctrl+A ...) 必须用这个。注入期间临时改线程键盘状态, 调用后还原。*/
+UI_API int   ui_debug_key_mod(UiWindow win, int vk, int ctrl, int shift, int alt);
 UI_API int   ui_debug_right_click(UiWindow win, UiWidget w);
 UI_API int   ui_debug_right_click_at(UiWindow win, float x, float y);
 UI_API int   ui_debug_hover(UiWindow win, UiWidget w);
@@ -1306,6 +1561,20 @@ UI_API void ui_asset_register_dir(const char* dir_utf8);
 UI_API void ui_asset_register_blob(const char* name, const void* bytes, size_t size);
 UI_API void ui_asset_register_resolver(UiAssetResolver fn, void* userdata);
 UI_API void ui_asset_reset(void);
+
+/* 让所有 src == name 且**上次解析失败**的 <img> 重新尝试 (自 1.7.0 build 286)。
+ *
+ * 为什么需要: ImageWidget 是惰性的 —— 第一次真正要画它时才调 resolver 解析,
+ * 失败后置一个闩锁不再每帧重试 (否则每帧一次 IO)。这对同步 resolver 没问题,
+ * 但**异步** resolver (宿主先返回失败, 数据从后台线程读上来之后才可用) 会被
+ * 这个闩锁永久钉死, 除非 src 变化。数据就绪后调本函数打开闩锁, 下一帧自然重试。
+ *
+ * 配合"惰性解析 + 视口剔除"(build 285) 可以做出真正的按需加载: 落在视口外的
+ * 行不绘制 → 不解析 → resolver 不会被问到; 滚到哪里才请求哪里的资源。宿主在
+ * resolver 里把未命中的名字入队交后台读, 读完对该名字调一次本函数即可。
+ *
+ * 只在 UI 线程调。name 没有任何匹配实例时是 no-op。 */
+UI_API void ui_asset_invalidate(const char* name);
 
 /* ------------------------------------------------------------------ */
 /* Page API — HTML + Vue-like declarative pages                       */

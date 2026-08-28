@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 set(UI_CORE_VERSION "1.7.0")
-set(UI_CORE_INTERNAL_VERSION "253")
+set(UI_CORE_INTERNAL_VERSION "293")
 project(core-ui-project VERSION ${UI_CORE_VERSION} LANGUAGES C CXX)
 
 set(UI_CORE_VERSION_TAG "v${PROJECT_VERSION}")
@@ -81,10 +81,15 @@ set(UI_CORE_SOURCES
     src/ui/image_view_gdi.cpp
     src/ui/image_view_plus.cpp
     src/ui/gh_img_view.cpp
+    src/ui/ocr_text_model.cpp
+    src/ui/ocr_img_view.cpp
     src/ui/image_source.cpp
     src/ui/image_source_bitmap.cpp
     src/ui/image_source_svg.cpp
     src/ui/svg_style_inliner.cpp
+    src/ui/svg_dom.cpp
+    src/ui/svg_d2d_segments.cpp
+    src/ui/image_shadow_geom.cpp
     src/ui/image_source_gif.cpp
     src/ui/image_source_tiled.cpp
     src/ui/handle_table.cpp
@@ -130,7 +135,7 @@ set(UI_CORE_SOURCES
     src/ui/page/svg_widget.cpp
 )
 
-set(UI_CORE_SYSTEM_LIBS d2d1 d3d11 dxgi dxguid dwrite dwmapi uxtheme windowscodecs shlwapi gdiplus)
+set(UI_CORE_SYSTEM_LIBS d2d1 d3d11 dxgi dxguid dwrite dwmapi uxtheme windowscodecs shlwapi gdiplus imm32)
 
 if(WIN32)
     function(ui_core_add_version_resource target file_desc internal_name original_name file_type)
@@ -216,6 +221,24 @@ ui_core_embed_text(ui-demo-uix FILE demo/ui_demo.uix         OUT app_uix.embed.h
 ui_core_embed_text(ui-demo-uix FILE demo/lang/ui_demo_zh.lang OUT lang_zh.embed.h VAR k_lang_zh)
 ui_core_embed_text(ui-demo-uix FILE demo/lang/ui_demo_en.lang OUT lang_en.embed.h VAR k_lang_en)
 
+# ---- ocr-demo.exe — ui_ocr_img_view 图片划词集成 demo ----
+add_executable(ocr-demo WIN32 EXCLUDE_FROM_ALL
+    demo/ocr_demo.cpp
+)
+target_link_libraries(ocr-demo PRIVATE core-ui)
+target_include_directories(ocr-demo PRIVATE include)
+
+# ---- ocr-uix-demo.exe — <ocr-img-view> 的 .uix 声明式集成 demo ----
+# 画布在 .uix 里声明, 宿主 find_by_id 后喂数据; 附带"行列表 ↔ 画布"双向
+# 联动 (select_range / selection_range / item_meta) 的可自动化验证。
+add_executable(ocr-uix-demo WIN32 EXCLUDE_FROM_ALL
+    demo/ocr_uix_demo.cpp
+)
+target_link_libraries(ocr-uix-demo PRIVATE core-ui)
+target_include_directories(ocr-uix-demo PRIVATE include)
+ui_core_embed_text(ocr-uix-demo FILE demo/ocr_uix_demo.uix
+    OUT ocr_uix_demo_uix.embed.h VAR k_ocr_uix_demo_uix)
+
 set(UI_CORE_VERSION_DEFS
     UI_CORE_VERSION_TAG="${UI_CORE_VERSION_TAG}"
     UI_CORE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
@@ -235,14 +258,84 @@ endif()
 option(UI_CORE_BUILD_INTERNAL_TESTS
     "Build internal regression test targets when test/ is available" ON)
 if(UI_CORE_BUILD_INTERNAL_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/src/svg_normalize_test.cpp")
+    # 测试全部用 assert() 断言。Release 构建带 /DNDEBUG 会把 assert 编成空操作 ——
+    # 那样测试只会打印 PASS 而什么都不检查 (2026-07 发现: 全部 9 个测试目标已空跑
+    # 了很久)。/UNDEBUG 撤销该宏, 让断言在任何 CMAKE_BUILD_TYPE 下都真正生效。
+    # 新增测试目标务必调用它。
+    function(ui_core_mark_test target)
+        target_compile_options(${target} PRIVATE /UNDEBUG)
+    endfunction()
+
     add_executable(svg_normalize_test EXCLUDE_FROM_ALL
         test/src/svg_normalize_test.cpp
         src/ui/svg_style_inliner.cpp
         src/ui/css/css_parser.cpp
         src/ui/css/selector.cpp
+        src/ui/css/value.cpp
     )
     target_compile_definitions(svg_normalize_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_include_directories(svg_normalize_test PRIVATE src)
+    ui_core_mark_test(svg_normalize_test)
+
+    # ---- 从 test/CMakeLists.txt 迁回来的纯逻辑测试 ----------------------------
+    # 那个文件从来没被 add_subdirectory 过, 里面的目标一个都构建不到, 这 5 个测试
+    # 就此静静躺了很久 (2026-07-30 发现)。测试目标只能定义在本文件里。
+    add_executable(flex_test EXCLUDE_FROM_ALL
+        test/src/flex_test.cpp
+        src/ui/flex/flex.cpp
+    )
+    target_compile_definitions(flex_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(flex_test PRIVATE src)
+    ui_core_mark_test(flex_test)
+
+    add_executable(css_parser_test EXCLUDE_FROM_ALL
+        test/src/css_parser_test.cpp
+        src/ui/css/css_parser.cpp
+    )
+    target_compile_definitions(css_parser_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(css_parser_test PRIVATE src)
+    ui_core_mark_test(css_parser_test)
+
+    add_executable(css_match_test EXCLUDE_FROM_ALL
+        test/src/css_match_test.cpp
+        src/ui/css/css_parser.cpp
+        src/ui/css/selector.cpp
+        src/ui/css/value.cpp
+        src/ui/css/cascade.cpp
+    )
+    target_compile_definitions(css_match_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(css_match_test PRIVATE src)
+    ui_core_mark_test(css_match_test)
+
+    add_executable(expr_rewriter_test EXCLUDE_FROM_ALL
+        test/src/expr_rewriter_test.cpp
+        src/ui/uix/expr_rewriter.cpp
+    )
+    target_compile_definitions(expr_rewriter_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(expr_rewriter_test PRIVATE src)
+    ui_core_mark_test(expr_rewriter_test)
+
+    add_executable(reactive_test EXCLUDE_FROM_ALL
+        test/src/reactive_test.cpp
+        src/ui/reactive/binding.cpp
+    )
+    target_compile_definitions(reactive_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(reactive_test PRIVATE src)
+    ui_core_mark_test(reactive_test)
+
+    # 属性动画"按属性取消"语义。animation.cpp 会经 GetContext() 回窗口层,
+    # 单独编两个 .cpp 链不上, 所以跟 image_cpu_backing_test 一样链整个 lib。
+    add_executable(property_anim_cancel_test EXCLUDE_FROM_ALL
+        test/src/property_anim_cancel_test.cpp
+    )
+    target_compile_definitions(property_anim_cancel_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(property_anim_cancel_test PRIVATE src)
+    ui_core_mark_test(property_anim_cancel_test)
+    if(TARGET core-ui-static)
+        target_link_libraries(property_anim_cancel_test PRIVATE core-ui-static)
+    else()
+        target_link_libraries(property_anim_cancel_test PRIVATE core-ui)
+    endif()
 
     add_executable(frame_scheduler_test EXCLUDE_FROM_ALL
         test/src/frame_scheduler_test.cpp
@@ -250,12 +343,14 @@ if(UI_CORE_BUILD_INTERNAL_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/src
     )
     target_compile_definitions(frame_scheduler_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_include_directories(frame_scheduler_test PRIVATE src)
+    ui_core_mark_test(frame_scheduler_test)
 
     add_executable(image_cpu_backing_test EXCLUDE_FROM_ALL
         test/src/image_cpu_backing_test.cpp
     )
     target_compile_definitions(image_cpu_backing_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_include_directories(image_cpu_backing_test PRIVATE src)
+    ui_core_mark_test(image_cpu_backing_test)
     if(TARGET core-ui-static)
         target_link_libraries(image_cpu_backing_test PRIVATE core-ui-static)
     else()
@@ -267,6 +362,7 @@ if(UI_CORE_BUILD_INTERNAL_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/src
     )
     target_compile_definitions(render_recovery_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_include_directories(render_recovery_test PRIVATE src)
+    ui_core_mark_test(render_recovery_test)
     if(TARGET core-ui-static)
         target_link_libraries(render_recovery_test PRIVATE core-ui-static)
     else()
@@ -278,6 +374,7 @@ if(UI_CORE_BUILD_INTERNAL_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/src
     )
     target_compile_definitions(resource_store_budget_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_include_directories(resource_store_budget_test PRIVATE src)
+    ui_core_mark_test(resource_store_budget_test)
     if(TARGET core-ui-static)
         target_link_libraries(resource_store_budget_test PRIVATE core-ui-static)
     else()
@@ -289,21 +386,98 @@ if(UI_CORE_BUILD_INTERNAL_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/src
     )
     target_compile_definitions(svg_text_path_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_include_directories(svg_text_path_test PRIVATE src)
+    ui_core_mark_test(svg_text_path_test)
     if(TARGET core-ui-static)
         target_link_libraries(svg_text_path_test PRIVATE core-ui-static)
     else()
         target_link_libraries(svg_text_path_test PRIVATE core-ui)
     endif()
 
+    # 图片阴影几何: 纯算术, 不碰 D2D。
+    add_executable(image_shadow_geom_test EXCLUDE_FROM_ALL
+        test/src/image_shadow_geom_test.cpp
+        src/ui/image_shadow_geom.cpp
+    )
+    target_compile_definitions(image_shadow_geom_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(image_shadow_geom_test PRIVATE src)
+    ui_core_mark_test(image_shadow_geom_test)
+
+    # 最小 SVG DOM 是无依赖的纯逻辑模块, 直接编源文件, 不必链整个 core-ui。
+    add_executable(svg_dom_test EXCLUDE_FROM_ALL
+        test/src/svg_dom_test.cpp
+        src/ui/svg_dom.cpp
+    )
+    target_compile_definitions(svg_dom_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(svg_dom_test PRIVATE src)
+    ui_core_mark_test(svg_dom_test)
+
+    add_executable(svg_d2d_segments_test EXCLUDE_FROM_ALL
+        test/src/svg_d2d_segments_test.cpp
+        src/ui/svg_d2d_segments.cpp
+        src/ui/svg_dom.cpp
+    )
+    target_compile_definitions(svg_d2d_segments_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(svg_d2d_segments_test PRIVATE src)
+    ui_core_mark_test(svg_d2d_segments_test)
+
     add_executable(svg_drop_shadow_layer_test EXCLUDE_FROM_ALL
         test/src/svg_drop_shadow_layer_test.cpp
     )
     target_compile_definitions(svg_drop_shadow_layer_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_include_directories(svg_drop_shadow_layer_test PRIVATE src)
+    ui_core_mark_test(svg_drop_shadow_layer_test)
     if(TARGET core-ui-static)
         target_link_libraries(svg_drop_shadow_layer_test PRIVATE core-ui-static)
     else()
         target_link_libraries(svg_drop_shadow_layer_test PRIVATE core-ui)
+    endif()
+
+    add_executable(ocr_text_model_test EXCLUDE_FROM_ALL
+        test/src/ocr_text_model_test.cpp
+        src/ui/ocr_text_model.cpp
+    )
+    target_compile_definitions(ocr_text_model_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(ocr_text_model_test PRIVATE src)
+    ui_core_mark_test(ocr_text_model_test)
+
+    # 宿主联动 C API (select_range / selection_range / item_meta) 走真实
+    # C ABI, 所以链 lib 而不是只编 model 源文件。
+    add_executable(ocr_c_api_test EXCLUDE_FROM_ALL
+        test/src/ocr_c_api_test.cpp
+    )
+    target_compile_definitions(ocr_c_api_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(ocr_c_api_test PRIVATE include)
+    ui_core_mark_test(ocr_c_api_test)
+    if(TARGET core-ui-static)
+        target_link_libraries(ocr_c_api_test PRIVATE core-ui-static)
+    else()
+        target_link_libraries(ocr_c_api_test PRIVATE core-ui)
+    endif()
+
+    add_executable(combo_box_dropdown_test EXCLUDE_FROM_ALL
+        test/src/combo_box_dropdown_test.cpp
+    )
+    target_compile_definitions(combo_box_dropdown_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(combo_box_dropdown_test PRIVATE src)
+    ui_core_mark_test(combo_box_dropdown_test)
+    if(TARGET core-ui-static)
+        target_link_libraries(combo_box_dropdown_test PRIVATE core-ui-static)
+    else()
+        target_link_libraries(combo_box_dropdown_test PRIVATE core-ui)
+    endif()
+
+    # build 285: Widget 的批量子节点原语 (ReplaceChildRange / RemoveChildren)。
+    # 纯下标算术, 错了不崩只错位, 必须钉住边界与顺序。
+    add_executable(widget_children_test EXCLUDE_FROM_ALL
+        test/src/widget_children_test.cpp
+    )
+    target_compile_definitions(widget_children_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_include_directories(widget_children_test PRIVATE src)
+    ui_core_mark_test(widget_children_test)
+    if(TARGET core-ui-static)
+        target_link_libraries(widget_children_test PRIVATE core-ui-static)
+    else()
+        target_link_libraries(widget_children_test PRIVATE core-ui)
     endif()
 endif()
 

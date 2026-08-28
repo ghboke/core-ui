@@ -345,8 +345,12 @@ ui_debug_screenshot_menu(win, L"menu.png");                   // 弹出的菜单
 // 鼠标 / 键盘
 ui_debug_click(win, btn);                         // 完整 MouseDown+Up，触发 onClick
 ui_debug_right_click_at(win, 300, 200);           // 右键弹菜单
+ui_debug_double_click_at(win, 150, 178);          // 按坐标双击，走真实 WM_LBUTTONDBLCLK
+                                                  // （连点两次 click 进不了双击分支）
 ui_debug_focus(win, inputBox);
 ui_debug_type_text(win, L"hello");                // 逐字符输入
+ui_debug_key_mod(win, 'C', 1, 0, 0);              // Ctrl+C；组合键必须用这个，
+                                                  // ui_debug_key 送不出修饰键状态
 
 // 控件高层操作
 ui_debug_checkbox_set(win, cb, 1);                // 勾选 + 触发 onValueChanged

@@ -226,9 +226,18 @@ class UI_API ImageWidget : public Widget {
 public:
     enum class Fit { Fill, Contain, Cover, None };
 
-    ImageWidget() = default;
+    ImageWidget();
     ~ImageWidget() override;
-    explicit ImageWidget(const std::string& src) : src_(src) {}
+    explicit ImageWidget(const std::string& src);
+
+    /* 让所有 src == name 且上次解析失败的实例重新尝试 (build 286)。
+     *
+     * 用途: 宿主的 asset resolver 是异步喂数据的 —— 第一次被问到时字节还没
+     * 从磁盘读上来, 只能返回失败; 而 loadFailed_ 会把这个 widget 永久钉死,
+     * 除非 src 变化。数据就绪后调这个把闩锁打开, 下一帧自然重试。
+     *
+     * 只在 UI 线程调。 */
+    static void RetryFailedLoads(const std::string& name);
 
     // HTML <img src="logo.png"> 解析时调，name 是 asset registry 里的 key
     void SetSrc(const std::string& src);
@@ -271,6 +280,7 @@ public:
     bool OnKeyChar(wchar_t ch) override;
     bool OnKeyDown(int vk) override;
     D2D1_SIZE_F SizeHint() const override;
+    bool GetCaretRect(D2D1_RECT_F* out) const override;
 
     bool focused = false;
     bool readOnly = false;
@@ -295,6 +305,83 @@ private:
     std::wstring GetSelectedText() const;
     void SetClipboardText(const std::wstring& text);
     std::wstring GetClipboardText();
+};
+
+// ---- ChipsInput (single-line template editor: atomic chips + free text) ----
+// Value() serializes to a template string where each chip is `{key}` and free
+// text is literal (e.g. `{filename} - {width}x{height}`). Chips are atomic:
+// caret skips over them, Backspace/Delete first selects then removes, they can
+// be reordered by dragging inside the widget, and external drags (the window
+// DnD framework, payload = chip key) drop in as new chips at the caret the
+// cursor points at. Chip keys can be given display labels via SetChipLabels
+// ("key=label;key2=label2") — labels are presentation-only, Value() always
+// serializes keys.
+class UI_API ChipsInputWidget : public Widget {
+public:
+    explicit ChipsInputWidget(const std::wstring& placeholder = L"");
+
+    std::wstring Value() const;
+    void SetValue(const std::wstring& tpl);
+    void SetChipLabels(const std::wstring& spec);
+    void InsertChip(const std::wstring& key);     // at current caret
+    void SetPlaceholder(const std::wstring& p) { placeholder_ = p; }
+
+    void ResetCaretBlink();
+    bool ShouldShowCaret() const;
+    // Cursor dispatch (WM_SETCURSOR): true when windowX (DIP) is over a chip
+    // pill / over the hovered chip's × close zone.
+    bool IsOverChip(MeasureContext& m, float windowX) const;
+    bool IsOverChipClose(MeasureContext& m, float windowX) const;
+    // True while a chip is being drag-reordered (past threshold) — the
+    // window shows the move cursor for the duration of the gesture.
+    bool IsDraggingChip() const { return dragChip_ >= 0 && dragMoved_; }
+
+    void OnDraw(Renderer& r) override;
+    bool OnMouseDown(const MouseEvent& e) override;
+    bool OnMouseMove(const MouseEvent& e) override;
+    bool OnMouseUp(const MouseEvent& e) override;
+    bool OnKeyChar(wchar_t ch) override;
+    bool OnKeyDown(int vk) override;
+    D2D1_SIZE_F SizeHint() const override;
+    bool GetCaretRect(D2D1_RECT_F* out) const override;
+
+    bool readOnly = false;
+
+private:
+    // One element = a chip (atomic, s = key) or a single text character.
+    struct Elem { bool chip; std::wstring s; };
+    std::vector<Elem> elems_;
+    std::wstring placeholder_;
+    std::vector<std::pair<std::wstring, std::wstring>> chipLabels_;
+    int caret_ = 0;            // element boundary index [0..elems_.size()]
+    int selAnchor_ = -1;       // selection anchor boundary (-1 = no selection)
+    bool selecting_ = false;   // mouse-drag selection in progress
+    int selectedChip_ = -1;    // chip armed for deletion (backspace stage 1)
+    int hoverChip_ = -1;       // chip under cursor (draws the × affordance)
+    int dragChip_ = -1;        // chip being reordered (internal drag)
+    bool dragMoved_ = false;
+    int dropCaret_ = -1;       // insertion boundary highlighted during drags
+    float scrollX_ = 0;
+    float pressX_ = 0, pressY_ = 0;
+    float dragMx_ = 0, dragMy_ = 0;   // cursor pos during chip reorder (ghost)
+    uint64_t caretBlinkStartTick_ = 0;
+
+    const std::wstring& ChipLabel(const std::wstring& key) const;
+    float ChipFontSize() const;
+    float ElemWidth(MeasureContext& m, const Elem& el, float fontSize) const;
+    // Boundary x positions (content-local, before scroll): out has size()+1.
+    void BoundaryXs(MeasureContext& m, std::vector<float>& out) const;
+    int BoundaryFromX(MeasureContext& m, float localX) const;
+    int ChipIndexAt(MeasureContext& m, float localX, float localY, bool* onClose) const;
+    void EnsureCaretVisible(MeasureContext& m);
+    void Mutated();            // fire onTextChanged with Value()
+    void RemoveChip(int idx);
+    bool HasSelection() const {
+        return selAnchor_ >= 0 && selAnchor_ != caret_;
+    }
+    void ClearSelection() { selAnchor_ = -1; selecting_ = false; }
+    void DeleteSelection();    // erase selected element range, caret to start
+    std::wstring SerializeRange(int a, int b) const;
 };
 
 // ---- TextArea (multi-line text input) ----
@@ -323,6 +410,7 @@ public:
     bool OnKeyChar(wchar_t ch) override;
     bool OnKeyDown(int vk) override;
     D2D1_SIZE_F SizeHint() const override;
+    bool GetCaretRect(D2D1_RECT_F* out) const override;
 
     bool focused = false;
     bool readOnly = false;
@@ -330,6 +418,15 @@ public:
     int maxLength = -1;
 
     bool NeedsScrollbar() const;
+
+    /* 宿主驱动的选区 (build 278) —— 让"外部数据源 ↔ 文本"双向联动可做:
+     * 例如 OCR 场景里图上划词后, 宿主把对应文本区间选中并滚到可见。
+     * start/end 是 UTF-16 码元下标, 自动交换与 clamp; start==end 清选区。 */
+    void SetSelectionRange(int start, int end);
+    bool SelectionRange(int* start, int* end) const;   /* 无选区返 false */
+    /* 用户交互 (拖选 / Shift+方向 / Ctrl+A) 导致选区变化时 fire, UI 线程。
+     * 宿主自己调 SetSelectionRange 不 fire —— 避免联动回环。 */
+    std::function<void()> onSelectionChanged;
 
 private:
     std::wstring text_;
@@ -426,6 +523,7 @@ public:
     bool OnMouseDown(const MouseEvent& e) override;
     bool OnMouseMove(const MouseEvent& e) override;
     bool OnMouseUp(const MouseEvent& e) override;
+    bool OnMouseWheel(const MouseEvent& e) override;
     D2D1_SIZE_F SizeHint() const override;
 
     std::function<void(int)> onSelectionChanged;
@@ -433,14 +531,27 @@ public:
     float ItemHeight() const { return itemHeight_; }
     int ItemCount() const { return (int)items_.size(); }
     D2D1_RECT_F DropdownRect() const;
+    int DropdownItemAt(float x, float y) const;
 
 private:
+    struct DropdownLayout {
+        D2D1_RECT_F rect{};
+        int visibleRows = 0;
+        bool opensUpward = false;
+    };
+
+    DropdownLayout ComputeDropdownLayout_() const;
+    void OpenDropdown_();
+    void ClampDropdownScroll_(int visibleRows);
+
     std::vector<std::wstring> items_;
     std::vector<std::string>  i18nKeys_;   // L83: parallel to items_; "" = literal
     int selectedIndex_ = 0;
     int hoveredIndex_ = -1;
+    int dropdownScrollIndex_ = 0;
     bool open_ = false;
     float itemHeight_ = 28.0f;
+    static constexpr int kMaxVisibleRows = 12;
 };
 
 // ---- TabControl ----
@@ -476,7 +587,14 @@ public:
     void SetContent(WidgetPtr content);
 
     float ScrollY() const { return scrollY_; }
-    void SetScrollY(float y) { scrollY_ = y; ClampScroll(); }
+    /* 走与鼠标滚动同一条纯偏移路径 (build 285) —— 此前只改字段不动 rect,
+     * 内容要等下一次全局布局才归位, 长列表里那次布局就是每帧 O(n) 的来源。 */
+    void SetScrollY(float y) {
+        const float oldScroll = scrollY_;
+        scrollY_ = y;
+        ClampScroll();
+        ApplyScrollDelta_(oldScroll);
+    }
 
     void OnDraw(Renderer& r) override;
     void DrawTree(Renderer& r) override;
@@ -502,6 +620,15 @@ private:
 
     float ThumbWidth() const { return (hoveringBar_ || draggingThumb_) ? kThumbWide : kThumbThin; }
     void ClampScroll();
+
+    /* 纯滚动路径 (build 285): 只有 scrollY_ 变了、内容一个字没动时用。
+     * DoLayout() 会跑两遍 content_->DoLayout() (一遍量高度一遍定位) 外加一次
+     * 全子树递归 measure —— 2000 行实测 2.0ms/帧, 而滚动根本不改变任何尺寸。
+     * 这里改成把整棵子树的 rect 平移 delta, 同样 O(n) 但常数小一个量级。
+     *
+     * 调用方: 三个鼠标 handler (滚轮 / 拖 thumb / 点轨道跳转) —— 它们按定义
+     * 只改偏移。内容变化仍然走完整的 DoLayout()。 */
+    void ApplyScrollDelta_(float oldScrollY);
     float VisibleHeight() const;
     D2D1_RECT_F ThumbRect() const;
 };
@@ -969,8 +1096,6 @@ private:
     bool exeIconAttempted_ = false;
     ResourceKey userIconResourceKey_;
     ResourceKey exeIconResourceKey_;
-    uint64_t userIconGeneration_ = 0;
-    uint64_t exeIconGeneration_ = 0;
     int userIconW_ = 0;
     int userIconH_ = 0;
 };

@@ -49,6 +49,8 @@ export default {
       // ---- Events page ----
       lastEvent: "(none)",
       eventCount: 0,
+      dropLog: "drop here",
+      tplValue: "{alpha} - x",
       menuTransparent: true,
       menuBlur: 22,
 
@@ -113,16 +115,37 @@ export default {
     // Events
     probe(name, ev) {
       this.eventCount++;
-      var pos = ev && typeof ev === "object" && "x" in ev
-              ? ` @(${Math.round(ev.x)},${Math.round(ev.y)})` : "";
-      var dl  = ev && typeof ev === "object" && ev.delta
-              ? ` Δ${ev.delta}` : "";
-      this.lastEvent = `${name}${pos}${dl}`;
+      var s = name;
+      if (ev && typeof ev === "object") {
+        if ("offsetX" in ev)
+          s += ` off(${Math.round(ev.offsetX)},${Math.round(ev.offsetY)})` +
+               ` cli(${Math.round(ev.clientX)},${Math.round(ev.clientY)})`;
+        if (ev.deltaY || ev.deltaX)
+          s += ` ΔY${ev.deltaY} ΔX${ev.deltaX}`;
+        if ("button" in ev) s += ` btn=${ev.button}/${ev.buttons}`;
+        var mods = (ev.ctrlKey ? "C" : "") + (ev.shiftKey ? "S" : "") +
+                   (ev.altKey ? "A" : "");
+        if (mods) s += ` [${mods}]`;
+      }
+      this.lastEvent = s;
     },
     onClick($e)     { this.probe("click",     $e); },
     onDblClick($e)  { this.probe("dblclick",  $e); },
     onMouseDown($e) { this.probe("mousedown", $e); },
     onMouseUp($e)   { this.probe("mouseup",   $e); },
+    onMouseMove($e) { this.probe("mousemove", $e); },
+    onMouseEnter($e){ this.probe("mouseenter",$e); },
+    onMouseLeave()  { this.probe("mouseleave", null); },
+    onCtxMenu($e)   { this.probe("contextmenu", $e); },
+    onDragStart($e) { $e.data = "dynamic-" + this.eventCount; this.probe("dragstart", $e); },
+    onDragEnd($e)   { this.probe("dragend(" + $e + ")", null); },
+    onDragEnter($e) { this.probe("dragenter", $e); },
+    onDragLeave()   { this.probe("dragleave", null); },
+    onDrop($e)      {
+      this.dropLog = "got: " + $e.data +
+                     " @(" + Math.round($e.offsetX) + "," + Math.round($e.offsetY) + ")";
+      this.probe("drop", $e);
+    },
     onWheel($e)     { this.probe("wheel",     $e); },
     onFocus()       { this.probe("focus",     null); },
     onBlur()        { this.probe("blur",      null); },
@@ -220,6 +243,15 @@ export default {
               min-height: 96px; align-items: center; }
   .evlog    { padding: 8px 12px; background: var(--bg-2); border-radius: 4px;
               font-size: 12px; color: var(--fg); }
+
+  /* drag & drop demo */
+  .dnd-row  { flex-direction: row; gap: 8px; align-items: center; }
+  .dragchip { padding: 5px 14px; border-radius: 14px; background: var(--bg-2);
+              border: 1px solid var(--border-subtle); font-size: 12px; }
+  .dragchip:hover { background: var(--bg-3); }
+  .dropzone { height: 64px; border: 2px dashed var(--border-subtle);
+              border-radius: 8px; align-items: center; justify-content: center; }
+  .dropzone:drag-over { border-color: var(--accent); background: var(--bg-3); }
 
   /* progress bar — flex of 2 divs simulates filled/empty track */
   .pbar     { flex-direction: row; height: 8; border-radius: 4;
@@ -576,10 +608,31 @@ export default {
           <input v-model="name" @focus="onFocus" @blur="onBlur"
                  placeholder="focus / blur"/>
           <div id="evboxRoot" class="evbox" @mousedown="onMouseDown" @mouseup="onMouseUp"
-               @wheel="onWheel" @click="onClick">
+               @wheel="onWheel" @click="onClick" @mousemove="onMouseMove"
+               @mouseenter="onMouseEnter" @mouseleave="onMouseLeave"
+               @contextmenu="onCtxMenu">
             {{ $t('events_box') }}
           </div>
           <label class="evlog">{{ eventCount }} {{ $t('events_count') }} · {{ $t('events_last') }}: {{ lastEvent }}</label>
+
+          <div class="sep"/>
+          <label class="h2">Drag &amp; Drop</label>
+          <div class="dnd-row">
+            <label id="chipA" class="dragchip" drag-data="alpha">alpha</label>
+            <label id="chipB" class="dragchip" drag-data="beta">beta</label>
+            <label id="chipC" class="dragchip" draggable="true"
+                   @dragstart="onDragStart" @dragend="onDragEnd">dynamic</label>
+          </div>
+          <div id="dropZone" class="dropzone" @drop="onDrop"
+               @dragenter="onDragEnter" @dragleave="onDragLeave">
+            <label class="lbl">{{ dropLog }}</label>
+          </div>
+
+          <label class="h2">ChipsInput</label>
+          <chips-input id="chipsDemo" v-model="tplValue"
+                       chip-labels="alpha=Alpha 变量;beta=Beta"
+                       placeholder="type text or drop chips here"/>
+          <label class="evlog">value: {{ tplValue }}</label>
 
           <!-- build 75/130 (L73) BREAKING 后的菜单语法：@click 事件 + 文本包 <label>。
                旧写法 onclick="..." + 裸文本运行时建不出菜单项（弹出空矩形）。 -->

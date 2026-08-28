@@ -125,6 +125,10 @@ public:
                          float durationMs = 300.0f,
                          EasingFunction easing = EasingFunction::EaseOutCubic,
                          std::function<void()> onComplete = nullptr);
+    // 掐掉 target 上驱动 prop 的那条动画 (其他属性不受影响)。
+    // 任何"绕过动画直接写属性值"的路径都必须先调它, 否则在飞的动画下一帧会把
+    // 值覆盖回去 —— 表现成"最后一次写丢了"(下游 GuoheView bug-070)。
+    void CancelPropertyAnimation(Widget* target, AnimProperty prop);
 
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -229,6 +233,18 @@ private:
     AnimationManager propertyAnimations_;
     uint64_t    lastAnimationFrameTick_ = 0;
 
+    // Drag & drop (HTML5-style; see Widget draggable/onDrop* hooks)
+    Widget*     dragSource_ = nullptr;      // draggable widget under the press
+    Widget*     dragOverTarget_ = nullptr;  // drop target currently hovered
+    bool        dragActive_ = false;        // press exceeded the drag threshold
+    float       dragStartX_ = 0, dragStartY_ = 0;
+    float       dragX_ = 0, dragY_ = 0;     // current drag cursor pos (ghost)
+    std::wstring dragPayload_;
+    std::wstring dragGhostText_;  // ghost pill 显示文本: 源 Label 文本优先, 回落 payload
+    static constexpr float kDragThresholdDip = 4.0f;
+    void UpdateDragOverTarget(const MouseEvent& e);
+    void FinishDrag(bool dropped, const MouseEvent& e);
+
     // Tooltip
     Widget*     tooltipWidget_ = nullptr;
     DWORD       hoverStartTick_ = 0;
@@ -292,7 +308,19 @@ public:
     void SimMouseDown(float dipX, float dipY);
     void SimMouseUp(float dipX, float dipY);
     void SimMouseWheel(float dipX, float dipY, float delta);
+    /* 走真实的 WM_LBUTTONDBLCLK 路径 (OnMouseDoubleClick → @dblclick hook +
+     * Widget::OnMouseDoubleClick 冒泡)。连点两次 SimMouseDown/Up 不等价 ——
+     * 那条路只触发 onClick, 永远进不了双击分支。 */
+    void SimMouseDoubleClick(float dipX, float dipY);
     void SimRightClick(float dipX, float dipY);
+    void DispatchContextMenu(float dipX, float dipY);
+    /* IME: 把系统输入法 composition/候选窗钉到焦点控件光标处
+     * (WM_IME_STARTCOMPOSITION / WM_IME_COMPOSITION 时调用). */
+    void UpdateImeCompositionPos();
+    /* IME 组字进行中 (START..ENDCOMPOSITION 之间)。组字期间的按键属于输入法
+     * (删组字串/翻页/选字), 不得再转发给焦点控件 — 否则退格会同时删掉已落定
+     * 的文本。 */
+    bool imeComposing_ = false;
     void SimKeyDown(int vk);
     void SimKeyChar(wchar_t ch);
 
