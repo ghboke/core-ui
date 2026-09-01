@@ -937,6 +937,30 @@ WidgetPtr ConstructByTag(const std::string& tag, const std::string& text,
     if (tag == "li") {
         return std::make_shared<HBoxWidget>();
     }
+    if (tag == "Stack" || tag == "stack") {
+        return std::make_shared<StackWidget>();
+    }
+    if (tag == "SplitView" || tag == "split-view") {
+        auto split = std::make_shared<SplitViewWidget>();
+        for (const auto& a : node.attrs) {
+            if (a.kind != ui::uix::AttrKind::Static) continue;
+            if (a.name == "mode") {
+                if (a.rawValue == "overlay") split->SetDisplayMode(SplitViewMode::Overlay);
+                else if (a.rawValue == "inline") split->SetDisplayMode(SplitViewMode::Inline);
+                else if (a.rawValue == "compactOverlay") split->SetDisplayMode(SplitViewMode::CompactOverlay);
+                else if (a.rawValue == "compactInline") split->SetDisplayMode(SplitViewMode::CompactInline);
+            } else if (a.name == "openPaneLength" || a.name == "open-pane-length") {
+                const float length = ResolvePx(a.rawValue);
+                if (length > 0.0f) split->SetOpenPaneLength(length);
+            } else if (a.name == "compactPaneLength" || a.name == "compact-pane-length") {
+                const float length = ResolvePx(a.rawValue);
+                if (length >= 0.0f) split->SetCompactPaneLength(length);
+            } else if (a.name == "open" && ParseBoolAttr(a.rawValue)) {
+                split->SetPaneOpenImmediate(true);
+            }
+        }
+        return split;
+    }
 
     // Text widgets
     if (tag == "span" || tag == "a" || tag == "label" || tag == "small" || tag == "strong" || tag == "em") {
@@ -983,6 +1007,24 @@ WidgetPtr ConstructByTag(const std::string& tag, const std::string& text,
             }
         }
         return btn;
+    }
+    if (tag == "NavItem" || tag == "nav-item") {
+        std::wstring label = wtext;
+        std::string svg;
+        std::wstring glyph;
+        bool selected = false;
+        for (const auto& a : node.attrs) {
+            if (a.kind != ui::uix::AttrKind::Static) continue;
+            if (a.name == "text") label = ToWide(a.rawValue);
+            else if (a.name == "svg") svg = a.rawValue;
+            else if (a.name == "glyph") glyph = ToWide(a.rawValue);
+            else if (a.name == "selected") selected = ParseBoolAttr(a.rawValue);
+        }
+        auto nav = std::make_shared<NavItemWidget>(label, svg);
+        if (!glyph.empty()) nav->SetGlyph(glyph);
+        nav->SetSelected(selected);
+        nav->cursor = ui::CursorKind::Pointer;
+        return nav;
     }
     if (tag == "hr") {
         return std::make_shared<SeparatorWidget>();

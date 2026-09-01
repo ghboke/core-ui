@@ -196,6 +196,20 @@ ui_tab_add(tabs, L"Title", content);
 ui_tab_get_active(tabs);
 ui_tab_set_active(tabs, 0);
 
+// Stack
+ui_stack_get_active_index(stack);
+ui_stack_set_active_index(stack, 0);
+
+// NavItem
+ui_nav_get_selected(nav);
+ui_nav_set_selected(nav, 1);
+
+// SplitView
+ui_split_set_pane(split, pane);
+ui_split_set_content(split, content);
+ui_split_set_mode(split, UI_SPLIT_VIEW_INLINE);
+ui_split_set_open(split, 1);
+
 // ScrollView
 ui_scroll_set_content(sv, content);
 

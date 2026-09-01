@@ -413,6 +413,10 @@ UI_API UiWidget ui_hbox(void) {
     return Reg(std::make_shared<ui::HBoxWidget>());
 }
 
+UI_API UiWidget ui_stack(void) {
+    return Reg(std::make_shared<ui::StackWidget>());
+}
+
 UI_API UiWidget ui_spacer(float size) {
     return Reg(std::make_shared<ui::SpacerWidget>(size));
 }
@@ -536,6 +540,15 @@ UI_API UiWidget ui_tab_control(void) {
 
 UI_API UiWidget ui_scroll_view(void) {
     return Reg(std::make_shared<ui::ScrollViewWidget>());
+}
+
+UI_API UiWidget ui_nav_item(const wchar_t* text, const char* svg) {
+    return Reg(std::make_shared<ui::NavItemWidget>(
+        text ? text : L"", svg ? svg : ""));
+}
+
+UI_API UiWidget ui_split_view(void) {
+    return Reg(std::make_shared<ui::SplitViewWidget>());
 }
 
 // ================================================================
@@ -2244,6 +2257,109 @@ UI_API int ui_tab_get_active(UiWidget tab_control) {
 UI_API void ui_tab_set_active(UiWidget tab_control, int index) {
     auto* tc = As<ui::TabControlWidget>(tab_control);
     if (tc) tc->SetActiveIndex(index);
+}
+
+// ================================================================
+// Stack
+// ================================================================
+
+UI_API int ui_stack_get_active_index(UiWidget stack) {
+    auto* sw = As<ui::StackWidget>(stack);
+    return sw ? sw->ActiveIndex() : -1;
+}
+
+UI_API void ui_stack_set_active_index(UiWidget stack, int index) {
+    auto* sw = As<ui::StackWidget>(stack);
+    if (sw) {
+        sw->SetActiveIndex(index);
+        ui::RequestLayout();
+    }
+}
+
+// ================================================================
+// NavItem
+// ================================================================
+
+UI_API int ui_nav_get_selected(UiWidget nav_item) {
+    auto* nav = As<ui::NavItemWidget>(nav_item);
+    return nav && nav->IsSelected() ? 1 : 0;
+}
+
+UI_API void ui_nav_set_selected(UiWidget nav_item, int selected) {
+    auto* nav = As<ui::NavItemWidget>(nav_item);
+    if (nav) {
+        nav->SetSelected(selected != 0);
+        Ctx().InvalidateAllWindows();
+    }
+}
+
+// ================================================================
+// SplitView
+// ================================================================
+
+UI_API void ui_split_set_pane(UiWidget split_view, UiWidget pane) {
+    auto* sv = As<ui::SplitViewWidget>(split_view);
+    auto paneWidget = Ctx().handles.Lookup(pane);
+    if (sv && paneWidget) {
+        sv->SetPane(std::move(paneWidget));
+        ui::RequestLayout();
+    }
+}
+
+UI_API void ui_split_set_content(UiWidget split_view, UiWidget content) {
+    auto* sv = As<ui::SplitViewWidget>(split_view);
+    auto contentWidget = Ctx().handles.Lookup(content);
+    if (sv && contentWidget) {
+        sv->SetContent(std::move(contentWidget));
+        ui::RequestLayout();
+    }
+}
+
+UI_API int ui_split_get_open(UiWidget split_view) {
+    auto* sv = As<ui::SplitViewWidget>(split_view);
+    return sv && sv->IsPaneOpen() ? 1 : 0;
+}
+
+UI_API void ui_split_set_open(UiWidget split_view, int open) {
+    auto* sv = As<ui::SplitViewWidget>(split_view);
+    if (sv) sv->SetPaneOpen(open != 0);
+}
+
+UI_API void ui_split_set_open_immediate(UiWidget split_view, int open) {
+    auto* sv = As<ui::SplitViewWidget>(split_view);
+    if (sv) {
+        sv->SetPaneOpenImmediate(open != 0);
+        ui::RequestLayout();
+    }
+}
+
+UI_API void ui_split_set_mode(UiWidget split_view, UiSplitViewMode mode) {
+    auto* sv = As<ui::SplitViewWidget>(split_view);
+    if (!sv) return;
+    switch (mode) {
+    case UI_SPLIT_VIEW_OVERLAY:         sv->SetDisplayMode(ui::SplitViewMode::Overlay); break;
+    case UI_SPLIT_VIEW_INLINE:          sv->SetDisplayMode(ui::SplitViewMode::Inline); break;
+    case UI_SPLIT_VIEW_COMPACT_OVERLAY: sv->SetDisplayMode(ui::SplitViewMode::CompactOverlay); break;
+    case UI_SPLIT_VIEW_COMPACT_INLINE:  sv->SetDisplayMode(ui::SplitViewMode::CompactInline); break;
+    default: return;
+    }
+    ui::RequestLayout();
+}
+
+UI_API void ui_split_set_open_pane_length(UiWidget split_view, float length) {
+    auto* sv = As<ui::SplitViewWidget>(split_view);
+    if (sv && length > 0.0f) {
+        sv->SetOpenPaneLength(length);
+        ui::RequestLayout();
+    }
+}
+
+UI_API void ui_split_set_compact_pane_length(UiWidget split_view, float length) {
+    auto* sv = As<ui::SplitViewWidget>(split_view);
+    if (sv && length >= 0.0f) {
+        sv->SetCompactPaneLength(length);
+        ui::RequestLayout();
+    }
 }
 
 // ================================================================
