@@ -22,18 +22,21 @@ bool InitialClearColor(const DisplayList& list, D2D1_COLOR_F& out) {
 
 } // namespace
 
-RenderWindow::RenderWindow(RenderWindowId id, HWND hwnd, RenderSurfaceKind surfaceKind) {
-    Register(id, hwnd, surfaceKind);
+RenderWindow::RenderWindow(RenderWindowId id, HWND hwnd, RenderSurfaceKind surfaceKind,
+                           std::shared_ptr<LayeredFrameBuffer> layered) {
+    Register(id, hwnd, surfaceKind, std::move(layered));
 }
 
 RenderWindow::~RenderWindow() = default;
 RenderWindow::RenderWindow(RenderWindow&&) noexcept = default;
 RenderWindow& RenderWindow::operator=(RenderWindow&&) noexcept = default;
 
-void RenderWindow::Register(RenderWindowId id, HWND hwnd, RenderSurfaceKind surfaceKind) {
+void RenderWindow::Register(RenderWindowId id, HWND hwnd, RenderSurfaceKind surfaceKind,
+                            std::shared_ptr<LayeredFrameBuffer> layered) {
     id_ = id;
     hwnd_ = hwnd;
     surfaceKind_ = surfaceKind;
+    layered_ = std::move(layered);
 }
 
 void RenderWindow::Unregister() {
@@ -75,9 +78,19 @@ RenderFrameResult RenderWindow::RenderFrame(const FrameJob& job) {
         rendererReady_ = true;
     }
     if (!targetReady_ || !renderer_->RT()) {
-        const bool created = surfaceKind_ == RenderSurfaceKind::LayeredComposition
-            ? renderer_->CreateRenderTargetForLayered(hwnd_)
-            : renderer_->CreateRenderTarget(hwnd_);
+        bool created = false;
+        switch (surfaceKind_) {
+        case RenderSurfaceKind::LayeredComposition:
+            created = renderer_->CreateRenderTargetForLayered(hwnd_);
+            break;
+        case RenderSurfaceKind::HwndLayeredUlw:
+            created = renderer_->CreateRenderTargetUlw(hwnd_, layered_);
+            break;
+        default:
+            created = renderer_->CreateRenderTarget(
+                hwnd_, surfaceKind_ == RenderSurfaceKind::HwndCopySwapChain);
+            break;
+        }
         if (!created) {
             ReleaseResources();
             return RenderFrameResult::DeviceFailure;
@@ -107,6 +120,7 @@ RenderFrameResult RenderWindow::RenderFrame(const FrameJob& job) {
     renderer_->skipVSync = visible &&
                            job.policy != PresentPolicy::Final &&
                            job.policy != PresentPolicy::Screenshot;
+    renderer_->frameGeneration = job.generation;
     renderer_->BeginDraw();
     renderer_->ReplayDisplayList(job.display_list);
     HRESULT hr = renderer_->EndDraw();
@@ -118,8 +132,26 @@ RenderFrameResult RenderWindow::RenderFrame(const FrameJob& job) {
         ReleaseResources();
         return RenderFrameResult::DeviceFailure;
     }
+    if (surfaceKind_ == RenderSurfaceKind::HwndLayeredUlw && presentNow) {
+        /* 帧已读回发布; 交给窗口线程 Commit (ULW 不能在这里调, 见 layered_frame.h) */
+        PostMessageW(hwnd_, kUiCoreLayeredFrameReadyMessage, 0,
+                     static_cast<LPARAM>(job.generation));
+    }
     if (presentNow) return RenderFrameResult::Presented;
     return job.defer_present ? RenderFrameResult::Prepared : RenderFrameResult::Skipped;
+}
+
+bool RenderWindow::TryAcquireFrameSlot() {
+    if (!renderer_ || !targetReady_) return true;
+    return renderer_->TryAcquireFrameSlot();
+}
+
+HANDLE RenderWindow::FrameSlotWaitable() const {
+    return (renderer_ && targetReady_) ? renderer_->FrameSlotWaitable() : nullptr;
+}
+
+void RenderWindow::MarkFrameSlotHeld() {
+    if (renderer_) renderer_->MarkFrameSlotHeld();
 }
 
 RenderFrameResult RenderWindow::PresentPrepared(bool skipVSync) {

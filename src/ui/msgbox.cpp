@@ -1,6 +1,7 @@
 #include "msgbox.h"
 
 #include "renderer.h"
+#include "test_isolation.h"
 #include "theme.h"
 #include "ui_context.h"
 
@@ -30,6 +31,7 @@ constexpr float kCardMaxW   = 540.0f;
 struct BoxState {
     bool done   = false;
     int  result = -1;
+    bool cancelled = false;   /* build 339: Esc / 关闭收场 (UiMsgBoxResult.cancelled) */
     int  defaultIdx = 0;
     int  cancelIdx  = -1;
     UiWindow win = 0;
@@ -46,6 +48,12 @@ struct BoxState {
         if (win) {
             if (HWND h = (HWND)ui_window_hwnd(win)) PostMessageW(h, WM_NULL, 0, 0);
         }
+    }
+
+    void Cancel() {
+        if (cancelIdx < 0) return;
+        cancelled = true;
+        Finish(cancelIdx);
     }
 };
 
@@ -93,13 +101,13 @@ void OnKey(UiWindow win, int vk, void* ud) {
         ui_window_focus_widget(win, s->btnWidgets[target]);  /* on_focus 同步 focusedBtnIdx */
         return;
     }
-    if (vk == VK_ESCAPE && s->cancelIdx >= 0) s->Finish(s->cancelIdx);
+    if (vk == VK_ESCAPE && s->cancelIdx >= 0) s->Cancel();
     else if (vk == VK_RETURN) s->Finish(s->focusedBtnIdx >= 0 ? s->focusedBtnIdx : s->defaultIdx);
 }
 
 void OnClose(uint64_t /*win*/, void* ud) {
     auto* s = static_cast<BoxState*>(ud);
-    if (s && s->cancelIdx >= 0) s->Finish(s->cancelIdx);
+    if (s && s->cancelIdx >= 0) s->Cancel();
     /* cancel_idx < 0 (不可取消): 吞掉关闭 — lib on_close 后仍会销毁?
      * lib 语义: on_close 回调后窗口销毁。不可取消的 box 不提供关闭按钮
      * (show_buttons 已隐藏), 此回调仅防御性兜底。 */
@@ -139,6 +147,7 @@ UiMsgBoxResult MsgBox::Show(UiWindow parent,
     UiMsgBoxResult res{};
     res.button  = cancel_idx;
     res.checked = check_initial ? 1 : 0;
+    res.cancelled = 1;   /* 提前返回 (建窗失败等) = 没有按钮被点 */
     if (buttons.empty()) { res.button = -1; return res; }
     const int n = (int)buttons.size();
     if (default_idx < 0 || default_idx >= n) default_idx = 0;
@@ -297,9 +306,10 @@ UiMsgBoxResult MsgBox::Show(UiWindow parent,
     if (parentHwnd) EnableWindow(parentHwnd, FALSE);
 
     ui_window_show_immediate(win);
-    if (HWND h = (HWND)ui_window_hwnd(win)) {
-        SetForegroundWindow(h);
-        SetFocus(h);
+    HWND boxHwnd = (HWND)ui_window_hwnd(win);
+    if (boxHwnd && !TestIsolationEnabled()) {   // 测试隔离: 不抢用户前台
+        SetForegroundWindow(boxHwnd);
+        SetFocus(boxHwnd);
     }
 
     /* build 172: 注册为当前活动 msgbox (IPC 自动化驱动)。嵌套时 save/restore 成栈。
@@ -322,6 +332,7 @@ UiMsgBoxResult MsgBox::Show(UiWindow parent,
         /* WM_QUIT 流到这 — 转回外层泵, 按取消收场。 */
         PostQuitMessage((int)m.wParam);
         state.result = cancel_idx;
+        state.cancelled = true;
     }
     /* 勾选终态在窗口销毁前读取。 */
     if (check) res.checked = ui_checkbox_get_checked(check) ? 1 : 0;
@@ -329,9 +340,10 @@ UiMsgBoxResult MsgBox::Show(UiWindow parent,
     /* 先恢复宿主再销毁自己 — 反序 Windows 会把激活权丢给其它应用
      * (MessageBox 实现的经典细节)。 */
     if (parentHwnd && parentWasEnabled) EnableWindow(parentHwnd, TRUE);
-    if (parentHwnd) SetForegroundWindow(parentHwnd);
+    if (parentHwnd && !TestIsolationEnabled()) SetForegroundWindow(parentHwnd);
     ui_window_destroy(win);
     res.button = state.result;
+    res.cancelled = state.cancelled ? 1 : 0;
     return res;
 }
 
@@ -357,6 +369,13 @@ bool MsgBoxDebugFinish(int idx) {
         return true;
     }
     return false;
+}
+
+bool MsgBoxDebugCancel() {
+    BoxState* s = g_activeBox;
+    if (!s || s->cancelIdx < 0) return false;
+    s->Cancel();
+    return true;
 }
 
 }  // namespace ui

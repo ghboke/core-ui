@@ -10,6 +10,8 @@
   #endif
 #endif
 
+#include "animation_host.h"
+
 #include <d2d1.h>
 #include <cstdint>
 #include <memory>
@@ -142,17 +144,30 @@ public:
     // Resolved at layout time (parent rect known); empty string falls back to
     // the eager pos*Left/etc above. Lets `top: calc(50% - 20px)` work.
     std::string posLeftRaw, posTopRaw, posRightRaw, posBottomRaw;
-    // Reactive absolute-position overrides from .uix bindings such as
-    // `:left="x"`. They are re-applied after style recomputation so hover /
-    // class changes do not reset script-driven popover placement back to the
-    // static CSS baseline.
+    // ---- Dynamic (imperative) overrides -------------------------------
+    //
+    // recomputeStyle 在重新级联前会把一批字段**无条件重置**成默认值 (见
+    // page/compiler.cpp), 这样"class 里去掉某条规则"才能真的生效。代价是:
+    // 凡是由 .uix 绑定 (`:left` / `:background`) 或宿主 API
+    // (ui_widget_set_bg_color) 命令式写进去的值, 会被随便一次 hover / class
+    // 切换 / 主题刷新抹掉 —— 而这几种重算是随时发生的。
+    //
+    // 所以这些值单独记一份, 在级联之后由 ApplyDynamicOverrides() 补回。
+    // 语义: **命令式设过的字段, 此后一律压过 CSS** (含 :hover 的同名规则),
+    // 跟 hostFontSize / hostFg 的既有行为一致。
     bool dynamicPosLeftSet = false, dynamicPosTopSet = false;
     bool dynamicPosRightSet = false, dynamicPosBottomSet = false;
     float dynamicPosLeft = -1, dynamicPosTop = -1;
     float dynamicPosRight = -1, dynamicPosBottom = -1;
     std::string dynamicPosLeftRaw, dynamicPosTopRaw;
     std::string dynamicPosRightRaw, dynamicPosBottomRaw;
-    void ApplyDynamicPositionOverrides();
+
+    // 背景色。动画期间记的是**目标色** —— 动画途中撞上重算时, 停在目标色比
+    // 停在透明合理得多。
+    bool dynamicBgSet = false;
+    D2D1_COLOR_F dynamicBg{};
+
+    void ApplyDynamicOverrides();
 
     // ---- Padding (inner space) ----
     float padL = 0, padT = 0, padR = 0, padB = 0;
@@ -293,6 +308,25 @@ public:
         float fontSize     = -1.0f;
     };
     CssOverride css;
+
+    /* ---- 宿主运行时覆盖 (ui_widget_set_font_size / set_text_color) ----
+     * CSS 状态重算 (hover / focus / pressed) 会整片重写 css.*, 宿主设的值
+     * 必须在每次重算之后补回去 —— 否则典型症状是"设完字号一获得焦点就被冲回
+     * 默认小字"。所以单独存一份, 由 RecomputeStyleNow 负责重放。
+     * fontSize <= 0 / hasFg = false 表示宿主没设, 完全走 CSS。 */
+    float hostFontSize = -1.0f;
+    bool  hasHostFg = false;
+    D2D1_COLOR_F hostFg{};
+    void ApplyHostStyleOverrides() {
+        if (hostFontSize > 0.0f) css.fontSize = hostFontSize;
+        if (hasHostFg) { css.fg = hostFg; css.hasFg = true; }
+    }
+    /* 重算 CSS 并补回宿主覆盖。**所有 recomputeStyle 调用都应走这里**,
+     * 直接调 recomputeStyle 会丢掉宿主设的字号/文字色。 */
+    void RecomputeStyleNow(uint32_t bits) {
+        if (recomputeStyle) recomputeStyle(bits);
+        ApplyHostStyleOverrides();
+    }
 
     // ---- CSS cursor: logical kind mapped to Win32 cursor by ui_window ----
     CursorKind cursor = CursorKind::Default;
@@ -450,6 +484,24 @@ public:
     // Requires an active measure context; return false when unknown.
     virtual bool GetCaretRect(D2D1_RECT_F* out) const { (void)out; return false; }
     virtual D2D1_SIZE_F SizeHint() const { return {fixedW, fixedH}; }
+    /* 给定宽度 w (含 padding) 时的高度 (build 323)。会折行的内容 —— wrap label
+     * 以及包着它的容器 —— 高度取决于分到的宽度, 而 SizeHint 在宽度未知时只能
+     * 报单行。VBox 先定子项宽度再问高度, HBox 按分到的主轴宽度问交叉轴高度。
+     * 默认 = SizeHint().height: 不折行的控件行为不变。 */
+    virtual float HeightForWidth(float w) const { (void)w; return SizeHint().height; }
+
+    // ---- 动画心跳 (build 337) ----
+    /* 带动画的控件覆写这三个, 窗口不用认识具体类型:
+     * AnimationActive — 窗口重建登记清单 (全树扫描) 时问: 现在还要不要帧;
+     * AnimationInvalidationFlags — 每帧除重绘外还要不要重排 / 重算命中;
+     * TickAnimation — 每帧调一次: ticked = 本帧推进了状态, keep = 还要下一帧。
+     * 只要 keep 的 (如加载转圈, 靠 OnDraw 自己按时间画) 返回 {false, true}。 */
+    struct AnimTick { bool ticked; bool keep; };
+    virtual bool AnimationActive() const { return false; }
+    virtual AnimationInvalidation AnimationInvalidationFlags() const {
+        return AnimationInvalidation::Paint;
+    }
+    virtual AnimTick TickAnimation() { return {false, false}; }
 
     // ---- Focus ----
     bool IsFocused() const { return focused_; }
@@ -517,6 +569,10 @@ public:
     WidgetPtr MainJustify(LayoutJustify j){ mainJustify_ = j; return shared_from_this(); }
     void DoLayout() override;
     D2D1_SIZE_F SizeHint() const override;
+    float HeightForWidth(float w) const override;
+
+private:
+    float ChildCrossWidth(const Widget* child, float cw) const;
 };
 
 class UI_API HBoxWidget : public Widget {
@@ -536,9 +592,15 @@ public:
     WidgetPtr FlexWrap(bool w)            { flexWrap_ = w; return shared_from_this(); }
     void DoLayout() override;
     D2D1_SIZE_F SizeHint() const override;
+    float HeightForWidth(float w) const override;
 
 private:
     void DoLayoutWrap();  // multi-row packing path
+    /* 非折行路径的主轴宽度分配 (自然宽 / flex 分剩余 / flex-shrink 收缩)。
+     * DoLayout 与 HeightForWidth 共用, 保证"问高度时假设的宽度"就是"真正排出
+     * 来的宽度"。返回值 = 含 margin / gap 的内容总宽, totalFlex 供 justify 用。 */
+    float MainWidths(const std::vector<Widget*>& vis, float totalW,
+                     std::vector<float>& widths, float* totalFlex) const;
 };
 
 class UI_API SpacerWidget : public Widget {
@@ -590,6 +652,14 @@ private:
 inline bool& LayoutDirtyFlag() {
     static thread_local bool dirty = false;
     return dirty;
+}
+/* build 306: 排版请求代号, RequestLayout 每次加一。旗标由第一个画到的窗口消费并
+ * 清掉, 同时开着的其它窗口就收不到这次请求 (改的是 B 的页面、A 先画 → B 新增的
+ * v-for 行矩形为 0、:class 改的宽度不生效)。每个窗口记住自己处理到的代号, 落后的
+ * 都要重排一次。 */
+inline uint64_t& LayoutGeneration() {
+    static thread_local uint64_t gen = 0;
+    return gen;
 }
 /* 置脏 + 失效所有窗口 (催生一帧)。修复前只置旗标 — 旗标仅在 OnPaint 里
  * 被消费, 完全空闲的窗口永远等不到那次 paint, 导致 set_title / set_text

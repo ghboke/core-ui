@@ -39,6 +39,27 @@ enum class DrawCommandType : uint8_t {
      * 保持平行性), 梯形/透视四边形必须走真几何填充。新值一律追加在末尾 —
      * 中间插值会打乱既有编号。 */
     FillQuad,
+    /* 椭圆 (含正圆)。参数走 rect 当外接矩形, 不新增字段 —— 圆心和半径都能
+     * 从它算出来, 而调用方 (拖框画圆) 手上本来就是矩形。 */
+    FillEllipse,
+    DrawEllipse,
+    /* 折线 (铅笔笔迹 / 多段箭头)。点集走侧池, 见 PolylineRef。 */
+    DrawPolyline,
+    /* 透明图层 (build 344): 之间的内容画进独立的透明中间层, Pop 时整张
+     * source-over 合回去。配合 DrawImage 的 CompositeMode::DestinationOut
+     * 在层里挖洞 —— 只清层内内容, 层下面的东西原样露出来。 */
+    PushLayer,
+    PopLayer,
+};
+
+/* 位图的合成方式 (build 344)。只对 DrawImage 有意义。
+ *   SourceOver     — 普通叠加 (默认, 跟以前完全一样)。
+ *   DestinationOut — 按位图 alpha 清掉目标: 目标 *= (1 - 源alpha), 源颜色不用。
+ *                    一般放在 PushLayer/PopLayer 之间用 (橡皮擦), 否则会把窗口
+ *                    底色一起挖穿。 */
+enum class CompositeMode : uint8_t {
+    SourceOver,
+    DestinationOut,
 };
 
 enum class ImageSampling : uint8_t {
@@ -172,6 +193,17 @@ struct QuadRef {
     D2D1_POINT_2F pts[4] = {};
 };
 
+/* 折线的点集。点数不定 (一条铅笔笔迹动辄几百点), 必须走侧池。
+ *
+ * 存在理由: 用 N 条 DrawLine 拼一条笔迹, 每帧要录 N 条命令, 一张图上画十
+ * 笔就是几千条; 而且逐段独立描边在转折处会露出缺口 (平头线帽), 半透明颜色
+ * 还会在接头处叠深。整条走一个 PathGeometry + 圆头圆角线型, 一条命令解决,
+ * 线质也对。 */
+struct PolylineRef {
+    std::vector<D2D1_POINT_2F> pts;
+    bool closed = false;
+};
+
 struct DrawCommand {
     DrawCommandType type = DrawCommandType::FillRect;
     D2D1_RECT_F rect = {};
@@ -191,8 +223,13 @@ struct DrawCommand {
     uint32_t svg_document_ref_index = UINT32_MAX;
     uint32_t svg_text_ref_index = UINT32_MAX;
     uint32_t quad_index = UINT32_MAX;
+    uint32_t polyline_index = UINT32_MAX;
     TextStyle text_style;
     ImageSampling sampling = ImageSampling::Linear;
+    /* 描边线型: 0=实线 1=虚线 2=点线 3=点划线。只对描边类命令有意义。 */
+    uint8_t dash_style = 0;
+    /* 只对 DrawImage 有意义, 见 CompositeMode。 */
+    CompositeMode composite = CompositeMode::SourceOver;
 };
 
 class DisplayList {
@@ -218,6 +255,7 @@ public:
     std::vector<SvgDocumentRef> svg_document_refs;
     std::vector<SvgTextRunListRef> svg_text_refs;
     std::vector<QuadRef> quad_refs;
+    std::vector<PolylineRef> polyline_refs;
 
     bool Empty() const { return commands.empty(); }
     void Clear();
@@ -247,16 +285,27 @@ public:
     void PopOpacity();
     void PushTransform(D2D1_MATRIX_3X2_F transform);
     void PopTransform();
+    void PushLayer();
+    void PopLayer();
     void FillRect(D2D1_RECT_F rect, D2D1_COLOR_F color);
     void FillQuad(const D2D1_POINT_2F pts[4], D2D1_COLOR_F color);
-    void DrawRect(D2D1_RECT_F rect, D2D1_COLOR_F color, float strokeWidth);
+    /* dash: 0=实线 1=虚线 2=点线 3=点划线 */
+    void DrawRect(D2D1_RECT_F rect, D2D1_COLOR_F color, float strokeWidth, int dash = 0);
+    /* rect = 外接矩形 */
+    void FillEllipse(D2D1_RECT_F rect, D2D1_COLOR_F color);
+    void DrawEllipse(D2D1_RECT_F rect, D2D1_COLOR_F color, float strokeWidth, int dash = 0);
     void FillRoundedRect(D2D1_RECT_F rect, float rx, float ry, D2D1_COLOR_F color);
     void DrawRoundedRect(D2D1_RECT_F rect, float rx, float ry, D2D1_COLOR_F color, float strokeWidth);
     void DrawBlurredRoundedRect(D2D1_RECT_F rect, float rx, float ry,
                                 float blurRadius, D2D1_COLOR_F color);
-    void DrawLine(D2D1_POINT_2F p0, D2D1_POINT_2F p1, D2D1_COLOR_F color, float strokeWidth);
+    void DrawLine(D2D1_POINT_2F p0, D2D1_POINT_2F p1, D2D1_COLOR_F color, float strokeWidth,
+                  int dash = 0);
+    /* count < 2 时不录命令 (单点笔迹由调用方自己决定要不要画成一个点) */
+    void DrawPolyline(const D2D1_POINT_2F* pts, size_t count, D2D1_COLOR_F color,
+                      float strokeWidth, bool closed, int dash = 0);
     void DrawText(std::wstring text, D2D1_RECT_F rect, TextStyle style);
-    void DrawImage(ImageRef image, D2D1_RECT_F dst, ImageSampling sampling, float opacity = 1.0f);
+    void DrawImage(ImageRef image, D2D1_RECT_F dst, ImageSampling sampling, float opacity = 1.0f,
+                   CompositeMode composite = CompositeMode::SourceOver);
     void FillImagePattern(ImageRef image, D2D1_RECT_F rect);
     void FillGradient(GradientRef gradient, D2D1_RECT_F rect, float radius);
     void DrawSvgIcon(SvgIconRef icon, D2D1_RECT_F dst, D2D1_COLOR_F color);

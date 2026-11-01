@@ -154,6 +154,8 @@ export const apiGroups: ApiGroup[] = [
       { name: "ui_text_input_get_text", signature: "const wchar_t* ui_text_input_get_text(UiWidget w)", description: "Get input text (valid until next call)" },
       { name: "ui_text_input_set_text", signature: "void ui_text_input_set_text(UiWidget w, const wchar_t* text)", description: "Set input text" },
       { name: "ui_text_input_set_read_only", signature: "void ui_text_input_set_read_only(UiWidget w, int read_only)", description: "Set read-only mode" },
+      { name: "ui_text_input_set_password", signature: "void ui_text_input_set_password(UiWidget w, int on)", description: "Password mode: mask characters as '●', block copy/cut" },
+      { name: "ui_text_input_select_all", signature: "void ui_text_input_select_all(UiWidget w)", description: "Select all text (like input.select()); typing replaces it" },
       { name: "ui_text_area_get_text", signature: "const wchar_t* ui_text_area_get_text(UiWidget w)", description: "Get text area content" },
       { name: "ui_text_area_set_text", signature: "void ui_text_area_set_text(UiWidget w, const wchar_t* text)", description: "Set text area content" },
       { name: "ui_text_area_set_read_only", signature: "void ui_text_area_set_read_only(UiWidget w, int read_only)", description: "Set text area read-only mode" },
@@ -282,6 +284,7 @@ export const apiGroups: ApiGroup[] = [
     functions: [
       { name: "ui_window_enable_canvas_mode", signature: "void ui_window_enable_canvas_mode(UiWindow win, int enable)", description: "One-shot frameless canvas mode: min_size=32x32, transparent bg, root drag, titlebar hidden" },
       { name: "ui_window_set_min_size", signature: "void ui_window_set_min_size(UiWindow win, float w, float h)", description: "Override the default 480x360 minimum window size" },
+      { name: "ui_window_set_auto_height", signature: "void ui_window_set_auto_height(UiWindow win, int enable)", description: "Height follows content (same as <window height=\"auto\">); refits on every layout, capped to the work area. Calling again re-measures immediately" },
       { name: "ui_window_set_background_mode", signature: "void ui_window_set_background_mode(UiWindow win, int mode)", description: "0=theme fill (default), 1=transparent Clear on paint" },
       { name: "ui_widget_set_drag_window", signature: "void ui_widget_set_drag_window(UiWidget w, int enable)", description: "Hitting this widget returns HTCAPTION so the system drags the window" },
       { name: "ui_window_set_rect", signature: "void ui_window_set_rect(UiWindow win, float x, float y, float w, float h)", description: "Atomic SetWindowPos + invalidate, DIP-native" },

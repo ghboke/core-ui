@@ -74,6 +74,9 @@ public:
     // which changes their measured widths; without a relayout the labels keep
     // their previously-laid-out rects and longer translations wrap/overflow.
     void RelayoutAllWindows();
+    // build 314: 全局字体 / 排版区域 / 文字渲染模式运行时改了 —— 每个窗口的
+    // Renderer 清 TextFormat 缓存、重建回退字体链, 然后整体重排 (文字宽度变了)。
+    void RefreshTextAllWindows();
     // Re-evaluates per-window animation timers (toggle/checkbox/etc.). Needed
     // whenever a binding application or external setter flips a widget into
     // an animating state outside an event handler — without this, the timer
@@ -87,7 +90,8 @@ public:
     /* ---- 批量绑定合批 (build 285) ---------------------------------------
      * 背景: PageState::ApplyBindingToWidget 每应用一条绑定就
      * InvalidateAllWindows() + UpdateAnimTimers()。后者会**遍历整棵 widget 树**
-     * 并对每个节点做 6 次以上 dynamic_cast —— 单次是 O(树大小)。
+     * 并逐个节点问是否在动画 (当时是 6 次以上 dynamic_cast, build 337 起是一次
+     * 虚函数调用) —— 单次是 O(树大小)。
      * v-for 一次性建 2000 行时要应用约 16000 条绑定, 树里又正好有约 12000 个
      * widget, 于是整体退化成 O(n^2): 实测 2000 行 8.9 秒, 5000 行 56 秒。
      *

@@ -1687,6 +1687,14 @@ void GhImgViewWidget::DrawCheckerboard_(Renderer& r, const D2D1_RECT_F& area) {
     r.FillRectWithImagePattern(checkerTileResourceKey_, checkerTile_.Get(), area);
 }
 
+/* 建议内边距随主题变 (深色档的描边/投影参数不同), 所以取的是"此刻"的主题。
+ * 宿主在主题切换后重新问一次即可。 */
+float GhImgViewWidget::ShadowFitPadding() const {
+    const bool dark = theme::CurrentMode() == theme::Mode::Dark;
+    return imgshadow::RecommendedFitPadding(
+        imgshadow::ParamsFor(shadowStyle_, dark));
+}
+
 void GhImgViewWidget::DrawImageShadow_(Renderer& r, const D2D1_RECT_F& visual,
                                        const D2D1_RECT_F& viewport) {
     namespace ish = imgshadow;
@@ -1698,30 +1706,34 @@ void GhImgViewWidget::DrawImageShadow_(Renderer& r, const D2D1_RECT_F& visual,
     if (tier == ish::Tier::Hidden) return;
 
     const bool dark = theme::CurrentMode() == theme::Mode::Dark;
-    const ish::Params p = ish::ScaleParams(ish::ParamsForTheme(dark),
+    const ish::Params p = ish::ScaleParams(ish::ParamsFor(shadowStyle_, dark),
                                            ish::TierScale(tier));
 
     const ish::RectF img{visual.left, visual.top, visual.right, visual.bottom};
     const ish::RectF vp{viewport.left, viewport.top, viewport.right, viewport.bottom};
 
-    if (p.shadowAlpha > 0.0f && p.blur > 0.0f) {
-        ish::RectF bands[4];
-        const int n = ish::ShadowBands(img, vp, p.blur, p.offsetY, bands);
-        if (n > 0) {
-            const ish::RectF s = ish::ShadowBounds(img, p.blur, p.offsetY);
-            const D2D1_RECT_F shadowRect{s.left, s.top, s.right, s.bottom};
-            const D2D1_COLOR_F shadowColor = D2D1::ColorF(0.0f, 0.0f, 0.0f,
-                                                          p.shadowAlpha);
-            /* 每条边带各裁剪一次再画同一个模糊矩形 —— 图片矩形被挖空, 透明图
-             * 的透明区不会透出暗块。D2D 的 effect 按输出区域惰性求值, 裁到窄
-             * 边带后四次的总开销约等于一次全幅模糊, 不必自建离屏复用。 */
-            for (int i = 0; i < n; ++i) {
-                const D2D1_RECT_F clip{bands[i].left, bands[i].top,
-                                       bands[i].right, bands[i].bottom};
-                r.PushClip(clip);
-                r.DrawBlurredRoundedRect(shadowRect, 0.0f, 0.0f, p.blur, shadowColor);
-                r.PopClip();
+    const ish::RectF bounds = ish::ShadowBounds(img, p);
+    ish::RectF bands[4];
+    const int n = ish::Valid(bounds) ? ish::ShadowBands(img, vp, bounds, bands) : 0;
+    if (n > 0) {
+        /* 每条边带各裁剪一次, 在裁剪内把所有层依次画上 —— 图片矩形被挖空, 透明
+         * 图的透明区不会透出暗块。裁剪范围含模糊尾巴 (LayerBounds 比几何矩形多
+         * 一个 blur), 少了这截尾巴阴影外沿会被切成硬边。D2D 的 effect 按输出区域
+         * 惰性求值, 裁到窄边带后总开销约等于一次全幅模糊, 不必自建离屏复用。 */
+        for (int i = 0; i < n; ++i) {
+            const D2D1_RECT_F clip{bands[i].left, bands[i].top,
+                                   bands[i].right, bands[i].bottom};
+            r.PushClip(clip);
+            for (int li = 0; li < p.layerCount; ++li) {
+                const ish::Layer& l = p.layers[li];
+                if (l.alpha <= 0.0f) continue;
+                const ish::RectF g = ish::LayerGeomRect(img, l);
+                if (!ish::Valid(g)) continue;
+                r.DrawBlurredRoundedRect(D2D1_RECT_F{g.left, g.top, g.right, g.bottom},
+                                         0.0f, 0.0f, l.blur,
+                                         D2D1::ColorF(0.0f, 0.0f, 0.0f, l.alpha));
             }
+            r.PopClip();
         }
     }
 
@@ -1740,6 +1752,7 @@ void GhImgViewWidget::DrawImageShadow_(Renderer& r, const D2D1_RECT_F& visual,
 // ===== 数据形状 =====
 
 void GhImgViewWidget::Begin(const Info& info, Renderer& r) {
+    zoomAnim_ = zoommotion::State{};   // 换图: 在飞的缩放动画作废 (下面会重设视口)
     const uint64_t oldGeneration = imageGeneration_;
     ++imageGeneration_;
     if (oldGeneration != 0) {
@@ -1805,6 +1818,38 @@ void GhImgViewWidget::SetPreview(const void* bgra, uint32_t pw, uint32_t ph,
     (void)r;
     if (!bgra || pw == 0 || ph == 0) return;
     if (stride == 0) stride = pw * 4;
+    DropPreviewResource_();
+
+    ResourceKey key = GlobalResourceStore().AddImage(
+        ResourceKind::Preview, imageGeneration_, (int)pw, (int)ph, (int)stride,
+        PixelFormat::BgraStraight, bgra, true);
+    AdoptPreviewResource_(key, pw, ph);
+}
+
+void GhImgViewWidget::SetPreviewShared(const void* bgra, uint32_t pw, uint32_t ph,
+                                        uint32_t stride, bool premultiplied,
+                                        std::shared_ptr<const void> owner, Renderer& r) {
+    (void)r;
+    if (!bgra || pw == 0 || ph == 0 || !owner) return;   /* owner 随参数析构归还 */
+    if (stride == 0) stride = pw * 4;
+    DropPreviewResource_();
+
+    ResourceKey key = GlobalResourceStore().AddImageShared(
+        ResourceKind::Preview, imageGeneration_, (int)pw, (int)ph, (int)stride,
+        premultiplied ? PixelFormat::BgraPremul : PixelFormat::BgraStraight,
+        bgra, std::move(owner), true);
+    AdoptPreviewResource_(key, pw, ph);
+}
+
+void GhImgViewWidget::AdoptPreviewResource_(ResourceKey key, uint32_t pw, uint32_t ph) {
+    if (!key.IsValid()) return;
+    previewResourceKey_ = key;
+    previewW_ = pw;
+    previewH_ = ph;
+    InvalidateAllWindows();
+}
+
+void GhImgViewWidget::DropPreviewResource_() {
     if (previewResourceKey_.IsValid() &&
         previewResourceKey_.image_generation != imageGeneration_) {
         GlobalResourceStore().PurgeGeneration(previewResourceKey_.image_generation);
@@ -1818,15 +1863,6 @@ void GhImgViewWidget::SetPreview(const void* bgra, uint32_t pw, uint32_t ph,
         GlobalResourceStore().Remove(previewResourceKey_);
         previewResourceKey_ = {};
     }
-
-    ResourceKey key = GlobalResourceStore().AddImage(
-        ResourceKind::Preview, imageGeneration_, (int)pw, (int)ph, (int)stride,
-        PixelFormat::BgraStraight, bgra, true);
-    if (!key.IsValid()) return;
-    previewResourceKey_ = key;
-    previewW_ = pw;
-    previewH_ = ph;
-    InvalidateAllWindows();
 }
 
 void GhImgViewWidget::SetTile(uint32_t level, uint32_t tx, uint32_t ty,
@@ -1933,6 +1969,7 @@ void GhImgViewWidget::ClearLevel(uint32_t level) {
 }
 
 void GhImgViewWidget::Clear() {
+    zoomAnim_ = zoommotion::State{};
     if (imageGeneration_ != 0) GlobalResourceStore().PurgeGeneration(imageGeneration_);
     if (previewResourceKey_.IsValid() &&
         previewResourceKey_.image_generation != imageGeneration_) {
@@ -2420,8 +2457,13 @@ void GhImgViewWidget::SetActiveLevel(uint32_t level) {
 // ===== 视口 =====
 
 void GhImgViewWidget::SetZoom(float z) {
+    const bool interrupted = zoomAnim_.active;
+    if (interrupted) StopZoomAnimation_(false);
     z = std::clamp(z, minZoom_, maxZoom_);
-    if (zoom_ == z) return;
+    if (zoom_ == z) {
+        if (interrupted) RequestViewportCommit();
+        return;
+    }
     {
         TraceEvent("gh_img_view", "set_zoom",
                    {TraceF64("old", zoom_),
@@ -2446,7 +2488,12 @@ void GhImgViewWidget::SetZoom(float z) {
  * 早 return 优化: (x, y) 等于当前 pan 时跳过 — caller 端可能反复调
  * (例如 minimap drag 时连续 set_pan), 避免无效 callback. */
 void GhImgViewWidget::SetPan(float x, float y) {
-    if (panX_ == x && panY_ == y) return;
+    const bool interrupted = zoomAnim_.active;
+    if (interrupted) StopZoomAnimation_(false);
+    if (panX_ == x && panY_ == y) {
+        if (interrupted) RequestViewportCommit();
+        return;
+    }
     {
         TraceEvent("gh_img_view", "set_pan",
                    {TraceF64("old_x", panX_),
@@ -2462,19 +2509,9 @@ void GhImgViewWidget::SetPan(float x, float y) {
     RequestViewportCommit();
 }
 
-void GhImgViewWidget::SetZoomAround(float z, float anchorX, float anchorY) {
-    z = std::clamp(z, minZoom_, maxZoom_);
-    if (zoom_ == z) return;
-
-    // 1) 当前 state 下 anchor 屏幕点对应的图像坐标 (顶级, rotation-aware)
-    float ix = 0, iy = 0;
-    ScreenToImage(anchorX, anchorY, ix, iy);
-
-    // 2) 切新 zoom
-    zoom_ = z;
-    if (autoLevel_) SwitchLevel(PickAutoLevel());
-
-    // 3) 反算 pan 使 (ix, iy) 仍落在 (anchorX, anchorY)
+void GhImgViewWidget::ApplyZoomAtAnchor_(float z, float ix, float iy,
+                                         float anchorX, float anchorY) {
+    // 设新 zoom, 反算 pan 使图像点 (ix, iy) 落在屏幕点 (anchorX, anchorY)。
     //
     // Forward image (ix, iy) → screen (sx, sy):
     //   fx = (ix - fullW/2) * zoom_new
@@ -2484,6 +2521,7 @@ void GhImgViewWidget::SetZoomAround(float z, float anchorX, float anchorY) {
     //   sy = widget_cy + panY + ry
     //
     // 要求 sx = anchorX, sy = anchorY → panX/Y = anchor - widget_center - (rx/ry).
+    zoom_ = z;
     float fullW = (float)info_.fullWidth;
     float fullH = (float)info_.fullHeight;
     float fx = (ix - fullW * 0.5f) * zoom_;
@@ -2494,13 +2532,149 @@ void GhImgViewWidget::SetZoomAround(float z, float anchorX, float anchorY) {
     float cy = (rect.top  + rect.bottom) * 0.5f;
     panX_ = anchorX - cx - rx;
     panY_ = anchorY - cy - ry;
-
     ConstrainPan();
+}
+
+void GhImgViewWidget::SetZoomAround(float z, float anchorX, float anchorY) {
+    const bool interrupted = zoomAnim_.active;
+    if (interrupted) StopZoomAnimation_(false);
+    z = std::clamp(z, minZoom_, maxZoom_);
+    if (zoom_ == z) {
+        if (interrupted) RequestViewportCommit();
+        return;
+    }
+
+    // 当前 state 下 anchor 屏幕点对应的图像坐标 (顶级, rotation-aware)
+    float ix = 0, iy = 0;
+    ScreenToImage(anchorX, anchorY, ix, iy);
+    ApplyZoomAtAnchor_(z, ix, iy, anchorX, anchorY);
+    if (autoLevel_) SwitchLevel(PickAutoLevel());
+
     InvalidateSvgRenderSlot_(svgSlot_);
     RequestViewportCommit();
 }
 
+// ===== 平滑缩放 (build 301) =====
+
+namespace {
+
+int64_t QpcNow_() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+double QpcDeltaMs_(int64_t from, int64_t to) {
+    static const double freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<double>(f.QuadPart);
+    }();
+    return static_cast<double>(to - from) * 1000.0 / freq;
+}
+
+}  // namespace
+
+/* 不在库里读系统"显示动画"开关: "调整为最佳性能"等常见优化设置会连带关掉它,
+ * 库替用户拍板会让平滑缩放在很多机器上直接消失。要不要动画由宿主通过
+ * durationMs 决定 (传 0 = 一步到位)。
+ *
+ * 运动模型见 zoom_motion.h (Qt 式匀速分段): 每次调用 = 一段 durationMs 的匀速
+ * 运动; 动画中再调用, 同向则叠加提速, 反向则清掉积压立刻掉头。 */
+void GhImgViewWidget::AnimateZoomAround(float z, float anchorX, float anchorY,
+                                        float durationMs) {
+    const bool canAnimate = info_.fullWidth > 0 && info_.fullHeight > 0 &&
+                            durationMs > 0.0f;
+    if (!canAnimate) {
+        SetZoomAround(z, anchorX, anchorY);
+        return;
+    }
+    z = std::clamp(z, minZoom_, maxZoom_);
+
+    /* 锚点取"当前画面"下该屏幕点对应的图像坐标。动画中换锚点时, 用新锚点按当前
+     * 倍率反算出的 pan 恰好等于当前 pan, 所以画面不会跳。 */
+    float ix = 0, iy = 0;
+    ScreenToImage(anchorX, anchorY, ix, iy);
+    zoomAnimAnchorSX_ = anchorX;
+    zoomAnimAnchorSY_ = anchorY;
+    zoomAnimAnchorIX_ = ix;
+    zoomAnimAnchorIY_ = iy;
+
+    const bool wasActive = zoomAnim_.active;
+    zoommotion::Push(zoomAnim_, zoom_, z, durationMs);
+    if (wasActive) {
+        TraceEvent("gh_img_view", "zoom_anim_push",
+                   {TraceF64("current", zoom_), TraceF64("target", z),
+                    TraceI64("segments", zoomAnim_.count)});
+        return;   // 动画计时器已在跑
+    }
+    if (!zoomAnim_.active) return;   // 位移可忽略
+    zoomAnimLastQpc_ = QpcNow_();
+    TraceEvent("gh_img_view", "zoom_anim_start",
+               {TraceF64("from", zoom_), TraceF64("target", z),
+                TraceF64("duration_ms", durationMs)});
+    GetContext().RegisterAnimatingWidget(this);
+}
+
+float GhImgViewWidget::TargetZoom() const {
+    return zoomAnim_.active ? zoommotion::Target(zoomAnim_) : zoom_;
+}
+
+float GhImgViewWidget::ZoomStepBase(bool zoomIn) const {
+    if (!zoomAnim_.active) return zoom_;
+    const float target = zoommotion::Target(zoomAnim_);
+    /* 正在往反方向走: 从当前画面起步 (Push 会据此清掉积压立刻掉头)。 */
+    const bool reversing = zoomIn ? (target < zoom_) : (target > zoom_);
+    return reversing ? zoom_ : target;
+}
+
+bool GhImgViewWidget::TickZoomAnimation() {
+    if (!zoomAnim_.active) return false;
+    const int64_t now = QpcNow_();
+    const double dtMs = QpcDeltaMs_(zoomAnimLastQpc_, now);
+    zoomAnimLastQpc_ = now;
+
+    const bool running = zoommotion::Step(zoomAnim_, dtMs);
+    ApplyZoomAtAnchor_(zoommotion::Current(zoomAnim_),
+                       zoomAnimAnchorIX_, zoomAnimAnchorIY_,
+                       zoomAnimAnchorSX_, zoomAnimAnchorSY_);
+    /* build 309: 动画中间帧发变换回调 (interacting=1); 到位那帧由下面的
+     * RequestViewportCommit → NotifyViewport 发落定回调。 */
+    if (running) NotifyTransform_();
+    if (!running) {
+        /* 到位: 统一切级 + fire 一次视口回调, 宿主此时才排新可见区的瓦块。 */
+        TraceEvent("gh_img_view", "zoom_anim_end", {TraceF64("zoom", zoom_)});
+        if (autoLevel_) SwitchLevel(PickAutoLevel());
+        InvalidateSvgRenderSlot_(svgSlot_);
+        RequestViewportCommit();
+    }
+    return running;
+}
+
+void GhImgViewWidget::FinishZoomAnimation() {
+    if (!zoomAnim_.active) return;
+    const float target = zoommotion::Target(zoomAnim_);
+    zoomAnim_ = zoommotion::State{};
+    ApplyZoomAtAnchor_(target, zoomAnimAnchorIX_, zoomAnimAnchorIY_,
+                       zoomAnimAnchorSX_, zoomAnimAnchorSY_);
+    TraceEvent("gh_img_view", "zoom_anim_finish", {TraceF64("zoom", zoom_)});
+    if (autoLevel_) SwitchLevel(PickAutoLevel());
+    InvalidateSvgRenderSlot_(svgSlot_);
+    RequestViewportCommit();
+}
+
+void GhImgViewWidget::StopZoomAnimation_(bool notify) {
+    if (!zoomAnim_.active) return;
+    zoomAnim_ = zoommotion::State{};
+    TraceEvent("gh_img_view", "zoom_anim_stop",
+               {TraceF64("zoom", zoom_), TraceBool("notify", notify)});
+    if (autoLevel_) SwitchLevel(PickAutoLevel());
+    InvalidateSvgRenderSlot_(svgSlot_);
+    if (notify) RequestViewportCommit();
+}
+
 void GhImgViewWidget::Fit() {
+    StopZoomAnimation_(false);   // 下面无条件提交
     if (info_.fullWidth == 0 || info_.fullHeight == 0) return;
     float w = std::max(1.0f, rect.right - rect.left);
     float h = std::max(1.0f, rect.bottom - rect.top);
@@ -2523,8 +2697,13 @@ void GhImgViewWidget::Fit() {
 }
 
 void GhImgViewWidget::SetRotation(int angle) {
+    const bool interrupted = zoomAnim_.active;
+    if (interrupted) StopZoomAnimation_(false);
     int n = NormalizeAngle(angle);
-    if (n == rotation_) return;
+    if (n == rotation_) {
+        if (interrupted) RequestViewportCommit();
+        return;
+    }
     rotation_ = n;
     // pan / zoom 都保留 (用户预期: 旋转不丢视图状态). pan 在屏幕空间, 跟
     // rotation 解耦, 不需要旋转 pan 向量 — 详见类注释.
@@ -2533,6 +2712,7 @@ void GhImgViewWidget::SetRotation(int angle) {
 }
 
 void GhImgViewWidget::Reset() {
+    StopZoomAnimation_(false);   // 下面无条件提交
     zoom_ = 1.0f;
     panX_ = 0; panY_ = 0;
     if (autoLevel_) SwitchLevel(PickAutoLevel());
@@ -2566,7 +2746,11 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
         rect.top    != lastNotifiedRect_.top    ||
         rect.right  != lastNotifiedRect_.right  ||
         rect.bottom != lastNotifiedRect_.bottom) {
-        if (viewUpdateDepth_ > 0) {
+        if (zoomAnim_.active) {
+            /* 缩放动画中视口尺寸变了 (窗口缩放/布局): 锚点的屏幕坐标已失去意义,
+             * 直接跳到终点并提交 (内部 fire 视口回调, 同时更新 lastNotifiedRect_)。 */
+            FinishZoomAnimation();
+        } else if (viewUpdateDepth_ > 0) {
             pendingViewportNotify_ = true;
             TraceEvent("gh_img_view", "draw_viewport_deferred");
         } else {
@@ -2584,6 +2768,17 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
 
     D2D1_RECT_F dest = ComputeDestRect();   // logical (pre-rotation) dest
 
+    /* 外画阴影 (build 321): 在控件裁剪之外, 围着图片可见部分 (visual ∩ rect) 画,
+     * 范围限在 rect 外扩 shadowOutset_ 以内。溢出时可见部分 = 控件矩形本身。 */
+    if (shadow_ && shadowOutset_ > 0.0f) {
+        const D2D1_RECT_F vis{std::max(visual.left, rect.left), std::max(visual.top, rect.top),
+                              std::min(visual.right, rect.right),
+                              std::min(visual.bottom, rect.bottom)};
+        const D2D1_RECT_F vp{rect.left - shadowOutset_, rect.top - shadowOutset_,
+                             rect.right + shadowOutset_, rect.bottom + shadowOutset_};
+        DrawImageShadow_(r, vis, vp);
+    }
+
     r.PushClip(rect);
 
     /* 棋盘垫层: 画在一切图像内容之下, 只覆盖图片区域 (visual = 旋转后可见
@@ -2592,7 +2787,7 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
      * 求交不会移动花纹。 */
     /* 图片阴影: 画在棋盘和一切图像内容之下。只画图片矩形外圈, 所以跟棋盘
      * (只画图片矩形内) 在空间上不重叠, 先后顺序无所谓。 */
-    if (shadow_) DrawImageShadow_(r, visual, rect);
+    if (shadow_ && shadowOutset_ <= 0.0f) DrawImageShadow_(r, visual, rect);
 
     if (checkerboard_) {
         D2D1_RECT_F cb = visual;
@@ -2738,7 +2933,9 @@ void GhImgViewWidget::OnDraw(Renderer& r) {
             if (!coversVisible || !scaleOk) {
                 if (!hasRaster) {
                     EnsureSvgRaster(reqL, reqT, reqR, reqB, renW, renH, r);
-                } else {
+                } else if (!zoomAnim_.active) {
+                    /* 缩放动画期间沿用旧栅格缩放绘制, 不逐帧排后台重渲;
+                     * 到位那帧 (动画已结束) 再按终点倍率请求一次。 */
                     RequestSvgRasterAsync_(reqL, reqT, reqR, reqB, renW, renH,
                                            GetCurrentThreadId());
                 }
@@ -3005,6 +3202,9 @@ void GhImgViewWidget::DrawLevel(Renderer& r, uint32_t level, const D2D1_RECT_F& 
 
 bool GhImgViewWidget::OnMouseDown(const MouseEvent& e) {
     if (!Contains(e.x, e.y)) return false;
+    /* 按下即"抓住"画面: 动画停在当前倍率, 否则画面会在手底下继续缩放。
+     * 不在这里通知 —— 松手 OnMouseUp 统一 fire 一次。 */
+    StopZoomAnimation_(false);
     dragging_   = true;
     dragStartX_ = e.x;
     dragStartY_ = e.y;
@@ -3027,9 +3227,12 @@ bool GhImgViewWidget::OnMouseMove(const MouseEvent& e) {
     // 观察拖动手势 (如"拖出图片"), 只是被锁轴不平移; 命令式 SetPan 不受影响。
     // 长图锁水平 (lockX,!lockY) → 左右固定居中、上下仍可拖动阅读。
     if (panLockX_ && panLockY_) return true;   // 全锁: 无平移、无重绘 (同原 early-return)
+    const float oldPanX = panX_, oldPanY = panY_;
     if (!panLockX_) panX_ = dragPanX_ + (e.x - dragStartX_);
     if (!panLockY_) panY_ = dragPanY_ + (e.y - dragStartY_);
     ConstrainPan();
+    /* build 309: 拖动途中只发轻量的变换回调 (interacting=1), 视口回调仍留到松手。 */
+    if (panX_ != oldPanX || panY_ != oldPanY) NotifyTransform_();
     /* L47 follow-up: drag 期间完全不 fire NotifyViewport, drag 结束 OnMouseUp
      * 才 fire 一次精解. 之前实测节流 100ms 也不够 — drag 跨越 tile 数决定
      * 总 enqueue 量, 不取决于 callback fire 频率. 1 秒 drag 实测 234 tile
@@ -3065,7 +3268,12 @@ bool GhImgViewWidget::OnMouseWheel(const MouseEvent& e) {
     // hook 已在分发开头无条件 fire) 自行决定滚轮行为 (如切图). 返 false = 未消费.
     if (!wheelZoomEnabled_) return false;
     float factor = (e.delta > 0) ? 1.25f : 1.0f / 1.25f;
-    SetZoomAround(zoom_ * factor, e.x, e.y);
+    if (wheelZoomSmoothMs_ > 0.0f) {
+        /* 基于终点累乘: 动画中连滚几格, 每格都算数, 不会被"当前中间值"吞掉。 */
+        AnimateZoomAround(ZoomStepBase(e.delta > 0) * factor, e.x, e.y, wheelZoomSmoothMs_);
+    } else {
+        SetZoomAround(zoom_ * factor, e.x, e.y);
+    }
     return true;
 }
 
@@ -3229,9 +3437,25 @@ void GhImgViewWidget::ConstrainPan() {
     // 后续若要"小图居中、大图限边界"再加。
 }
 
-void GhImgViewWidget::NotifyViewport() {
-    if (!onViewportChanged) return;
+void GhImgViewWidget::NotifyTransform_() {
+    if (!onTransformChanged) return;
     if (info_.fullWidth == 0 || info_.fullHeight == 0) return;
+    Transform t{};
+    t.zoom = zoom_;
+    t.panX = panX_;
+    t.panY = panY_;
+    t.rotation = rotation_;
+    t.interacting = dragging_ || zoomAnim_.active;
+    onTransformChanged(t);
+}
+
+void GhImgViewWidget::NotifyViewport() {
+    if (info_.fullWidth == 0 || info_.fullHeight == 0) return;
+    /* build 309: 每次落定都同步一次变换回调 (落定的唯一出口, 含松手 / 动画到位 /
+     * 命令式 set_zoom / set_pan / 旋转 / fit)。放在 onViewportChanged 判空之前:
+     * 宿主可以只挂变换回调。 */
+    NotifyTransform_();
+    if (!onViewportChanged) return;
     {
         TraceEvent("gh_img_view", "notify_viewport",
                    {TraceF64("zoom", zoom_),

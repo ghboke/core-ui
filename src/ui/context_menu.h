@@ -5,6 +5,7 @@
 #include "renderer.h"
 #include "theme.h"
 #include "widget.h"
+#include <atomic>
 #include <string>
 #include <vector>
 #include <memory>
@@ -27,6 +28,8 @@ struct MenuItem {
     bool enabled = true;
     bool isSeparator = false;
     ContextMenuPtr submenu;
+    /* build 303: 声明式 @click / onclick, 已绑定本行的迭代变量。空 = 没写。 */
+    std::function<void()> action;
     /* 整个 item row 的 content widget tree — 跟普通 widget 同款渲染路径
      * (CSS cascade / reactive bindings / OnDraw / HitTest). separator
      * 时为 null. PageState::PopulateMenuItem 实例化并装入. */
@@ -38,7 +41,8 @@ struct MenuItem {
  * 暴露点击项的 id 字符串 + 全部静态属性, 让宿主按 key / data-* 路由。 */
 struct MenuClickInfo {
     std::string id;                                          // "id" attr (key 或数字串), 可空
-    std::vector<std::pair<std::string,std::string>> attrs;   // 该项全部静态属性 (含 id)
+    std::vector<std::pair<std::string,std::string>> attrs;   // 该项全部属性 (含 id)
+    std::function<void()> action;   // 声明式 @click (有则由窗口先执行, 见 WM_APP+100)
     const char* Attr(const char* name) const {
         if (!name) return nullptr;
         for (const auto& kv : attrs) if (kv.first == name) return kv.second.c_str();
@@ -67,6 +71,10 @@ public:
     void AddSeparator();
     void AddSubmenu(WidgetPtr entryContent, ContextMenuPtr submenu);
     void SetEnabled(int id, bool enabled);
+    /* 只改最近 Add 的那一项 —— 声明式 populate 用。按 id 批量改会连累同一
+     * v-for 的其它行 (它们曾共用编译期 id), submenu 行 id 又恒为 -1 改不到。 */
+    void SetLastItemEnabled(bool enabled);
+    void SetLastItemAction(std::function<void()> action);
     void SetBgColor(D2D1_COLOR_F color) { bgColor_ = color; hasBgColor_ = true; }
     void SetFrostedMaterial(bool enabled) { frostedMaterial_ = enabled; ReleaseBackdropResource(); }
     void SetBackdropBlur(float radius) { backdropBlurRadius_ = radius; ReleaseBackdropResource(); }
@@ -77,6 +85,21 @@ public:
     float CornerRadius() const {
         return cornerRadius_ >= 0.0f ? cornerRadius_ : kCornerRadius;
     }
+
+    /* popup 窗口现在是"关了也留着复用"的 (见 HidePopupWindow), 所以对象
+     * 析构时必须真销毁, 否则隐藏窗口活到进程结束. */
+    ~ContextMenu();
+
+    /* popup 菜单共享的 D3D / DComp 设备是进程内懒建的, ui_shutdown 收尾时放掉.
+     * 跟 Renderer::ReleaseOffscreenDevice 同款口径. */
+    static void ReleaseSharedGpu();
+
+    /* 打开动画 (对标 WinUI MenuPopupThemeTransition, 见 menu_open_motion.h)。进程全局,
+     * 下次弹出生效; 由 DComp 合成器驱动, 不占 UI / overlay 线程。timeScale 是调试用的
+     * 放慢倍数, 夹在 [1, 20]。 */
+    static void SetOpenAnimationEnabled(bool enabled);
+    static bool OpenAnimationEnabled();
+    static void SetOpenAnimationTimeScale(float scale);
 
     // Show / hide
     // parentHwnd: owner window; x,y: screen coordinates
@@ -113,10 +136,14 @@ public:
      * submenu) 计算出的最大 MenuWidth 回写到每个 ContextMenu, submenu 至少
      * 跟主菜单同宽. 用户视觉感受 "菜单系列宽度一致". */
     void SetMinPropagatedWidth(float w) { minPropagatedWidth_ = w; InvalidateLayout(); }
+    /* build 307: 本菜单自己的最小宽度 (<menu min-width>), 0 = 不限, 不传给子菜单。 */
+    void SetMinWidth(float w) { minWidth_ = w; InvalidateLayout(); }
     /* build 85: expose MenuWidth — PageState 算完 reserved 后查 final 宽,
      * 再 propagate 到 submenu. */
     float MenuWidth() const;
     float MenuHeight() const;
+    /* 快捷键列宽 (含 16 DIP 呼吸), 宽度 / 排版 / 绘制共用; 0 = 无快捷键。 */
+    float ShortcutColumnWidth() const;
 
     // Rendering
     void Draw(Renderer& r);
@@ -131,6 +158,7 @@ public:
     // 点击项的字符串 id + 全部属性 (submenu 点击会沿链传播到 root)。
     const std::string& ClickedItemStrId() const { return clickedStrId_; }
     const std::vector<std::pair<std::string,std::string>>& ClickedItemAttrs() const { return clickedAttrs_; }
+    const std::function<void()>& ClickedItemAction() const { return clickedAction_; }
 
     // Geometry
     D2D1_RECT_F Bounds() const;
@@ -139,6 +167,9 @@ public:
     // ---- Debug / simulation access ----
     // 用于从 debug API 查询和模拟菜单交互，不直接暴露 items_
     int  ItemCount() const { return (int)items_.size(); }
+    const MenuItem* ItemAt(int index) const {
+        return (index >= 0 && index < (int)items_.size()) ? &items_[index] : nullptr;
+    }
     int  ItemIdAt(int index) const;          // -1 out of range / separator
     bool ItemEnabled(int index) const;
     bool ItemIsSeparator(int index) const;
@@ -175,9 +206,19 @@ private:
     float x_ = 0, y_ = 0;
     int hoveredIndex_ = -1;
     int openSubmenuIndex_ = -1;
+    /* hover 到带 submenu 的行后, 等 kSubmenuHoverDelayMs 才真开 —— 快速划过
+     * 整张菜单时一个 popup 都不建. -1 = 没有待开的. */
+    int pendingSubmenuIndex_ = -1;
     int clickedId_ = -1;
     std::string  clickedStrId_;                                          // 点击项字符串 id (跟 clickedId_ 同步设)
     std::vector<std::pair<std::string,std::string>> clickedAttrs_;       // 点击项全部属性
+    std::function<void()> clickedAction_;                                 // 点击项的声明式 @click
+    /* 记下点击项 (id + 属性 + 动作), 并生成投递给父窗口的载荷。 */
+    void RecordClick(const MenuItem& item);
+    void RecordClickFrom(const ContextMenu& sub);
+    MenuClickInfo* MakeClickInfo() const {
+        return new MenuClickInfo{clickedStrId_, clickedAttrs_, clickedAction_};
+    }
     D2D1_COLOR_F bgColor_ = {};
     bool hasBgColor_ = false;
     bool frostedMaterial_ = false;
@@ -201,6 +242,7 @@ private:
     float reservedContentWidth_ = 0.0f;
     /* Build 85+: tree-wide max MenuWidth, submenu 至少跟主菜单同宽. */
     float minPropagatedWidth_ = 0.0f;
+    float minWidth_ = 0.0f;
     bool layoutValid_ = false;
     float layoutWidth_ = 0.0f;
     float layoutHeight_ = 0.0f;
@@ -229,6 +271,11 @@ private:
     // (kShadowMargin, kShadowMargin), leaving room for the blurred shadow
     // halo to spread outward.
     static constexpr float kShadowMargin = 18.0f;
+    /* submenu hover 延时开 (Win11 / macOS 同款手感). 实测一次建 popup 要
+     * ~107ms, 划过就开会把 OverlayService 的消息泵堵死. */
+    static constexpr UINT kSubmenuHoverTimerId = 2;
+    static constexpr UINT kSubmenuHoverDelayMs = 160;
+    static constexpr UINT kAutoCloseTimerId = 1;
 
     // (MenuWidth / MenuHeight 移到 public)
     bool HasAnyIcon() const;
@@ -241,9 +288,12 @@ private:
     HWND popupHwnd_ = nullptr;
     Renderer popupRenderer_;
     HWND parentHwnd_ = nullptr;
+    /* 建 popup 窗口时用的 owner. 复用前要比对 —— owner 变了只能重建. */
+    HWND popupOwnerHwnd_ = nullptr;
     bool popupRendererReady_ = false;
     int popupWidthPx_ = 0;
     int popupHeightPx_ = 0;
+    UINT popupDpi_ = 0;
     ComPtr<ID3D11Device> popupD3DDevice_;
     ComPtr<ID2D1Device> popupD2DDevice_;
     ComPtr<ID2D1DeviceContext> popupD2DContext_;
@@ -252,19 +302,46 @@ private:
     ComPtr<IUnknown> popupDcompDevice_;
     ComPtr<IUnknown> popupDcompTarget_;
     ComPtr<IUnknown> popupDcompVisual_;
+    /* 打开动画: 挂在 popupDcompVisual_ 上的裁剪框 + 透明度效果组。 */
+    ComPtr<IUnknown> popupDcompClip_;
+    ComPtr<IUnknown> popupDcompEffect_;
+    /* 这次弹出被屏幕边缘往上推了 (落在锚点上方): 打开动画改成从下往上展开。 */
+    bool openUpward_ = false;
     ResourceKey backdropResourceKey_{};
     // 父级菜单（子菜单对象里指向打开它的那个菜单）。ROOT 为 nullptr。
     // 用于子菜单 leaf 被点击后沿链向上 Close，避免 root 菜单残留。
     ContextMenu* parentMenu_ = nullptr;
 
     void CreatePopupWindow(HWND parent, int screenX, int screenY);
+    /* 复用已有窗口: 移到新位置 + 重绘 + 显示. 省掉 CreateWindowEx (~37ms)
+     * 和第一次 ShowWindow 的 DWM 开销 (~35ms). */
+    void ReshowPopupWindow(HWND parent, int screenX, int screenY);
+    /* Close 走这条: 只 SW_HIDE, 保留 hwnd / swapchain / target bitmap. */
+    void HidePopupWindow();
     void DestroyPopupWindow();
+    void OpenSubmenuPopup(int index);
+    void OpenPendingSubmenu();
+    void CancelPendingSubmenu();
+    void CloseOpenSubmenu();
     void CaptureBackdrop(int screenX, int screenY, int width, int height, float dpiScale);
     void ReleaseBackdropResource();
+    /* 弹出 = 截屏 + 模糊 + 移位 + 绘制 + 显示, 整段投到 overlay 线程异步做,
+     * 宿主 UI 线程不等 (以前同步等 60ms+, 宿主动图停帧)。几何在 UI 线程算好传入。 */
+    void PostShowPopup(HWND hwnd, int screenX, int screenY, int w, int h,
+                       int marginPx, int cardW, int cardH, float dpiScale, bool move,
+                       const char* traceName);
+    /* 屏障: 还有没做完的异步弹出就等它做完。UI 线程要改菜单状态 (再次 Show
+     * 重建 items_ / Close / 销毁窗口) 之前调, 避免和 overlay 线程上的绘制同时
+     * 读写。没有挂起的弹出时零开销。 */
+    void WaitPendingShow();
+    std::atomic<int> pendingShows_{0};
     bool EnsurePopupRenderer(int widthPx, int heightPx);
     bool BindPopupTarget(int widthPx, int heightPx);
     void ReleasePopupRenderer();
     void RenderPopupFrame();
+    /* 显示前调 (overlay 线程): 开关打开时给 visual 挂好打开动画, 关闭时复位成静止
+     * 终态。窗口复用, 每次弹出都要重设。返回是否真的挂上了动画。 */
+    bool ApplyOpenAnimation(int windowW, int windowH, int marginPx, int cardH, bool upward);
     int  WritePopupScreenshot(const wchar_t* outPath);
 
     LRESULT HandleOverlayMessage(HWND hwnd, UINT msg, WPARAM wParam,

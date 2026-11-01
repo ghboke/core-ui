@@ -44,11 +44,18 @@ RenderThread& RenderThread::Instance() {
 
 RenderThread::~RenderThread() {
     Stop();
+    if (wakeEvent_) CloseHandle(wakeEvent_);
+}
+
+void RenderThread::Wake() {
+    cv_.notify_one();
+    if (wakeEvent_) SetEvent(wakeEvent_);
 }
 
 void RenderThread::Start() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (running_) return;
+    if (!wakeEvent_) wakeEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     stopRequested_ = false;
     running_ = true;
     worker_ = std::thread(&RenderThread::ThreadMain, this);
@@ -61,6 +68,7 @@ void RenderThread::Stop() {
         stopRequested_ = true;
     }
     cv_.notify_all();
+    if (wakeEvent_) SetEvent(wakeEvent_);
     if (worker_.joinable()) worker_.join();
     std::lock_guard<std::mutex> lock(mutex_);
     latestJobs_.clear();
@@ -70,19 +78,21 @@ void RenderThread::Stop() {
     running_ = false;
 }
 
-void RenderThread::RegisterWindow(RenderWindowId id, HWND hwnd, RenderSurfaceKind surfaceKind) {
+void RenderThread::RegisterWindow(RenderWindowId id, HWND hwnd, RenderSurfaceKind surfaceKind,
+                                  std::shared_ptr<LayeredFrameBuffer> layered) {
     if (!id.IsValid() || !hwnd) return;
     bool notify = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = windows_.find(id.window_id);
         if (it == windows_.end()) {
-            windows_.emplace(id.window_id, std::make_shared<RenderWindow>(id, hwnd, surfaceKind));
+            windows_.emplace(id.window_id,
+                             std::make_shared<RenderWindow>(id, hwnd, surfaceKind, layered));
             return;
         }
         if (it->second && it->second->Matches(id) && it->second->Hwnd() == hwnd &&
-            it->second->SurfaceKind() == surfaceKind) {
-            it->second->Register(id, hwnd, surfaceKind);
+            it->second->SurfaceKind() == surfaceKind && it->second->Layered() == layered) {
+            it->second->Register(id, hwnd, surfaceKind, layered);
             return;
         }
         if (it->second) {
@@ -92,10 +102,11 @@ void RenderThread::RegisterWindow(RenderWindowId id, HWND hwnd, RenderSurfaceKin
         completedGenerations_.erase(id.window_id);
         retiredWindows_.push_back(std::move(it->second));
         windows_.erase(it);
-        windows_.emplace(id.window_id, std::make_shared<RenderWindow>(id, hwnd, surfaceKind));
+        windows_.emplace(id.window_id,
+                         std::make_shared<RenderWindow>(id, hwnd, surfaceKind, layered));
         notify = true;
     }
-    if (notify) cv_.notify_one();
+    if (notify) Wake();
 }
 
 void RenderThread::UnregisterWindow(RenderWindowId id) {
@@ -113,7 +124,7 @@ void RenderThread::UnregisterWindow(RenderWindowId id) {
             notify = true;
         }
     }
-    if (notify) cv_.notify_one();
+    if (notify) Wake();
 }
 
 void RenderThread::Submit(FrameJob job) {
@@ -122,7 +133,7 @@ void RenderThread::Submit(FrameJob job) {
     auto it = windows_.find(job.window.window_id);
     if (it == windows_.end() || !it->second || !it->second->Matches(job.window)) return;
     latestJobs_.insert_or_assign(job.window.window_id, std::move(job));
-    cv_.notify_one();
+    Wake();
 }
 
 bool RenderThread::PresentPrepared(RenderWindowId id, bool skipVSync, uint32_t timeoutMs) {
@@ -140,7 +151,7 @@ bool RenderThread::PresentPrepared(RenderWindowId id, bool skipVSync, uint32_t t
         }
         presentJobs_.push_back(std::move(job));
     }
-    cv_.notify_one();
+    Wake();
     if (future.wait_for(std::chrono::milliseconds(timeoutMs)) != std::future_status::ready) {
         return false;
     }
@@ -163,7 +174,7 @@ int RenderThread::ScreenshotRegion(RenderWindowId id, D2D1_RECT_F region,
         if (it == windows_.end() || !it->second || !it->second->Matches(id)) return -1;
         screenshotJobs_.push_back(std::move(job));
     }
-    cv_.notify_one();
+    Wake();
     return future.get();
 }
 
@@ -363,6 +374,8 @@ void RenderThread::ThreadMain() {
                     : -1;
                 screenshot.result.set_value(result);
                 lock.lock();
+            } else if (!latestJobs_.empty()) {
+                WaitForFrameSlotLocked(lock);
             }
             continue;
         }
@@ -416,22 +429,63 @@ void RenderThread::ThreadMain() {
     if (coInitialized) CoUninitialize();
 }
 
+bool RenderThread::JobNeedsFrameSlot(const FrameJob& job) {
+    /* 改尺寸事务的预备帧 (defer_present) 和收尾 / 截图帧要立刻画, 不等名额: UI 线程
+     * 在 WaitForGeneration 上等着它们。预备帧交的时候再补拿 (Renderer::PresentPrepared)。 */
+    return job.render_thread_present && !job.defer_present &&
+           job.policy != PresentPolicy::Final && job.policy != PresentPolicy::Screenshot;
+}
+
 std::optional<FrameJob> RenderThread::TakeNextJobLocked() {
     if (latestJobs_.empty()) return std::nullopt;
 
-    auto best = latestJobs_.begin();
-    for (auto it = std::next(latestJobs_.begin()); it != latestJobs_.end(); ++it) {
+    auto best = latestJobs_.end();
+    for (auto it = latestJobs_.begin(); it != latestJobs_.end(); ++it) {
         const auto& a = it->second;
+        if (JobNeedsFrameSlot(a)) {
+            auto w = windows_.find(it->first);
+            // 窗口已不在: 照常取出, 渲染那边按无效窗口处理掉
+            if (w != windows_.end() && w->second && !w->second->TryAcquireFrameSlot()) continue;
+        }
+        if (best == latestJobs_.end()) { best = it; continue; }
         const auto& b = best->second;
         if (a.priority > b.priority ||
             (a.priority == b.priority && a.generation > b.generation)) {
             best = it;
         }
     }
+    if (best == latestJobs_.end()) return std::nullopt;   // 都在等名额
 
     FrameJob job = std::move(best->second);
     latestJobs_.erase(best);
     return job;
+}
+
+void RenderThread::WaitForFrameSlotLocked(std::unique_lock<std::mutex>& lock) {
+    std::vector<HANDLE> handles{wakeEvent_};
+    std::vector<std::shared_ptr<RenderWindow>> owners;
+    for (const auto& entry : latestJobs_) {
+        auto it = windows_.find(entry.first);
+        if (it == windows_.end() || !it->second) continue;
+        HANDLE h = it->second->FrameSlotWaitable();
+        if (!h || handles.size() >= MAXIMUM_WAIT_OBJECTS) continue;
+        handles.push_back(h);
+        owners.push_back(it->second);
+    }
+    if (owners.empty() || !wakeEvent_) return;
+
+    lock.unlock();
+    const DWORD r = WaitForMultipleObjects(static_cast<DWORD>(handles.size()), handles.data(),
+                                           FALSE, Renderer::kFrameSlotWaitMs);
+    lock.lock();
+    if (r > WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + handles.size()) {
+        owners[r - WAIT_OBJECT_0 - 1]->MarkFrameSlotHeld();   // 等到 = 已占用这个名额
+    } else if (r == WAIT_TIMEOUT) {
+        /* 系统一直没取帧 (窗口刚被遮挡 / 驱动异常): 不等了, 照画照交。 */
+        TraceEvent("render_thread", "frame_slot_timeout",
+                   {TraceI64("windows", static_cast<int64_t>(owners.size()))});
+        for (auto& w : owners) w->MarkFrameSlotHeld();
+    }
 }
 
 } // namespace ui

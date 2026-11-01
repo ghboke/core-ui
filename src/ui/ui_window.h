@@ -14,6 +14,7 @@
 #include <shellapi.h>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,8 @@ public:
     std::function<void(const std::wstring&)> onDrop;
     std::function<void(int)> onKey;
     std::function<void(float, float)> onRightClick;
+    /* L297: 中键 / 侧键 X1 / X2 按下。参数为 Win32 VK 码 + 客户区 DIP 坐标。 */
+    std::function<void(int, float, float)> onMouseButton;
     std::function<void(const MenuClickInfo*)> onMenuItemClick;  // 点击项 id+属性载荷
     /* L219: 标题栏背景被"拖动"(按下后超过系统拖动阈值)时触发。仅当
      * titlebarDragIntercept_=true(宿主开启, 如全屏态)时拦截 —— 此时不进系统移动
@@ -115,6 +118,14 @@ public:
      * Show / ShowImmediate 消费一次 (走 SW_SHOWMAXIMIZED 路径) 后清零, 不
      * 残留影响后续 ShowWindow(SW_HIDE)+Show() 循环. */
     bool startMaximizedPending_ = false;
+    /* config.copy_swap_chain: 建窗即定的交换链类型 (复制模式), 见 RegisterRenderWindow。 */
+    bool copySwapChain_ = false;
+    /* config.layered_canvas: 分层画布窗口 —— WS_EX_LAYERED, 渲染线程离屏绘制读回,
+     * UI 线程 UpdateLayeredWindow 一次提交位置 + 尺寸 + 画面 (见 layered_frame.h)。
+     * 建窗即定; 不走开场动画 / 透明度动画 (SetLayeredWindowAttributes 会让 ULW 失效)。 */
+    bool layeredCanvas_ = false;
+    /* 测试 / 诊断用: 分层画布窗口的帧缓冲 (非分层窗口为空)。 */
+    const std::shared_ptr<LayeredFrameBuffer>& LayeredFrames() const { return layeredFrames_; }
 
     // Public so Context::UpdateAnimTimers can fire it after a binding
     // application flips a widget into animating_=true outside an event handler.
@@ -153,11 +164,20 @@ private:
     void BeginAnimationFrame();
     void EnsureAnimationTimer();
     void StopAnimationTimer();
+    /* 动画心跳订阅按原因计: 控件动画 / 窗口开关动画各占一位, 全部清掉才真正退订,
+     * 免得一方结束把另一方的心跳也停了。 */
+    enum TickReason : uint32_t { kTickWidgets = 1u << 0, kTickWindowAnim = 1u << 1 };
+    void SetTickReason(uint32_t reason, bool on);
+    void StepWindowOpenAnimation();
+    void StepWindowCloseAnimation();
+    void RequestInputPaint();
     bool HasAnimationFrameWork() const;
     void PaintAndValidate();
     void OnResize(UINT width, UINT height);
     void OnDpiChanged(UINT dpi, const RECT* suggested);
     void RefreshClientSizeCache();
+    /* 按 borderless_ / resizable_ 设 Win11 圆角偏好 (见 window_corner.h)。 */
+    void ApplyCornerPreference();
     void UpdateClientSizeCache(UINT widthPx, UINT heightPx);
     D2D1_SIZE_F CachedClientSizeDip() const;
     void OnMouseMove(float x, float y);
@@ -166,7 +186,10 @@ private:
     /* 鼠标 capture 被外部夺走 (WM_CAPTURECHANGED, 典型 DoDragDrop 起拖) 时调:
      * 复位 press 中的 widget (清 pressedWidget_ + OnMouseUp 取消其 drag 状态),
      * 但不 fire onClick. 否则 widget 收不到 WM_LBUTTONUP 卡在 drag 态, 后续
-     * hover 仍被路由 OnMouseMove → 误拖/误 pan. */
+     * hover 仍被路由 OnMouseMove → 误拖/误 pan.
+     * build 308 起也用于"松开丢在窗口外": 没抓 capture 的控件 (TextArea 等)
+     * 按下后移出窗口松开, 窗口收不到 WM_LBUTTONUP; 下一条真 WM_MOUSEMOVE 不带
+     * MK_LBUTTON 时由 WndProc 调本函数补一次取消。 */
     void CancelMouseCapture();
     void OnMouseDoubleClick(float x, float y);
     void OnMouseWheel(float x, float y, int delta);
@@ -174,6 +197,9 @@ private:
     LRESULT OnNcCalcSize(WPARAM wParam, LPARAM lParam);
     LRESULT OnNcHitTest(int x, int y);
     void OnGetMinMaxInfo(MINMAXINFO* mmi);
+    /* 跨屏最大化兜底: 最大化态窗口矩形超出当前屏工作区就纠回。
+     * 返 true = 已发起纠正 (真正的 layout 在嵌套 WM_SIZE 里做)。 */
+    bool ClampMaximizedRectToWorkArea();
     bool IsCanvasDragHit(int sx, int sy) const;
     void UpdateDwmFrameMargins();
     void NotifyResizeCallback(UINT width, UINT height);
@@ -182,6 +208,11 @@ private:
     void StartWindowOpenAnimation();
     void StartWindowCloseAnimation();
     void UnregisterRenderWindow();
+    /* 分层画布窗口: 显示 (先画好并提交一帧再 SW_SHOWNA) / 提交前台帧 /
+     * 视觉事务收尾 (帧准备好后一次 ULW 带上新位置)。 */
+    void ShowLayeredCanvas(bool activate);
+    bool CommitLayeredFrame(const POINT* screenPos);
+    void EndLayeredCanvasTransaction(bool resizeDirty, bool paintDirty);
 
     HWND        hwnd_ = nullptr;
     HICON       hIcon_ = nullptr;
@@ -190,10 +221,18 @@ private:
     bool        canvasMode_ = false;
     bool        toolWindow_ = false;
     bool        maximized_ = false;
+    /* ClampMaximizedRectToWorkArea 的重入闸: 纠正用的 SetWindowPos 会同步
+     * 递归回 WM_SIZE, 不闸住会无限套娃。 */
+    bool        clampingMaximizedRect_ = false;
     int         configWidth_ = 0, configHeight_ = 0;
     /* 用户覆盖的最小窗口尺寸（0 = 用 theme::kMin* 默认值）。
      * 无边框画布模式下可以小于默认。 */
     int         minWOverride_ = 0, minHOverride_ = 0;
+    /* build 328: 高度跟随内容。applying 闸住 SetWindowPos → WM_SIZE → LayoutRoot
+     * 的同步递归, 递归那趟只排版不再改尺寸。 */
+    bool        autoHeight_ = false;
+    bool        autoHeightApplying_ = false;
+    bool        ApplyAutoHeight();
     /* 背景模式：0=主题色填充（默认），1=透明/不擦背景（widget 自己全覆盖画）。
      * 无边框画布模式下设 1，避免 SetWindowPos 扩窗口时的背景闪烁。 */
     int         bgMode_ = 0;
@@ -202,6 +241,11 @@ private:
      * exit 时清零. WM_SIZING 收到 user 拖出的 RECT 后, 按 ratio 算合法 size
      * 写回, Win32 把这个 RECT 当 user 实际拖的 size. */
     int         aspectLockW_ = 0, aspectLockH_ = 0;
+    /* build 321: 分层画布窗口透明底 (清屏用 alpha 0, 透明像素鼠标点穿)。 */
+    bool        layeredTransparent_ = false;
+    /* build 321: 缩放边框内缩 (dip)。窗口四周留透明边距 (画阴影) 时, resize 感应带
+     * 落在内缩后的内容矩形边缘; aspect lock 也按内容矩形算。边距里其余区域不响应。 */
+    float       resizeInset_ = 0.0f;
     UINT        dpi_ = 96;
     float       dpiScale_ = 1.0f;
     UINT        clientWidthPx_ = 0;
@@ -212,14 +256,22 @@ private:
     uint64_t    hwndGeneration_ = 0;
     RenderWindowId renderWindowId_{};
     bool        renderThreadPresentActive_ = false;
+    std::shared_ptr<LayeredFrameBuffer> layeredFrames_;
+    /* ULW 提交期间 (会同步收到 WM_SIZE): 画面已是新尺寸, 不再另请一帧。 */
+    bool        layeredCommitting_ = false;
     uint64_t    lastDeviceRecoveryGeneration_ = 0;
 
     Renderer    renderer_;
     FrameScheduler frameScheduler_;
     MeasureContext measureContext_;
     WidgetPtr   root_;
+    uint64_t    layoutGenSeen_ = 0;   // build 306: 已处理到的排版请求代号 (见 ui::LayoutGeneration)
     Widget*     hoveredWidget_ = nullptr;
     Widget*     pressedWidget_ = nullptr;
+    /* build 308: 当前这次按下来自 SimMouseDown (调试管道 / 测试注入)。注入的按下
+     * 没有真实左键, 期间物理鼠标划过窗口产生的 WM_MOUSEMOVE 不带 MK_LBUTTON,
+     * 不能据此判"松开丢失"把注入的拖动取消掉。 */
+    bool        pressFromSim_ = false;
     ContextMenuPtr activeMenu_;
 
     void     DestroyToast();
@@ -227,11 +279,29 @@ private:
     bool        startupRevealPending_ = false;
     bool        startupRevealPosted_ = false;
     bool        caretBlinkTimerRunning_ = false;
-    bool        toggleAnimTimerRunning_ = false;
+    uint32_t    tickReasons_ = 0;   // TickReason 位; 非 0 = 已订阅 FrameTicker
+    /* 鼠标移动重绘合并 (RequestInputPaint): 已约好 vblank 前那一帧 / 有未画的变化 /
+     * 上一帧提交的 QPC 时刻。 */
+    bool        inputPaintPending_ = false;
+    bool        inputPaintDirty_ = false;
+    int         inputMoveDepth_ = 0;     // >0: 正在处理鼠标移动, Invalidate 只记脏
+    int64_t     inputMoveStartQpc_ = 0;  // 最外层这次移动开始处理的时刻 (判嵌套消息循环)
+    int64_t     inputPaintDeadline_ = 0; // 已约好那一帧的时刻 (过点太久没到就重新约)
+    bool        testIsolated_ = false;   // 建窗时 UI_CORE_TEST_ISOLATE=1: 丢弃真实鼠标消息
+    void BeginInputMove() {
+        if (inputMoveDepth_++ == 0) {
+            LARGE_INTEGER q;
+            QueryPerformanceCounter(&q);
+            inputMoveStartQpc_ = q.QuadPart;
+        }
+    }
+    int64_t     lastSubmitQpc_ = 0;
     bool        renderFramePosted_ = false;
     AnimationHost animationHost_;
     AnimationManager propertyAnimations_;
-    uint64_t    lastAnimationFrameTick_ = 0;
+    uint64_t    lastAnimationFrameTick_ = 0;   // QPC 计数, 只给 trace 量帧间隔
+    bool        animFrameFromTimer_ = false;   // 本次绘制是动画定时器触发的 (trace 用)
+    bool        moveFromSim_ = false;          // 调试模拟的移动: 不登记 WM_MOUSELEAVE 跟踪
 
     // Drag & drop (HTML5-style; see Widget draggable/onDrop* hooks)
     Widget*     dragSource_ = nullptr;      // draggable widget under the press
@@ -244,6 +314,15 @@ private:
     static constexpr float kDragThresholdDip = 4.0f;
     void UpdateDragOverTarget(const MouseEvent& e);
     void FinishDrag(bool dropped, const MouseEvent& e);
+    /* 拖放贴边自动滚动 (build 303, 对齐浏览器): 光标停在可滚动 ScrollView 的
+     * 上/下边缘带里时按 dragscroll::kTickMs 节拍持续滚动, 每拍重算落点。 */
+    bool        dragAutoScrollTimer_ = false;
+    void UpdateDragAutoScroll();   // 拖动中调用: 需要滚就开表, 不需要就停
+    void TickDragAutoScroll();     // 定时器节拍: 滚一步 + 刷新 dragover
+    void StopDragAutoScroll();
+    /* 按下 / 起拖时拿系统鼠标捕获。注入的按下 (pressFromSim_) 不拿: 输入不经系统,
+     * 拿了没用, 反倒在用户点别处时收到 WM_CAPTURECHANGED 把模拟操作取消。 */
+    void CaptureForPress() { if (!pressFromSim_ && hwnd_) SetCapture(hwnd_); }
 
     // Tooltip
     Widget*     tooltipWidget_ = nullptr;
@@ -334,16 +413,25 @@ public:
 
     /* 无边框画布模式相关：覆盖最小尺寸 / 背景擦除行为。0 = 恢复默认。 */
     void SetMinSize(int wDip, int hDip) { minWOverride_ = wDip; minHOverride_ = hDip; }
+    /* build 328: <window height="auto"> / ui_window_set_auto_height。开启后每次
+     * LayoutRoot 都把客户区高度定成根节点 HeightForWidth(当前宽度)。开启时立即
+     * 按当前内容定一次, 宿主在 show 前就能读到最终尺寸算居中。 */
+    void SetAutoHeight(bool on);
+    bool AutoHeight() const { return autoHeight_; }
     void SetBackgroundMode(int mode)    { bgMode_ = mode; }
     int  BackgroundMode() const         { return bgMode_; }
     /* L57: 锁定窗口 aspect 比例. 0/0 = disable. 看 aspectLockW_/H_ 注释. */
     void SetAspectLock(int ratioW, int ratioH) { aspectLockW_ = ratioW; aspectLockH_ = ratioH; }
+    void SetLayeredTransparent(bool on);
+    void SetResizeInset(float dip) { resizeInset_ = dip > 0.0f ? dip : 0.0f; }
 
     /* 窗口几何（DIP-native，内部乘 dpiScale_ 转物理像素）。
      * x/y 是屏幕物理坐标（Win32 惯例）；w/h 是 DIP（按当前 DPI 换算）。
      * 包含一次 SetWindowPos + InvalidateRect + UpdateWindow，确保 resize 后
      * 同帧内把 widget 内容画到新尺寸，减少扩大窗口时的背景闪烁。 */
     void SetWindowRect(int xScreen, int yScreen, int wDip, int hDip);
+    /* 宽高也是物理像素 (非整数缩放下 DIP 取整到不了某些像素尺寸)。 */
+    void SetWindowRectPx(int xScreen, int yScreen, int wPx, int hPx);
     void SetWindowSize(int wDip, int hDip);             /* 保持位置不变 */
     void SetWindowPosition(int xScreen, int yScreen);   /* 保持尺寸不变 */
     void GetWindowRectScreen(int* x, int* y, int* wDip, int* hDip) const;

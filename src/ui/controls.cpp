@@ -7,6 +7,8 @@
 #include "renderer.h"
 #include "resource_store.h"
 #include "ui_context.h"
+#include "toggle_visual.h"
+#include "anim_clock.h"
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -227,6 +229,7 @@ bool LabelWidget::OnKeyDown(int vk) {
 }
 
 D2D1_SIZE_F LabelWidget::SizeHint() const {
+    const float fs = DrawFontSize();   /* 与 OnDraw 同一字号, 见 controls.h */
     /* 估算文本宽度：CJK 字符按 1.0 倍 fontSize，其他按 0.55 倍 */
     /* 加粗字体每字符多约 8% 宽度，避免末字符触发 ellipsis 截断 */
     float estW = 0;
@@ -240,9 +243,9 @@ D2D1_SIZE_F LabelWidget::SizeHint() const {
         if (g_activeMeasureContext && !text_.empty()) {
             auto weight = bold_ ? DWRITE_FONT_WEIGHT_SEMI_BOLD
                                 : DWRITE_FONT_WEIGHT_NORMAL;
-            estW = g_activeMeasureContext->MeasureTextWidth(text_, fontSize_, nullptr, weight) + 1.0f;
+            estW = g_activeMeasureContext->MeasureTextWidth(text_, fs, nullptr, weight) + 1.0f;
         } else {
-            float asciiW = bold_ ? fontSize_ * 0.66f : fontSize_ * 0.62f;
+            float asciiW = bold_ ? fs * 0.66f : fs * 0.62f;
             for (wchar_t ch : text_) {
                 /* build 290: 0x2E80 这条线漏了 **U+2010–U+2027 那段通用标点**
                  * —— …(2026) —(2014) ‘’(2018/2019) “”(201C/201D) 在中文排版里
@@ -254,7 +257,7 @@ D2D1_SIZE_F LabelWidget::SizeHint() const {
                  * "收集箱…" 显示成 "收集...", 而同样 4 个字符的 "收集箱囧"
                  * (全部 >= 0x2E80) 完好。 */
                 if (ch >= 0x2E80 || (ch >= 0x2010 && ch <= 0x2027))
-                    estW += fontSize_;                     /* CJK / 全角 */
+                    estW += fs;                     /* CJK / 全角 */
                 else
                     estW += asciiW;
             }
@@ -284,38 +287,57 @@ D2D1_SIZE_F LabelWidget::SizeHint() const {
      *   - 否则:                  默认 1.3 × fontSize (现代浏览器 / Fluent UI)
      * 历史 fontSize_ + 10.0f 在密集列表偏松, 见 controls.h 注释. */
     float lineH = (lineHeightPx_ > 0.0f)    ? lineHeightPx_
-                : (lineHeightRatio_ > 0.0f) ? (lineHeightRatio_ * fontSize_)
-                                            : (fontSize_ * 1.3f);
+                : (lineHeightRatio_ > 0.0f) ? (lineHeightRatio_ * fs)
+                                            : (fs * 1.3f);
     float h = fixedH > 0 ? fixedH : lineH;
     if (wrap_ && fixedW > 0) {
-        /* 仅 fixedW 显式约束时 SizeHint 能可靠预测 wrap 后的高度. 没 fixedW
-         * 时父宽未知 (要等 DoLayout 分配 rect 才知道), SizeHint 给单行高;
-         * 父级层 layout 时若分配 rect.width < intrinsic, draw 时按 rect
-         * 宽度 wrap, 可能视觉溢出 — 这条 limitation 由调用方负责 (给
-         * fixedW 或父级提供足够 cross-axis 空间), 与之前用 parent_->rect
-         * 的方案相比换来"absolute / shrink-to-fit 不死锁"的更大好处. */
-        float availW = fixedW - padL - padR;
-        if (availW > 10.0f) {
-            extern MeasureContext* g_activeMeasureContext;
-            if (g_activeMeasureContext) {
-                auto weight = bold_ ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL;
-                float textH = g_activeMeasureContext->MeasureTextHeight(text_, availW, fontSize_, weight);
-                /* build 92 (L20): wrap 分支也走 line-height. DWrite textH 包含
-                 * ascent + descent (单行 ≈ fontSize × 1.2). 折成行数后乘 lineH.
-                 * 1.4 阈值: 单行实际 ratio ≈ 1.2, 用 1.4 当 "definitely > 1 line"
-                 * 边界, 防 ceil(1.23) 错误判 2 行. */
-                int numLines = std::max(1, (int)std::ceil(textH / (fontSize_ * 1.4f)));
-                h = numLines * lineH;
-                if (maxLines_ > 0) {
-                    float maxH = lineH * maxLines_;
-                    if (h > maxH) h = maxH;
-                }
-            }
-        }
+        /* SizeHint 只在 fixedW 显式约束时预测 wrap 后的高度; 父宽未知时给单行。
+         * 布局容器 (VBox/HBox) 定宽后改问 HeightForWidth (build 323), 不再
+         * 依赖这里 —— 之前 `width: 100%` 的 label 靠这条分支拿到的是上一次
+         * 布局换算的 fixedW, 宽度一变就过期, 折行文字和下一行叠在一起。 */
+        float wrapped = WrappedTextHeight(fixedW - padL - padR);
+        if (wrapped > 0) h = wrapped;
     }
     // CSS padding 撑大 label 整体尺寸（badge / pill / chip 用），文字仍画
     // 在 textRect = rect 减 padding 内。
     return {w + padL + padR, h + padT + padB};
+}
+
+float LabelWidget::WrappedTextHeight(float availW) const {
+    const float fs = DrawFontSize();
+    if (availW <= 10.0f) return -1.0f;
+    extern MeasureContext* g_activeMeasureContext;
+    if (!g_activeMeasureContext) return -1.0f;
+    float lineH = (lineHeightPx_ > 0.0f)    ? lineHeightPx_
+                : (lineHeightRatio_ > 0.0f) ? (lineHeightRatio_ * fs)
+                                            : (fs * 1.3f);
+    if (hfwAvailW_ == availW && hfwFont_ == fs && hfwBold_ == bold_ &&
+        hfwLineH_ == lineH && hfwMaxLines_ == maxLines_ && hfwText_ == text_) {
+        return hfwHeight_;
+    }
+    auto weight = bold_ ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL;
+    float textH = g_activeMeasureContext->MeasureTextHeight(text_, availW, fs, weight);
+    /* build 92 (L20): wrap 分支也走 line-height. DWrite textH 包含
+     * ascent + descent (单行 ≈ fontSize × 1.2). 折成行数后乘 lineH.
+     * 1.4 阈值: 单行实际 ratio ≈ 1.2, 用 1.4 当 "definitely > 1 line"
+     * 边界, 防 ceil(1.23) 错误判 2 行. */
+    int numLines = std::max(1, (int)std::ceil(textH / (fs * 1.4f)));
+    float h = numLines * lineH;
+    if (maxLines_ > 0) {
+        float maxH = lineH * maxLines_;
+        if (h > maxH) h = maxH;
+    }
+    hfwAvailW_ = availW; hfwFont_ = fs; hfwBold_ = bold_;
+    hfwLineH_ = lineH; hfwMaxLines_ = maxLines_; hfwText_ = text_;
+    hfwHeight_ = h;
+    return h;
+}
+
+float LabelWidget::HeightForWidth(float w) const {
+    if (!wrap_ || fixedH > 0) return SizeHint().height;
+    float wrapped = WrappedTextHeight(w - padL - padR);
+    if (wrapped <= 0) return SizeHint().height;
+    return wrapped + padT + padB;
 }
 
 // ---- Button ----
@@ -512,7 +534,7 @@ void CheckBoxWidget::SetChecked(bool v) {
 
 void CheckBoxWidget::UpdateAnimation() {
     checkAnim_.SetIdleTarget(checked_ ? 1.0f : 0.0f);
-    checkAnim_.SampleFrame(GetTickCount64());
+    checkAnim_.SampleFrame(AnimNowMs());
     animating_ = checkAnim_.Active();
 }
 
@@ -533,7 +555,7 @@ void CheckBoxWidget::OnDraw(Renderer& r) {
     D2D1_COLOR_F fg = css.hasFg ? css.fg : theme::kBtnText();
 
     checkAnim_.SetIdleTarget(checked_ ? 1.0f : 0.0f);
-    float t = std::clamp(checkAnim_.SampleFrame(GetTickCount64()), 0.0f, 1.0f);
+    float t = std::clamp(checkAnim_.SampleFrame(AnimNowMs()), 0.0f, 1.0f);
     animating_ = checkAnim_.Active();
 
     if (t > 0.01f) {
@@ -637,7 +659,7 @@ void SliderWidget::RetargetThumbAnimation() {
 void SliderWidget::UpdateThumbAnimation() {
     RetargetThumbAnimation();
     thumbScale_.SetIdleTarget(thumbScaleTarget_);
-    thumbScale_.SampleFrame(GetTickCount64());
+    thumbScale_.SampleFrame(AnimNowMs());
 }
 
 void SliderWidget::OnDraw(Renderer& r) {
@@ -906,7 +928,7 @@ bool TextInputWidget::GetCaretRect(D2D1_RECT_F* out) const {
     float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
     int pos = std::min(std::max(cursorPos_, 0), (int)text_.size());
     float x = rect.left + 11.0f - scrollX_ +
-              g_activeMeasureContext->MeasureTextWidth(text_.substr(0, pos),
+              g_activeMeasureContext->MeasureTextWidth(DisplayText().substr(0, pos),
                                                        fontSize);
     *out = {x, rect.top + 5, x + 1.5f, rect.bottom - 6};
     return true;
@@ -917,12 +939,13 @@ int TextInputWidget::CharIndexFromX(MeasureContext& measure, float x) const {
     float textX = rect.left + 11.0f - scrollX_;
     if (x <= textX) return 0;
 
-    for (int i = 0; i <= (int)text_.size(); i++) {
-        std::wstring substr = text_.substr(0, i);
+    const std::wstring shown = DisplayText();
+    for (int i = 0; i <= (int)shown.size(); i++) {
+        std::wstring substr = shown.substr(0, i);
         float w = measure.MeasureTextWidth(substr, fontSize, nullptr);
         float charX = textX + w;
-        if (i < (int)text_.size()) {
-            std::wstring nextSubstr = text_.substr(0, i + 1);
+        if (i < (int)shown.size()) {
+            std::wstring nextSubstr = shown.substr(0, i + 1);
             float nextW = measure.MeasureTextWidth(nextSubstr, fontSize, nullptr);
             float nextCharX = textX + nextW;
             if (x < (charX + nextCharX) / 2.0f) return i;
@@ -942,15 +965,48 @@ void TextInputWidget::DeleteSelection() {
     ClearSelection();
 }
 
+void TextInputWidget::RecordEdit(TextEditKind kind, bool isSpace) {
+    undo_.Record({text_, cursorPos_, selectionStart_, selectionEnd_}, kind,
+                 GetTickCount64(), isSpace);
+}
+
+bool TextInputWidget::UndoRedo(bool redo) {
+    const TextEditSnap cur{text_, cursorPos_, selectionStart_, selectionEnd_};
+    TextEditSnap s;
+    if (!(redo ? undo_.Redo(cur, s) : undo_.Undo(cur, s))) return false;
+    text_ = s.text;
+    cursorPos_ = s.cursor;
+    selectionStart_ = s.selStart;
+    selectionEnd_ = s.selEnd;
+    return true;
+}
+
+void TextInputWidget::AfterEdit() {
+    ResetCaretBlink();
+    extern MeasureContext* g_activeMeasureContext;
+    if (g_activeMeasureContext) EnsureCursorVisible(*g_activeMeasureContext);
+    if (onTextChanged) onTextChanged(text_);
+}
+
 void TextInputWidget::EnsureCursorVisible(MeasureContext& measure) {
     float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
     float textAreaW = rect.right - rect.left - 22.0f;  // 11px padding each side
-    std::wstring before = text_.substr(0, cursorPos_);
+    const std::wstring shown = DisplayText();
+    std::wstring before = shown.substr(0, cursorPos_);
     float cursorX = measure.MeasureTextWidth(before, fontSize, nullptr);
 
     if (cursorX - scrollX_ < 0) scrollX_ = cursorX;
     else if (cursorX - scrollX_ > textAreaW) scrollX_ = cursorX - textAreaW;
     if (scrollX_ < 0) scrollX_ = 0;
+
+    /* 还要钳住上界: 上面两条只会"为了让光标可见往前滚", 从不往回退。控件一旦
+     * 在窄状态下滚动过, 之后变宽 (窗口 resize / 布局变化 / 宿主改 rect), 文字
+     * 就会一直停在左边、右边空一大片 —— 因为此时光标已经落在可视区内, 两个
+     * 分支都不触发, 旧的 scrollX_ 就留下了。
+     * 文本比可视区窄时 maxScroll 为 0, 自然回到左端。 */
+    const float totalW = measure.MeasureTextWidth(shown, fontSize, nullptr);
+    const float maxScroll = (totalW > textAreaW) ? (totalW - textAreaW) : 0.0f;
+    if (scrollX_ > maxScroll) scrollX_ = maxScroll;
 }
 
 std::wstring TextInputWidget::GetSelectedText() const {
@@ -1046,6 +1102,7 @@ void TextInputWidget::OnDraw(Renderer& r) {
     D2D1_COLOR_F caret = css.hasCaretColor ? css.caretColor : accent;
 
     if (!text_.empty()) {
+        const std::wstring shown = DisplayText();
         float textX = rect.left + 11.0f - scrollX_;
         D2D1_RECT_F drawArea = {textX, rect.top, textX + 10000, rect.bottom};
         bool selDrawn = false;
@@ -1053,8 +1110,8 @@ void TextInputWidget::OnDraw(Renderer& r) {
         if (HasSelection()) {
             int start = std::min(selectionStart_, selectionEnd_);
             int end = std::max(selectionStart_, selectionEnd_);
-            std::wstring beforeSel = text_.substr(0, start);
-            std::wstring selected = text_.substr(start, end - start);
+            std::wstring beforeSel = shown.substr(0, start);
+            std::wstring selected = shown.substr(start, end - start);
             float x1 = textX + r.MeasureTextWidth(beforeSel, fontSize, nullptr);
             float x2 = x1 + r.MeasureTextWidth(selected, fontSize, nullptr);
             D2D1_RECT_F selRect = {x1, rect.top + 5, x2, rect.bottom - 6};
@@ -1086,24 +1143,24 @@ void TextInputWidget::OnDraw(Renderer& r) {
             if (customSelFg) {
                 // 选区前 / 选区内 / 选区后 各 push 一段 clip 画对应颜色
                 r.PushClip({rect.left, rect.top, x1, rect.bottom});
-                r.DrawText(text_, drawArea, fg, fontSize);
+                r.DrawText(shown, drawArea, fg, fontSize);
                 r.PopClip();
                 r.PushClip({x1, rect.top, x2, rect.bottom});
-                r.DrawText(text_, drawArea, selFg, fontSize);
+                r.DrawText(shown, drawArea, selFg, fontSize);
                 r.PopClip();
                 r.PushClip({x2, rect.top, rect.right, rect.bottom});
-                r.DrawText(text_, drawArea, fg, fontSize);
+                r.DrawText(shown, drawArea, fg, fontSize);
                 r.PopClip();
                 selDrawn = true;
             }
         }
 
         if (!selDrawn) {
-            r.DrawText(text_, drawArea, fg, fontSize);
+            r.DrawText(shown, drawArea, fg, fontSize);
         }
 
         if (focused && !HasSelection() && ShouldShowCaret()) {
-            std::wstring before = text_.substr(0, cursorPos_);
+            std::wstring before = shown.substr(0, cursorPos_);
             float textWidth = r.MeasureTextWidth(before, fontSize, nullptr);
             float cursorX = textX + textWidth;
             float cy1 = rect.top + 5, cy2 = rect.bottom - 5;
@@ -1128,6 +1185,7 @@ bool TextInputWidget::OnMouseDown(const MouseEvent& e) {
     bool wasFocused = focused;
     focused = Contains(e.x, e.y);
     if (focused) {
+        undo_.BreakMerge();
         extern MeasureContext* g_activeMeasureContext;
         if (g_activeMeasureContext) {
             cursorPos_ = CharIndexFromX(*g_activeMeasureContext, e.x);
@@ -1175,8 +1233,10 @@ bool TextInputWidget::OnKeyChar(wchar_t ch) {
 
     if (ch == '\b') {
         if (HasSelection()) {
+            RecordEdit(TextEditKind::Atomic);
             DeleteSelection();
         } else if (cursorPos_ > 0) {
+            RecordEdit(TextEditKind::Backspace);
             text_.erase(cursorPos_ - 1, 1);
             cursorPos_--;
         }
@@ -1184,15 +1244,13 @@ bool TextInputWidget::OnKeyChar(wchar_t ch) {
         if (inputFilter && !inputFilter(ch)) return true;
         if (maxLength >= 0 && (int)text_.size() >= maxLength) return true;
 
+        RecordEdit(TextEditKind::Typing, ch == L' ');
         if (HasSelection()) DeleteSelection();
         text_.insert(cursorPos_, 1, ch);
         cursorPos_++;
     }
 
-    ResetCaretBlink();
-    extern MeasureContext* g_activeMeasureContext;
-    if (g_activeMeasureContext) EnsureCursorVisible(*g_activeMeasureContext);
-    if (onTextChanged) onTextChanged(text_);
+    AfterEdit();
     return true;
 }
 
@@ -1216,64 +1274,81 @@ bool TextInputWidget::OnKeyDown(int vk) {
     bool shift = GetKeyState(VK_SHIFT) & 0x8000;
     bool ctrl = GetKeyState(VK_CONTROL) & 0x8000;
 
-    // Clipboard operations
+    /* build 333: Ctrl+Z 撤销, Ctrl+Y / Ctrl+Shift+Z 重做。没东西可撤也吞掉
+     * (同系统编辑框), 免得宿主的 Ctrl+Z 在打字时被误触发。 */
+    if (ctrl && (vk == 'Z' || vk == 'Y')) {
+        if (!readOnly && UndoRedo(vk == 'Y' || shift)) AfterEdit();
+        return true;
+    }
+
+    // Clipboard operations (密码模式不许把明文复制 / 剪切出去, 同系统密码框)
     if (ctrl && vk == 'C') {
-        if (HasSelection()) SetClipboardText(GetSelectedText());
+        if (HasSelection() && !password) SetClipboardText(GetSelectedText());
         return true;
     }
     if (ctrl && vk == 'X') {
-        if (readOnly) return true;
+        if (readOnly || password) return true;
         if (HasSelection()) {
             SetClipboardText(GetSelectedText());
+            RecordEdit(TextEditKind::Atomic);
             DeleteSelection();
+            AfterEdit();
         }
         return true;
     }
     if (ctrl && vk == 'V') {
         if (readOnly) return true;
         std::wstring paste = GetClipboardText();
-        if (!paste.empty()) {
+        if (!paste.empty() &&
+            (maxLength < 0 || (int)(text_.size() + paste.size()) <= maxLength)) {
+            RecordEdit(TextEditKind::Atomic);
             if (HasSelection()) DeleteSelection();
-            if (maxLength < 0 || (int)(text_.size() + paste.size()) <= maxLength) {
-                text_.insert(cursorPos_, paste);
-                cursorPos_ += (int)paste.size();
-            }
+            text_.insert(cursorPos_, paste);
+            cursorPos_ += (int)paste.size();
+            AfterEdit();
         }
-        ResetCaretBlink();
-        extern MeasureContext* g_activeMeasureContext;
-        if (g_activeMeasureContext) EnsureCursorVisible(*g_activeMeasureContext);
         return true;
     }
     if (ctrl && vk == 'A') {
-        selectionStart_ = 0;
-        selectionEnd_ = (int)text_.size();
-        cursorPos_ = selectionEnd_;
+        SelectAll();
         return true;
     }
 
     int oldPos = cursorPos_;
+    const bool navigation = (vk == 0x25 || vk == 0x27 || vk == 0x24 || vk == 0x23);
+    if (navigation) undo_.BreakMerge();
 
+    bool edited = false;
     if (vk == 0x25 /*VK_LEFT*/ && cursorPos_ > 0) cursorPos_--;
     else if (vk == 0x27 /*VK_RIGHT*/ && cursorPos_ < (int)text_.size()) cursorPos_++;
     else if (vk == 0x24 /*VK_HOME*/) cursorPos_ = 0;
     else if (vk == 0x23 /*VK_END*/) cursorPos_ = (int)text_.size();
     else if (vk == 0x2E /*VK_DELETE*/ && !readOnly) {
-        if (HasSelection()) DeleteSelection();
-        else if (cursorPos_ < (int)text_.size()) text_.erase(cursorPos_, 1);
+        if (HasSelection()) {
+            RecordEdit(TextEditKind::Atomic);
+            DeleteSelection();
+            edited = true;
+        } else if (cursorPos_ < (int)text_.size()) {
+            RecordEdit(TextEditKind::DeleteForward);
+            text_.erase(cursorPos_, 1);
+            edited = true;
+        }
     }
 
-    if (shift && (vk == 0x25 || vk == 0x27 || vk == 0x24 || vk == 0x23)) {
+    if (shift && navigation) {
         if (selectionStart_ < 0) selectionStart_ = oldPos;
         selectionEnd_ = cursorPos_;
-    } else if (vk == 0x25 || vk == 0x27 || vk == 0x24 || vk == 0x23) {
+    } else if (navigation) {
         ClearSelection();
     }
 
-    ResetCaretBlink();
-    extern MeasureContext* g_activeMeasureContext;
-    if (g_activeMeasureContext) EnsureCursorVisible(*g_activeMeasureContext);
-    if ((vk == 0x2E || (ctrl && vk == 'V') || (ctrl && vk == 'X')) && onTextChanged)
-        onTextChanged(text_);
+    if (edited) {
+        AfterEdit();
+    } else {
+        ResetCaretBlink();
+        extern MeasureContext* g_activeMeasureContext;
+        if (g_activeMeasureContext) EnsureCursorVisible(*g_activeMeasureContext);
+    }
     return true;
 }
 
@@ -1355,11 +1430,30 @@ D2D1_RECT_F TextAreaWidget::ThumbRect() const {
 }
 
 void TextAreaWidget::SetText(const std::wstring& t) {
+    if (t == text_) return;     /* v-model 同值回写, 理由同 TextInputWidget::SetText */
     text_ = t;
     cursorPos_ = (int)t.size();
     selectionStart_ = selectionEnd_ = -1;
     layoutDirty_ = true;
+    undo_.Clear();
     ResetCaretBlink();
+}
+
+void TextAreaWidget::RecordEdit(TextEditKind kind, bool isSpace) {
+    undo_.Record({text_, cursorPos_, selectionStart_, selectionEnd_}, kind,
+                 GetTickCount64(), isSpace);
+}
+
+bool TextAreaWidget::UndoRedo(bool redo) {
+    const TextEditSnap cur{text_, cursorPos_, selectionStart_, selectionEnd_};
+    TextEditSnap s;
+    if (!(redo ? undo_.Redo(cur, s) : undo_.Undo(cur, s))) return false;
+    text_ = s.text;
+    cursorPos_ = s.cursor;
+    selectionStart_ = s.selStart;
+    selectionEnd_ = s.selEnd;
+    layoutDirty_ = true;
+    return true;
 }
 
 // ----- Layout-driven helpers -----
@@ -1703,6 +1797,7 @@ bool TextAreaWidget::OnMouseDown(const MouseEvent& e) {
 
     focused = Contains(e.x, e.y);
     if (focused) {
+        undo_.BreakMerge();
         extern MeasureContext* g_activeMeasureContext;
         if (g_activeMeasureContext) {
             float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
@@ -1771,6 +1866,7 @@ void TextAreaWidget::SetSelectionRange(int start, int end) {
     if (start < 0) start = 0;
     if (end > len) end = len;
     if (start > len) start = len;
+    undo_.BreakMerge();
     if (start == end) {
         ClearSelection();
         cursorPos_ = start;
@@ -1808,13 +1904,16 @@ bool TextAreaWidget::OnKeyChar(wchar_t ch) {
 
     if (ch == '\b') {
         if (HasSelection()) {
+            RecordEdit(TextEditKind::Atomic);
             DeleteSelection();
         } else if (cursorPos_ > 0) {
+            RecordEdit(TextEditKind::Backspace);
             text_.erase(cursorPos_ - 1, 1);
             cursorPos_--;
             layoutDirty_ = true;
         }
     } else if (ch == '\r' || ch == '\n') {
+        RecordEdit(TextEditKind::Typing, true);
         if (HasSelection()) DeleteSelection();
         text_.insert(cursorPos_, 1, L'\n');
         cursorPos_++;
@@ -1822,6 +1921,7 @@ bool TextAreaWidget::OnKeyChar(wchar_t ch) {
     } else if (ch >= 32) {
         if (inputFilter && !inputFilter(ch)) return true;
         if (maxLength >= 0 && (int)text_.size() >= maxLength) return true;
+        RecordEdit(TextEditKind::Typing, ch == L' ');
         if (HasSelection()) DeleteSelection();
         text_.insert(cursorPos_, 1, ch);
         cursorPos_++;
@@ -1850,6 +1950,26 @@ bool TextAreaWidget::OnKeyDown(int vk) {
     bool shift = GetKeyState(VK_SHIFT) & 0x8000;
     bool ctrl = GetKeyState(VK_CONTROL) & 0x8000;
 
+    auto afterEdit = [&]() {
+        ResetCaretBlink();
+        EnsureCursorVisible(g_activeMeasureContext);
+        if (onTextChanged) onTextChanged(text_);
+    };
+
+    /* build 333: 撤销 / 重做, 规则同 TextInputWidget。只读时不认这两个键,
+     * 照旧冒泡给宿主 (build 279 的"不认识的键交还给窗口")。 */
+    if (ctrl && (vk == 'Z' || vk == 'Y')) {
+        if (readOnly) return false;
+        const int oldSelStart = selectionStart_, oldSelEnd = selectionEnd_;
+        if (UndoRedo(vk == 'Y' || shift)) {
+            afterEdit();
+            if ((selectionStart_ != oldSelStart || selectionEnd_ != oldSelEnd) &&
+                onSelectionChanged)
+                onSelectionChanged();
+        }
+        return true;
+    }
+
     // Clipboard
     if (ctrl && vk == 'C') {
         if (HasSelection()) SetClipboardText(GetSelectedText());
@@ -1859,26 +1979,28 @@ bool TextAreaWidget::OnKeyDown(int vk) {
         if (readOnly) return true;
         if (HasSelection()) {
             SetClipboardText(GetSelectedText());
+            RecordEdit(TextEditKind::Atomic);
             DeleteSelection();
+            afterEdit();
         }
         return true;
     }
     if (ctrl && vk == 'V') {
         if (readOnly) return true;
         std::wstring paste = GetClipboardText();
-        if (!paste.empty()) {
+        if (!paste.empty() &&
+            (maxLength < 0 || (int)(text_.size() + paste.size()) <= maxLength)) {
+            RecordEdit(TextEditKind::Atomic);
             if (HasSelection()) DeleteSelection();
-            if (maxLength < 0 || (int)(text_.size() + paste.size()) <= maxLength) {
-                text_.insert(cursorPos_, paste);
-                cursorPos_ += (int)paste.size();
-                layoutDirty_ = true;
-            }
+            text_.insert(cursorPos_, paste);
+            cursorPos_ += (int)paste.size();
+            layoutDirty_ = true;
+            afterEdit();
         }
-        ResetCaretBlink();
-        EnsureCursorVisible(g_activeMeasureContext);
         return true;
     }
     if (ctrl && vk == 'A') {
+        undo_.BreakMerge();
         selectionStart_ = 0;
         selectionEnd_ = (int)text_.size();
         cursorPos_ = selectionEnd_;
@@ -1896,7 +2018,9 @@ bool TextAreaWidget::OnKeyDown(int vk) {
                              vk == 0x28 || vk == 0x24 || vk == 0x23);
     const bool editing = (vk == 0x2E /*DELETE*/ && !readOnly);
     if (!navigation && !editing) return false;
+    if (navigation) undo_.BreakMerge();
 
+    bool edited = false;
     if (vk == 0x25 /*LEFT*/ && cursorPos_ > 0) cursorPos_--;
     else if (vk == 0x27 /*RIGHT*/ && cursorPos_ < (int)text_.size()) cursorPos_++;
     else if (vk == 0x26 /*UP*/)        cursorPos_ = PosUp(cursorPos_);
@@ -1904,24 +2028,28 @@ bool TextAreaWidget::OnKeyDown(int vk) {
     else if (vk == 0x24 /*HOME*/)      cursorPos_ = PosLineStart(cursorPos_);
     else if (vk == 0x23 /*END*/)       cursorPos_ = PosLineEnd(cursorPos_);
     else if (vk == 0x2E /*DELETE*/ && !readOnly) {
-        if (HasSelection()) DeleteSelection();
-        else if (cursorPos_ < (int)text_.size()) {
+        if (HasSelection()) {
+            RecordEdit(TextEditKind::Atomic);
+            DeleteSelection();
+            edited = true;
+        } else if (cursorPos_ < (int)text_.size()) {
+            RecordEdit(TextEditKind::DeleteForward);
             text_.erase(cursorPos_, 1);
             layoutDirty_ = true;
+            edited = true;
         }
     }
 
-    if (shift && (vk == 0x25 || vk == 0x27 || vk == 0x26 || vk == 0x28 || vk == 0x24 || vk == 0x23)) {
+    if (shift && navigation) {
         if (selectionStart_ < 0) selectionStart_ = oldPos;
         selectionEnd_ = cursorPos_;
-    } else if (vk == 0x25 || vk == 0x27 || vk == 0x26 || vk == 0x28 || vk == 0x24 || vk == 0x23) {
+    } else if (navigation) {
         ClearSelection();
     }
 
     ResetCaretBlink();
     EnsureCursorVisible(g_activeMeasureContext);
-    if ((vk == 0x2E || (ctrl && vk == 'V') || (ctrl && vk == 'X')) && onTextChanged)
-        onTextChanged(text_);
+    if (edited && onTextChanged) onTextChanged(text_);
     if ((selectionStart_ != oldSelStart || selectionEnd_ != oldSelEnd) &&
         onSelectionChanged) {
         onSelectionChanged();       /* Shift+方向 改选区 (build 278) */
@@ -2170,6 +2298,7 @@ bool ComboBoxWidget::OnMouseMove(const MouseEvent& e) {
 bool ComboBoxWidget::OnMouseUp(const MouseEvent& e) {
     if (open_ && hoveredIndex_ >= 0) {
         selectedIndex_ = hoveredIndex_;
+        requestedIndex_ = selectedIndex_;
         open_ = false;
         if (onSelectionChanged) onSelectionChanged(selectedIndex_);
         return true;
@@ -2341,6 +2470,16 @@ D2D1_SIZE_F TabControlWidget::SizeHint() const {
 }
 
 // ---- ScrollView ----
+
+std::wstring DragGhostText(const Widget* source) {
+    if (!source || !source->visible) return {};
+    if (auto* lb = dynamic_cast<const LabelWidget*>(source)) return lb->Text();
+    for (const auto& c : source->Children()) {
+        std::wstring t = DragGhostText(c.get());
+        if (!t.empty()) return t;
+    }
+    return {};
+}
 
 void ScrollViewWidget::SetContent(WidgetPtr content) {
     children_.clear();
@@ -2544,7 +2683,7 @@ void RadioButtonWidget::SetSelected(bool v) {
 
 void RadioButtonWidget::UpdateAnimation() {
     selectAnim_.SetIdleTarget(selected_ ? 1.0f : 0.0f);
-    selectAnim_.SampleFrame(GetTickCount64());
+    selectAnim_.SampleFrame(AnimNowMs());
     animating_ = selectAnim_.Active();
 }
 
@@ -2581,7 +2720,7 @@ void RadioButtonWidget::OnDraw(Renderer& r) {
     float fontSize = (css.fontSize > 0) ? css.fontSize : theme::kFontSizeNormal;
 
     selectAnim_.SetIdleTarget(selected_ ? 1.0f : 0.0f);
-    float t = std::clamp(selectAnim_.SampleFrame(GetTickCount64()), 0.0f, 1.0f);
+    float t = std::clamp(selectAnim_.SampleFrame(AnimNowMs()), 0.0f, 1.0f);
     animating_ = selectAnim_.Active();
 
     if (t > 0.01f) {
@@ -2661,17 +2800,42 @@ void ToggleWidget::UpdateCachedColors() {
     CachedThumbColorOn_ = theme::Rgb(0xFF, 0xFF, 0xFF);
 }
 
-void ToggleWidget::UpdateAnimation() {
+void ToggleWidget::SampleAll_(uint64_t now) {
     anim_.SetIdleTarget(on_ ? 1.0f : 0.0f);
-    anim_.SampleFrame(GetTickCount64());
-    animating_ = anim_.Active();
+    anim_.SampleFrame(now);
+    knobW_.SampleFrame(now);
+    knobH_.SampleFrame(now);
+    stateLevel_.SampleFrame(now);
+    animating_ = anim_.Active() || knobW_.Active() || knobH_.Active() || stateLevel_.Active();
+}
+
+void ToggleWidget::UpdateAnimation() {
+    SyncInteraction_();
+    SampleAll_(AnimNowMs());
+}
+
+void ToggleWidget::SyncInteraction_() {
+    using namespace togglevisual;
+    const Interaction s = ResolveInteraction(enabled && hovered, enabled && pressed);
+    if (static_cast<int>(s) == appliedInteraction_) return;
+    appliedInteraction_ = static_cast<int>(s);
+    if (s == Interaction::Pressed) knobExtendRight_ = !on_;
+    const KnobSize size = TargetKnobSize(s);
+    knobW_.SetTarget(size.w);
+    knobH_.SetTarget(size.h);
+    stateLevel_.SetTarget(InteractionLevel(s));
+    animating_ = true;
+    ui::GetContext().RegisterAnimatingWidget(this);
 }
 
 void ToggleWidget::SetOn(bool v) {
     if (on_ == v) return;
 
     on_ = v;
-    anim_.SetTarget(on_ ? 1.0f : 0.0f);
+    /* 从当前位置出发 (滑到一半再点就是掉头), 这一程时长按要走的距离缩短。 */
+    const float target = on_ ? 1.0f : 0.0f;
+    const float distance = std::fabs(target - anim_.Current());
+    anim_.RetargetScaled(target, togglevisual::SlideDurationScale(distance, anim_.Duration()));
     animating_ = anim_.Active();
     ui::GetContext().RegisterAnimatingWidget(this);
 }
@@ -2696,9 +2860,19 @@ void ToggleWidget::OnDraw(Renderer& r) {
     D2D1_COLOR_F onTrack  = css.hasAccent ? css.accent : CachedTrackColorOn_;
     D2D1_COLOR_F offTrack = (bgColor.a > 0) ? bgColor  : CachedTrackColorOff_;
 
-    anim_.SetIdleTarget(on_ ? 1.0f : 0.0f);
-    float t = std::clamp(anim_.SampleFrame(GetTickCount64()), 0.0f, 1.0f);
-    animating_ = anim_.Active();
+    /* 悬停离开等状态是窗口直接改 hovered 的, 不一定经过本控件的鼠标回调, 画的时候补一次。 */
+    SyncInteraction_();
+    SampleAll_(AnimNowMs());
+    float t = std::clamp(anim_.Current(), 0.0f, 1.0f);
+    {
+        const float level = stateLevel_.Current();
+        const togglevisual::Rgba on = togglevisual::OnTrackColor(
+            {onTrack.r, onTrack.g, onTrack.b, onTrack.a}, level);
+        const togglevisual::Rgba off = togglevisual::OffTrackColor(
+            {offTrack.r, offTrack.g, offTrack.b, offTrack.a}, level, dark);
+        onTrack = {on.r, on.g, on.b, on.a};
+        offTrack = {off.r, off.g, off.b, off.a};
+    }
     D2D1_COLOR_F trackColor = {
         offTrack.r + t * (onTrack.r - offTrack.r),
         offTrack.g + t * (onTrack.g - offTrack.g),
@@ -2720,15 +2894,14 @@ void ToggleWidget::OnDraw(Renderer& r) {
         if (bw > 0) r.DrawRoundedRect(track, trackR, trackR, borderColor, bw);
     }
 
-    float thumbSize = 12.0f;
-    float thumbCR = 7.0f;
-
     float minX = tx + trackH / 2;
     float maxX = tx + trackW - trackH / 2;
     float thumbX = minX + t * (maxX - minX);
 
-    float halfThumb = thumbSize / 2;
-    D2D1_RECT_F thumb = {thumbX - halfThumb, cy - halfThumb, thumbX + halfThumb, cy + halfThumb};
+    const togglevisual::KnobRect kr = togglevisual::ComputeKnobRect(
+        thumbX, cy, knobW_.Current(), knobH_.Current(), knobExtendRight_);
+    D2D1_RECT_F thumb = {kr.left, kr.top, kr.right, kr.bottom};
+    float thumbCR = kr.radius;
     D2D1_COLOR_F thumbColor = {
         CachedThumbColorOff_.r + t * (CachedThumbColorOn_.r - CachedThumbColorOff_.r),
         CachedThumbColorOff_.g + t * (CachedThumbColorOn_.g - CachedThumbColorOff_.g),
@@ -2751,17 +2924,28 @@ float ToggleWidget::ContentRight_() const {
     return rect.left + padL + trackW + (text_.empty() ? 0 : gap + textW) + 4.0f;
 }
 
+bool ToggleWidget::OnMouseDown(const MouseEvent& e) {
+    const bool handled = Widget::OnMouseDown(e);
+    SyncInteraction_();   // 窗口已置 pressed: 圆点开始拉长
+    return handled;
+}
+
+/* 快速第二击 (WM_LBUTTONDBLCLK) 也照常切换: 每一下点击都算数, 圆点从当前位置掉头
+ * (可打断), 连点几下切几下, 停在最后一次的状态。用户定 (2026-10-19)。 */
 bool ToggleWidget::OnMouseUp(const MouseEvent& e) {
     if (e.x >= rect.left && e.x < ContentRight_() && e.y >= rect.top && e.y < rect.bottom) {
         SetOn(!on_);
         if (onValueChanged) onValueChanged(on_);
+        SyncInteraction_();   // 松开: 一边滑过去一边缩回悬停尺寸
         return true;
     }
+    SyncInteraction_();
     return false;
 }
 
 bool ToggleWidget::OnMouseMove(const MouseEvent& e) {
     hovered = e.x >= rect.left && e.x < ContentRight_() && e.y >= rect.top && e.y < rect.bottom;
+    SyncInteraction_();
     return hovered;
 }
 
@@ -2795,12 +2979,19 @@ void ProgressBarWidget::SetValue(float v, bool animate) {
 
 void ProgressBarWidget::UpdateAnimation() {
     valueAnim_.SetIdleTarget(targetValue_);
-    valueAnim_.SampleFrame(GetTickCount64());
+    valueAnim_.SampleFrame(AnimNowMs());
     animating_ = valueAnim_.Active();
+}
+
+void ProgressBarWidget::HookFrames_() {
+    if (framesHooked_ || !GetContext().FindWindowByWidget(this)) return;
+    framesHooked_ = true;
+    GetContext().RegisterAnimatingWidget(this);
 }
 
 void ProgressBarWidget::OnDraw(Renderer& r) {
     Widget::OnDraw(r);
+    if (indeterminate_) HookFrames_();
     bool dark = theme::IsDark();
 
     // 6px bar over a same-height track. Earlier 3/1 split rendered as a
@@ -2818,9 +3009,10 @@ void ProgressBarWidget::OnDraw(Renderer& r) {
     r.FillRoundedRect(trackRect, cr, cr, trackColor);
 
     if (indeterminate_) {
-        uint64_t now = GetTickCount64();
-        float period = 888.0f;
-        float phase = fmodf((float)now, period * 2.0f) / (period * 2.0f);
+        uint64_t now = AnimNowMs();
+        /* 先在整数上取模: 毫秒数转 float 后, 开机几天精度就掉到几十毫秒。 */
+        const uint64_t cycleMs = 1776;   // 888ms 往返一次
+        float phase = static_cast<float>(now % cycleMs) / static_cast<float>(cycleMs);
         float barW = (rect.right - rect.left) * 0.4f;
         float totalTravel = (rect.right - rect.left) + barW;
         float xOffset = -barW + phase * totalTravel;
@@ -2832,7 +3024,7 @@ void ProgressBarWidget::OnDraw(Renderer& r) {
         }
     } else {
         valueAnim_.SetIdleTarget(targetValue_);
-        float visualValue = valueAnim_.SampleFrame(GetTickCount64());
+        float visualValue = valueAnim_.SampleFrame(AnimNowMs());
         animating_ = valueAnim_.Active();
         float pct = (max_ > min_) ? (visualValue - min_) / (max_ - min_) : 0;
         float fillW = (rect.right - rect.left) * pct;
@@ -2873,8 +3065,15 @@ void ToolTipWidget::OnDraw(Renderer& r) {
 
 // ---- Overlay ----
 
+void OverlayWidget::HookFrames_() {
+    if (framesHooked_ || !GetContext().FindWindowByWidget(this)) return;
+    framesHooked_ = true;
+    GetContext().RegisterAnimatingWidget(this);
+}
+
 void OverlayWidget::OnDraw(Renderer& r) {
     if (!active_) return;
+    if (showSpinner_) HookFrames_();
 
     // Full-screen mask.
     D2D1_COLOR_F mask = {0.0f, 0.0f, 0.0f, 0.35f};
@@ -2892,7 +3091,7 @@ void OverlayWidget::OnDraw(Renderer& r) {
     r.DrawRoundedRect(panel, 8.0f, 8.0f, theme::kDivider(), 0.8f);
 
     if (showSpinner_) {
-        uint64_t now = GetTickCount64();
+        uint64_t now = AnimNowMs();
         if (spinnerTick_ == 0) spinnerTick_ = now;
         float t = (float)((now - spinnerTick_) % 1200ULL) / 1200.0f;
         float centerY = panel.top + 28.0f;
@@ -2953,7 +3152,6 @@ D2D1_SIZE_F OverlayWidget::SizeHint() const {
 // ---- ImageView ----
 
 static std::unordered_map<UINT_PTR, ImageViewWidget*> g_animTimerMap;
-static std::unordered_map<UINT_PTR, ImageViewWidget*> g_loadingTimerMap;
 
 ImageViewWidget::ImageViewWidget() {
     expanding = true;
@@ -2965,11 +3163,6 @@ ImageViewWidget::~ImageViewWidget() {
         GlobalResourceStore().Remove(checkerTileResourceKey_);
     }
     ClearTiles();
-    if (loadingTimerId_) {
-        KillTimer(NULL, loadingTimerId_);
-        g_loadingTimerMap.erase(loadingTimerId_);
-        loadingTimerId_ = 0;
-    }
     if (animTimerId_) {
         KillTimer(NULL, animTimerId_);
         g_animTimerMap.erase(animTimerId_);
@@ -3124,7 +3317,7 @@ void ImageViewWidget::UpdateRegion(int x, int y, const void* pixels, int w, int 
     const int pxH = res->height;
 
     if (x < 0 || y < 0 || x + w > pxW || y + h > pxH) return;
-    std::vector<uint8_t> updated = *res->bytes;
+    std::vector<uint8_t> updated(res->bytes->data(), res->bytes->data() + res->bytes->size());
     const uint8_t* src = static_cast<const uint8_t*>(pixels);
     for (int row = 0; row < h; ++row) {
         uint8_t* dst = updated.data() + static_cast<size_t>(y + row) * res->stride + static_cast<size_t>(x) * 4;
@@ -3238,18 +3431,6 @@ void ImageViewWidget::DrawCheckerboard(Renderer& r, const D2D1_RECT_F& area) {
 }
 
 /* ---- GIF 动画 timer ---- */
-void CALLBACK ImageViewWidget::LoadingTimerProc(HWND, UINT, UINT_PTR id, DWORD) {
-    auto it = g_loadingTimerMap.find(id);
-    if (it == g_loadingTimerMap.end()) return;
-    EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM) -> BOOL {
-        wchar_t cls[64];
-        GetClassNameW(hwnd, cls, 64);
-        if (wcscmp(cls, L"UiCore_Window") == 0)
-            InvalidateRect(hwnd, nullptr, FALSE);
-        return TRUE;
-    }, 0);
-}
-
 void CALLBACK ImageViewWidget::AnimTimerProc(HWND, UINT, UINT_PTR id, DWORD) {
     auto it = g_animTimerMap.find(id);
     if (it != g_animTimerMap.end()) {
@@ -3318,26 +3499,20 @@ void ImageViewWidget::StopAnimation() {
 void ImageViewWidget::SetLoading(bool on) {
     if (loading_ == on) return;
     loading_ = on;
-    loadingAngle_ = 0.0f;
+    loadingHooked_ = false;
     if (on) {
-        // ~60Hz threadless timer drives Invalidate so the spinner actually
-        // animates without needing user input. OnDraw advances the angle.
-        loadingTimerId_ = SetTimer(NULL, 0, 16, LoadingTimerProc);
-        if (loadingTimerId_) g_loadingTimerMap[loadingTimerId_] = this;
+        /* 转圈由所在窗口的动画心跳驱动 (每次刷新一帧); 窗口的帧循环见到 IsLoading
+         * 就保持登记, 加载结束后自然退出。还没挂进窗口时由 OnDraw 补登记。 */
+        HookLoadingFrames_();
     } else {
-        if (loadingTimerId_) {
-            KillTimer(NULL, loadingTimerId_);
-            g_loadingTimerMap.erase(loadingTimerId_);
-            loadingTimerId_ = 0;
-        }
+        GetContext().RequestInvalidateAll();   // 收起转圈, 画出图片
     }
-    EnumThreadWindows(GetCurrentThreadId(), [](HWND hwnd, LPARAM) -> BOOL {
-        wchar_t cls[64];
-        GetClassNameW(hwnd, cls, 64);
-        if (wcscmp(cls, L"UiCore_Window") == 0)
-            InvalidateRect(hwnd, nullptr, FALSE);
-        return TRUE;
-    }, 0);
+}
+
+void ImageViewWidget::HookLoadingFrames_() {
+    if (loadingHooked_ || !GetContext().FindWindowByWidget(this)) return;
+    loadingHooked_ = true;
+    GetContext().RegisterAnimatingWidget(this);
 }
 
 static void DrawSpinner(Renderer& r, float cx, float cy, float radius,
@@ -3523,9 +3698,8 @@ void ImageViewWidget::OnDraw(Renderer& r) {
         float cy = (rect.top + rect.bottom) / 2;
         D2D1_COLOR_F spinColor = theme::kAccent();
         spinColor.a = 0.8f;
-        DrawSpinner(r, cx, cy, 20.0f, loadingAngle_, spinColor, 2.5f);
-        loadingAngle_ += 8.0f;  /* ~45°/frame ≈ 1圈/秒 @60fps */
-        if (loadingAngle_ >= 360.0f) loadingAngle_ -= 360.0f;
+        DrawSpinner(r, cx, cy, 20.0f, SpinnerAngleDeg(AnimNowMs()), spinColor, 2.5f);
+        HookLoadingFrames_();
         return;
     }
 
@@ -4020,7 +4194,29 @@ void CaptionButtonWidget::OnDraw(Renderer& r) {
     r.FillRect(rect, bg);
     D2D1_COLOR_F fg = (isClose && (hovered || pressed))
         ? D2D1_COLOR_F{1, 1, 1, 1} : theme::kBtnText();
-    r.DrawIcon(icon, rect, fg, theme::kFontSizeIcon);
+    const float mx = (rect.left + rect.right) / 2.0f;
+    const float my = (rect.top + rect.bottom) / 2.0f;
+    if (!svgContent_.empty()) {
+        if (!svgParsed_) {
+            svgIcon_ = r.ParseSvgIcon(svgContent_);
+            svgParsed_ = true;
+        }
+        const float h = kSvgBox / 2.0f;
+        r.DrawSvgIcon(svgIcon_, D2D1_RECT_F{mx - h, my - h, mx + h, my + h}, fg);
+    } else {
+        r.DrawIcon(icon, rect, fg, theme::kFontSizeIcon);
+    }
+
+    if (badge) {
+        // 红点贴在图标右上角 (字形 10px / SVG 16px 居中), 不是按钮 46px 宽的角上
+        constexpr float kBadgeD = 6.0f;
+        const float off = svgContent_.empty() ? 6.0f : kSvgBox / 2.0f;
+        const float cx = mx + off;
+        const float cy = my - off;
+        D2D1_RECT_F dot = {cx - kBadgeD / 2, cy - kBadgeD / 2,
+                           cx + kBadgeD / 2, cy + kBadgeD / 2};
+        r.FillEllipse(dot, D2D1_COLOR_F{232 / 255.0f, 17 / 255.0f, 35 / 255.0f, 1.0f});
+    }
 }
 
 // ---- TitleBar ----
@@ -4050,6 +4246,17 @@ TitleBarWidget::TitleBarWidget(const std::wstring& title) : title_(title) {
     closeB->id = "_caption_close";
     closeBtn_ = closeB;
     AddChild(closeBtn_);
+}
+
+WidgetPtr TitleBarWidget::AddCaptionButton(const std::wstring& glyph) {
+    auto b = std::make_shared<CaptionButtonWidget>();
+    b->icon = glyph;
+    b->fixedW = theme::kCaptionBtnWidth;
+    b->id = "_caption_ext_" + std::to_string(extraCaptionBtns_.size());
+    extraCaptionBtns_.push_back(b);
+    AddChild(b);
+    ui::RequestLayout();
+    return b;
 }
 
 TitleBarWidget::~TitleBarWidget() {
@@ -4145,6 +4352,8 @@ void TitleBarWidget::OnDraw(Renderer& r) {
     float textRight = closeBtn_ ? closeBtn_->rect.left : rect.right;
     if (!customWidgets_.empty()) {
         textRight = customWidgets_.front()->rect.left - 8;
+    } else if (!extraCaptionBtns_.empty()) {
+        textRight = captionLeft_ - 8;
     }
     D2D1_RECT_F titleRect = {titleLeft, rect.top, textRight, rect.bottom};
     r.DrawText(title_, titleRect, theme::kTitleBarText(), theme::kFontSizeTitle,
@@ -4193,6 +4402,14 @@ void TitleBarWidget::DoLayout() {
     maxBtn_->rect = {bx, rect.top, bx + btnW, rect.bottom};
     bx -= btnW;
     minBtn_->rect = {bx, rect.top, bx + btnW, rect.bottom};
+
+    // Extra caption buttons: flush against min, first-added nearest to min
+    for (auto& eb : extraCaptionBtns_) {
+        if (!eb->visible) continue;
+        bx -= btnW;
+        eb->rect = {bx, rect.top, bx + btnW, rect.bottom};
+    }
+    captionLeft_ = bx;
 
     // Custom widgets: laid out right-to-left before the caption buttons
     float cx = bx - 4;
@@ -4564,7 +4781,7 @@ void ExpanderWidget::SetExpanded(bool v) {
 
 void ExpanderWidget::UpdateAnimation() {
     expandAnim_.SetIdleTarget(expanded_ ? 1.0f : 0.0f);
-    expandAnim_.SampleFrame(GetTickCount64());
+    expandAnim_.SampleFrame(AnimNowMs());
     animating_ = expandAnim_.Active();
 }
 
@@ -5253,7 +5470,7 @@ float SplitViewWidget::CurrentPaneWidth() const {
 
 void SplitViewWidget::UpdateAnimation() {
     paneAnim_.SetIdleTarget(paneOpen_ ? 1.0f : 0.0f);
-    paneAnim_.SampleFrame(GetTickCount64());
+    paneAnim_.SampleFrame(AnimNowMs());
     animating_ = paneAnim_.Active();
 }
 
@@ -5462,6 +5679,7 @@ ChipsInputWidget::ChipsInputWidget(const std::wstring& placeholder)
         if (at < 0 || at > (int)elems_.size()) at = (int)elems_.size();
         dropCaret_ = -1;
         if (readOnly || data.empty()) return;
+        RecordEdit(TextEditKind::Atomic);
         ClearSelection();
         elems_.insert(elems_.begin() + at, Elem{true, data});
         caret_ = at + 1;
@@ -5513,6 +5731,8 @@ std::wstring ChipsInputWidget::Value() const {
 }
 
 void ChipsInputWidget::SetValue(const std::wstring& tpl) {
+    if (tpl == Value()) return;     /* 同值回写不清撤销历史 / 不动光标 */
+    undo_.Clear();
     elems_.clear();
     for (size_t i = 0; i < tpl.size();) {
         if (tpl[i] == L'{') {
@@ -5549,6 +5769,7 @@ void ChipsInputWidget::SetChipLabels(const std::wstring& spec) {
 
 void ChipsInputWidget::InsertChip(const std::wstring& key) {
     if (readOnly || key.empty()) return;
+    RecordEdit(TextEditKind::Atomic);
     if (HasSelection()) DeleteSelection();
     if (caret_ < 0 || caret_ > (int)elems_.size()) caret_ = (int)elems_.size();
     elems_.insert(elems_.begin() + caret_, Elem{true, key});
@@ -5637,6 +5858,23 @@ void ChipsInputWidget::Mutated() {
     if (onTextChanged) onTextChanged(Value());
 }
 
+void ChipsInputWidget::RecordEdit(TextEditKind kind, bool isSpace) {
+    undo_.Record({elems_, caret_, selAnchor_}, kind, GetTickCount64(), isSpace);
+}
+
+bool ChipsInputWidget::UndoRedo(bool redo) {
+    const Snap cur{elems_, caret_, selAnchor_};
+    Snap s;
+    if (!(redo ? undo_.Redo(cur, s) : undo_.Undo(cur, s))) return false;
+    elems_ = std::move(s.elems);
+    caret_ = s.caret;
+    selAnchor_ = s.selAnchor;
+    selecting_ = false;
+    selectedChip_ = -1;
+    hoverChip_ = -1;
+    return true;
+}
+
 void ChipsInputWidget::DeleteSelection() {
     if (!HasSelection()) return;
     int a = std::min(selAnchor_, caret_);
@@ -5660,6 +5898,7 @@ std::wstring ChipsInputWidget::SerializeRange(int a, int b) const {
 
 void ChipsInputWidget::RemoveChip(int idx) {
     if (idx < 0 || idx >= (int)elems_.size() || !elems_[idx].chip) return;
+    RecordEdit(TextEditKind::Atomic);
     elems_.erase(elems_.begin() + idx);
     if (caret_ > idx) caret_--;
     selectedChip_ = -1;
@@ -5822,6 +6061,7 @@ bool ChipsInputWidget::OnMouseDown(const MouseEvent& e) {
     int chip = ChipIndexAt(m, localX, e.y - rect.top, &onClose);
     pressX_ = e.x; pressY_ = e.y;
     dragMoved_ = false;
+    undo_.BreakMerge();
     if (chip >= 0 && !readOnly) {
         if (onClose) {
             RemoveChip(chip);
@@ -5888,6 +6128,7 @@ bool ChipsInputWidget::OnMouseUp(const MouseEvent& e) {
         // Reorder: remove the chip, re-insert at the drop boundary.
         int from = dragChip_;
         int to = dropCaret_;
+        RecordEdit(TextEditKind::Atomic);
         Elem el = elems_[from];
         elems_.erase(elems_.begin() + from);
         if (to > from) to--;
@@ -5910,6 +6151,7 @@ bool ChipsInputWidget::OnMouseUp(const MouseEvent& e) {
 bool ChipsInputWidget::OnKeyChar(wchar_t ch) {
     if (!IsFocused() || readOnly) return false;
     if (ch < 32) return false;
+    RecordEdit(TextEditKind::Typing, ch == L' ');
     if (HasSelection()) DeleteSelection();
     if (caret_ < 0 || caret_ > (int)elems_.size()) caret_ = (int)elems_.size();
     elems_.insert(elems_.begin() + caret_, Elem{false, std::wstring(1, ch)});
@@ -5926,8 +6168,21 @@ bool ChipsInputWidget::OnKeyDown(int vk) {
     if (!IsFocused()) return false;
     int n = (int)elems_.size();
     bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+    /* build 333: 撤销 / 重做, 规则同 TextInputWidget; 只读时冒泡给宿主。 */
+    if (ctrl && (vk == 'Z' || vk == 'Y') && !readOnly) {
+        if (UndoRedo(vk == 'Y' || shift)) {
+            ResetCaretBlink();
+            extern MeasureContext* g_activeMeasureContext;
+            if (g_activeMeasureContext) EnsureCaretVisible(*g_activeMeasureContext);
+            Mutated();
+        }
+        return true;
+    }
 
     if (ctrl && vk == 'A') {
+        undo_.BreakMerge();
         selAnchor_ = 0;
         caret_ = n;
         selectedChip_ = -1;
@@ -5944,6 +6199,7 @@ bool ChipsInputWidget::OnKeyDown(int vk) {
         if (HasSelection()) {
             ChipsSetClipboard(SerializeRange(std::min(selAnchor_, caret_),
                                              std::max(selAnchor_, caret_)));
+            RecordEdit(TextEditKind::Atomic);
             DeleteSelection();
         }
         return true;
@@ -5952,6 +6208,7 @@ bool ChipsInputWidget::OnKeyDown(int vk) {
         // Paste parses `{key}` back into chips (same grammar as SetValue).
         std::wstring clip = ChipsGetClipboard();
         if (clip.empty()) return true;
+        RecordEdit(TextEditKind::Atomic);
         if (HasSelection()) DeleteSelection();
         ChipsInputWidget tmp;
         tmp.SetValue(clip);
@@ -5964,11 +6221,14 @@ bool ChipsInputWidget::OnKeyDown(int vk) {
         return true;
     }
 
-    const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     auto beginShiftMove = [&]() {
         if (shift) { if (selAnchor_ < 0) selAnchor_ = caret_; }
         else ClearSelection();
     };
+
+    if (vk == VK_LEFT || vk == VK_RIGHT || vk == VK_HOME || vk == VK_END ||
+        vk == VK_ESCAPE)
+        undo_.BreakMerge();
 
     switch (vk) {
     case VK_LEFT:
@@ -5995,12 +6255,13 @@ bool ChipsInputWidget::OnKeyDown(int vk) {
     case VK_END:  selectedChip_ = -1; beginShiftMove(); caret_ = n; break;
     case VK_BACK:
         if (readOnly) return true;
-        if (HasSelection()) { DeleteSelection(); break; }
+        if (HasSelection()) { RecordEdit(TextEditKind::Atomic); DeleteSelection(); break; }
         if (selectedChip_ >= 0) { RemoveChip(selectedChip_); break; }
         if (caret_ > 0) {
             if (elems_[caret_ - 1].chip) {
                 selectedChip_ = caret_ - 1;  // stage 1: arm the chip
             } else {
+                RecordEdit(TextEditKind::Backspace);
                 elems_.erase(elems_.begin() + caret_ - 1);
                 caret_--;
                 Mutated();
@@ -6009,12 +6270,13 @@ bool ChipsInputWidget::OnKeyDown(int vk) {
         break;
     case VK_DELETE:
         if (readOnly) return true;
-        if (HasSelection()) { DeleteSelection(); break; }
+        if (HasSelection()) { RecordEdit(TextEditKind::Atomic); DeleteSelection(); break; }
         if (selectedChip_ >= 0) { RemoveChip(selectedChip_); break; }
         if (caret_ < n) {
             if (elems_[caret_].chip) {
                 selectedChip_ = caret_;
             } else {
+                RecordEdit(TextEditKind::DeleteForward);
                 elems_.erase(elems_.begin() + caret_);
                 Mutated();
             }

@@ -182,6 +182,8 @@ ui_progress_set_indeterminate(w, 1);
 // TextInput
 ui_text_input_get_text(w);      // → const wchar_t*（内部指针）
 ui_text_input_set_text(w, L"text");
+ui_text_input_select_all(w);          // 全选 (input.select()), 之后输入整体替换
+ui_text_input_set_password(w, 1);     // 密码模式: 显示 '●', 禁止复制 / 剪切
 
 // TextArea
 ui_text_area_get_text(w);
@@ -204,6 +206,10 @@ ui_titlebar_set_title(tb, L"Title");
 ui_titlebar_show_buttons(tb, min, max, close);
 ui_titlebar_show_icon(tb, show);
 ui_titlebar_add_widget(tb, widget);
+UiWidget cb = ui_titlebar_add_caption_button(tb, L"\xE700");  // 同款控制按钮, 贴最小化左侧
+ui_titlebar_caption_button_set_glyph(cb, L"\xE712");
+ui_titlebar_caption_button_set_svg(cb, "<svg viewBox=\"0 0 16 16\">...</svg>");  // SVG 代替字形
+ui_titlebar_caption_button_set_badge(cb, 1);                  // 红点
 
 // IconButton
 ui_icon_button_set_svg(w, svg);
@@ -250,7 +256,8 @@ ui_combobox_on_changed(combo, on_select, data);
 /* 鼠标位置 / 滚轮 / 离开 (widget-local 坐标) */
 ui_widget_on_mouse_move (w, on_move,  ud);   // void cb(UiWidget, float x, float y, void*)
 ui_widget_on_mouse_leave(w, on_leave, ud);   // void cb(UiWidget, void*)
-ui_widget_on_mouse_wheel(w, on_wheel, ud);   // void cb(UiWidget, float delta, void*)
+ui_widget_on_mouse_wheel(w, on_wheel, ud);   // void cb(UiWidget, float x, float y, float delta, void*)
+                                             // 冒泡: 子控件没挂时交给最近的挂了回调的祖先, x/y 相对该祖先
 
 /* 焦点 (配合 ui_custom_set_focusable 让自绘 widget 进键盘焦点系统) */
 ui_custom_set_focusable(custom, 1);
@@ -334,6 +341,9 @@ ui_debug_screenshot(win, L"screenshot.png");                  // 成功返回 0
 ui_debug_screenshot_widget(win, w, L"widget.png");            // 单个 widget 区域
 ui_debug_screenshot_menu(win, L"menu.png");                   // 弹出的菜单 popup（自 build 27）
                                                               // 没菜单打开返回 -1
+ui_debug_screenshot_toast(win, L"toast.png");                 // 当前 toast 位图（自 build 330）
+                                                              // 没 toast 返回 -1
+char* t = ui_debug_toast_info(win);                           // toast 状态 JSON, ui_debug_free 释放
 ```
 
 ### 事件模拟（自 1.1.0）
@@ -567,6 +577,7 @@ void on_wheel(UiWindow win, float wheel_x, float wheel_y, float delta) {
 |------|------|
 | `ui_window_enable_canvas_mode(win, 1)` | 一键进入画布模式 |
 | `ui_window_set_min_size(win, w, h)` | 覆盖主题默认最小尺寸（480×360） |
+| `ui_window_set_auto_height(win, 1)` | 高度跟随内容（= `<window height="auto">`），每次排版按根节点在当前宽度下的高度定客户区高，限工作区内；重复调用 = 立即重量一次（build 328） |
 | `ui_window_set_background_mode(win, 1)` | 透明 Clear，避免扩窗口时背景闪 |
 | `ui_widget_set_drag_window(w, 1)` | 命中即拖窗 |
 | `ui_window_set_rect(win, x, y, w, h)` | 原子 SetWindowPos + 同步重绘（x/y = screen px, w/h = DIP） |

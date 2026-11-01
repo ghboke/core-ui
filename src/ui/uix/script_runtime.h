@@ -148,6 +148,17 @@ public:
     // for this id may still complete (no preemption).
     void DisposeEffect(uint64_t id);
 
+    // Run `fn` with dependency tracking suspended (build 304). For calling out
+    // to host code from inside an effect — reads the host makes through the
+    // proxy must not become deps of the effect that happens to be running.
+    template <class F>
+    void RunUntracked(F&& fn) {
+        uint64_t prev = activeEffectId_;
+        activeEffectId_ = 0;
+        fn();
+        activeEffectId_ = prev;
+    }
+
     // Register a Vue 3-style computed property keyed by (target_ptr, key).
     // `userFn` is the body (e.g. `function(){ return this.firstName + ' '
     // + this.lastName }`) and `thisObj` is the proxy bound as `this` —

@@ -1,33 +1,43 @@
 #include "overlay_service.h"
+#include "anim_clock.h"
+#include "debug_trace.h"
+#include "frame_ticker.h"
 #include "theme.h"
 
 #include <d2d1.h>
 #include <dwrite.h>
-#include <timeapi.h>
+#include <wincodec.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
-
-#pragma comment(lib, "winmm.lib")
+#include <vector>
 
 namespace ui {
 namespace {
 
 constexpr UINT kOverlayWakeMessage = WM_APP + 0x540;
-constexpr UINT_PTR kToastTimerId = 1;
-constexpr UINT kToastTimerIntervalMs = 16;
+/* 淡入 / 淡出跟动画心跳 (FrameTicker) 每次刷新一帧; 停留期间退订, 用一次性定时器
+ * 在淡出前 kToastHoldWakeLeadMs 醒来重新订阅 (系统定时器 15.6ms 粒度, 提前醒免得淡出
+ * 头一帧跳过)。以前整程 16ms 定时器 + timeBeginPeriod(1) 拉高全系统时钟精度。 */
+constexpr UINT kToastFrameMessage = WM_APP + 0x541;
+constexpr UINT_PTR kToastHoldTimerId = 1;
+constexpr int kToastHoldWakeLeadMs = 20;
 constexpr int kToastInMs = 200;
 constexpr int kToastOutMs = 250;
+/* 超宽文字折行 (build 331), 最多这么多行; 再多仍截断并报 text_clipped。 */
+constexpr UINT32 kToastMaxLines = 4;
 
 float EaseOutCubic(float t) {
     t = std::clamp(t, 0.0f, 1.0f);
@@ -55,6 +65,7 @@ struct ToastBitmap {
     HDC dc = nullptr;
     HBITMAP bitmap = nullptr;
     HGDIOBJ oldBitmap = nullptr;
+    void* bits = nullptr;   /* DIB 像素 (预乘 BGRA, 自上而下), 调试截图读它 */
     int width = 0;
     int height = 0;
 
@@ -86,8 +97,13 @@ struct ToastOverlay {
     int targetX = 0;
     int targetY = 0;
     int slideRangePx = 0;
-    uint64_t startTick = 0;
-    bool timerPeriodSet = false;
+    uint64_t startTick = 0;     // AnimNowMs
+    bool ticking = false;       // 已订阅动画心跳 (淡入 / 淡出中)
+    bool textClipped = false;   /* 超过 kToastMaxLines 行 (或 fallback 下单词超宽), 被截断 */
+    /* 测量时排好的版, 绘制直接用它 —— 测量和绘制各排一次可能折出不同行数。 */
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+    float layoutMaxW = 0.0f;   /* layout 的排版宽度 (行在其中居中) */
+    float textH = 0.0f;        /* 显示的文字高度 (超行数时截到 kToastMaxLines 行) */
     std::unique_ptr<ToastBitmap> bitmap;
 };
 
@@ -195,6 +211,20 @@ struct OverlayService::Impl {
 
         std::unique_lock<std::mutex> lock(sync.mutex);
         sync.cv.wait(lock, [&sync]() { return sync.done; });
+    }
+
+    /* 同 InvokeSync 走同一队列, 只是 sync 为空 (CompleteSync 对空指针直接返回)。 */
+    void InvokeAsync(std::function<void()> fn) {
+        if (!fn) return;
+        EnsureThread();
+        if (GetCurrentThreadId() == threadId) {
+            fn();
+            return;
+        }
+        auto request = std::make_unique<Request>();
+        request->type = RequestType::Invoke;
+        request->fn = std::move(fn);
+        Post(std::move(request));
     }
 
     void EnsureThread() {
@@ -412,15 +442,34 @@ struct OverlayService::Impl {
         }
 
         raw->hwnd = hwnd;
-        raw->startTick = GetTickCount64();
-        timeBeginPeriod(1);
-        raw->timerPeriodSet = true;
-        SetTimer(hwnd, kToastTimerId, kToastTimerIntervalMs, nullptr);
+        raw->startTick = AnimNowMs();
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         ownerToast[request.owner] = hwnd;
         toasts[hwnd] = std::move(toast);
         UpdateToastFrame(*raw);
+        ScheduleToastFrames(*raw);
+    }
+
+    /* 按所处阶段决定下一帧怎么来: 淡入 / 淡出订阅心跳, 停留期间退订 + 一次性定时器。 */
+    static void ScheduleToastFrames(ToastOverlay& toast) {
+        if (!toast.hwnd) return;
+        const uint64_t elapsed = AnimNowMs() - toast.startTick;
+        const uint64_t holdWake = static_cast<uint64_t>(kToastInMs + toast.durationMs) -
+                                  std::min<uint64_t>(kToastHoldWakeLeadMs, toast.durationMs);
+        const bool holding = elapsed >= static_cast<uint64_t>(kToastInMs) && elapsed < holdWake;
+        if (holding) {
+            if (toast.ticking) {
+                FrameTicker::Instance().Unsubscribe(toast.hwnd);
+                toast.ticking = false;
+            }
+            SetTimer(toast.hwnd, kToastHoldTimerId,
+                     static_cast<UINT>(std::max<uint64_t>(holdWake - elapsed, USER_TIMER_MINIMUM)),
+                     nullptr);
+        } else if (!toast.ticking) {
+            FrameTicker::Instance().Subscribe(toast.hwnd, kToastFrameMessage);
+            toast.ticking = true;
+        }
     }
 
     bool MeasureToast(ToastOverlay& toast) {
@@ -443,9 +492,13 @@ struct OverlayService::Impl {
                                                    L"zh-cn", format.GetAddressOf()))) {
             return false;
         }
-        format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        /* build 331: 超宽折行 (以前不换行, 长文案两头被裁)。EMERGENCY_BREAK 让超长的
+         * 单词 / 路径也能断开 (Win 8.1+), 不支持时退回按词折行。 */
+        if (FAILED(format->SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK))) {
+            format->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        }
         format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
 
         const float iconSize = theme::kFontSizeNormal + 2.0f;
         const float iconGap = (toast.icon > 0) ? 8.0f : 0.0f;
@@ -457,14 +510,24 @@ struct OverlayService::Impl {
         Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
         if (FAILED(dwriteFactory->CreateTextLayout(
                 toast.text.c_str(), static_cast<UINT32>(toast.text.size()),
-                format.Get(), maxTextW, 80.0f, layout.GetAddressOf()))) {
+                format.Get(), maxTextW, 10000.0f, layout.GetAddressOf()))) {
             return false;
         }
         DWRITE_TEXT_METRICS metrics{};
         layout->GetMetrics(&metrics);
 
-        const float textW = std::min(maxTextW, std::max(1.0f, metrics.widthIncludingTrailingWhitespace));
-        const float textH = std::max(theme::kFontSizeNormal, metrics.height);
+        /* 单行沿用旧口径 (含行尾空白); 折行后行尾空白不算宽度。 */
+        const UINT32 lines = std::max<UINT32>(1, metrics.lineCount);
+        const float measuredW = (lines == 1) ? metrics.widthIncludingTrailingWhitespace
+                                             : metrics.width;
+        const float lineH = metrics.height / static_cast<float>(lines);
+        toast.textClipped = lines > kToastMaxLines || measuredW > maxTextW + 0.5f;
+        const float textW = std::min(maxTextW, std::max(1.0f, measuredW));
+        const float textH = std::max(theme::kFontSizeNormal,
+                                     std::min(metrics.height, lineH * kToastMaxLines));
+        toast.layout = layout;
+        toast.layoutMaxW = maxTextW;
+        toast.textH = textH;
         toast.widthDip = std::max(96.0f, textW + iconSpace + padH * 2.0f);
         toast.heightDip = std::max(iconSize, textH) + padV * 2.0f;
 
@@ -509,6 +572,7 @@ struct OverlayService::Impl {
         if (!bitmap->bitmap || !bits) {
             return false;
         }
+        bitmap->bits = bits;
         bitmap->oldBitmap = SelectObject(bitmap->dc, bitmap->bitmap);
 
         Microsoft::WRL::ComPtr<ID2D1DCRenderTarget> target;
@@ -529,19 +593,9 @@ struct OverlayService::Impl {
         target->CreateSolidColorBrush(D2D1::ColorF(0.15f, 0.15f, 0.18f, 0.92f), bgBrush.GetAddressOf());
         target->CreateSolidColorBrush(D2D1::ColorF(0.95f, 0.95f, 0.97f, 1.0f), textBrush.GetAddressOf());
 
-        Microsoft::WRL::ComPtr<IDWriteTextFormat> format;
-        if (!dwriteFactory ||
-            FAILED(dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", nullptr,
-                                                   DWRITE_FONT_WEIGHT_NORMAL,
-                                                   DWRITE_FONT_STYLE_NORMAL,
-                                                   DWRITE_FONT_STRETCH_NORMAL,
-                                                   theme::kFontSizeNormal,
-                                                   L"zh-cn", format.GetAddressOf()))) {
+        if (!toast.layout) {
             return false;
         }
-        format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
         target->BeginDraw();
         target->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
@@ -559,11 +613,20 @@ struct OverlayService::Impl {
             DrawIcon(*target.Get(), toast);
         }
 
-        const D2D1_RECT_F textRect = D2D1::RectF(
-            padH + iconSpace, 0.0f,
-            toast.widthDip - padH, toast.heightDip);
-        target->DrawTextW(toast.text.c_str(), static_cast<UINT32>(toast.text.size()),
-                          format.Get(), textRect, textBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        /* 用测量时那份排版画: 行在 layoutMaxW 宽的框里居中, 把这个框居中到文字区;
+         * 竖直方向把 (最多 kToastMaxLines 行的) 文字块居中, 超出的行裁掉。 */
+        const float areaL = padH + iconSpace;
+        const float areaW = toast.widthDip - padH - areaL;
+        const float textTop = (toast.heightDip - toast.textH) * 0.5f;
+        if (toast.layout) {
+            target->PushAxisAlignedClip(
+                D2D1::RectF(areaL, textTop, toast.widthDip - padH, textTop + toast.textH),
+                D2D1_ANTIALIAS_MODE_ALIASED);
+            target->DrawTextLayout(
+                D2D1::Point2F(areaL + (areaW - toast.layoutMaxW) * 0.5f, textTop),
+                toast.layout.Get(), textBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            target->PopAxisAlignedClip();
+        }
 
         HRESULT hr = target->EndDraw();
         if (FAILED(hr)) {
@@ -629,40 +692,61 @@ struct OverlayService::Impl {
         }
     }
 
-    void UpdateToastFrame(ToastOverlay& toast) {
-        if (!toast.hwnd || !toast.bitmap || !toast.bitmap->dc) {
-            return;
-        }
+    /* 某一时刻的帧: 淡入 / 停留 / 淡出。UpdateToastFrame 与调试查询共用。 */
+    struct ToastFrame {
+        bool expired = false;
+        uint64_t elapsed = 0;
+        BYTE alpha = 255;
+        int y = 0;
+    };
 
-        const uint64_t now = GetTickCount64();
-        const uint64_t elapsed = (toast.startTick != 0 && now >= toast.startTick)
-                                     ? (now - toast.startTick) : 0;
+    static ToastFrame ComputeToastFrame(const ToastOverlay& toast, uint64_t now) {
+        ToastFrame f;
+        f.elapsed = (toast.startTick != 0 && now >= toast.startTick)
+                        ? (now - toast.startTick) : 0;
         const uint64_t inEnd = kToastInMs;
         const uint64_t holdEnd = inEnd + static_cast<uint64_t>(toast.durationMs);
         const uint64_t outEnd = holdEnd + kToastOutMs;
 
         float alpha = 1.0f;
         float slide = 1.0f;
-        if (elapsed < inEnd) {
-            const float t = EaseOutCubic(static_cast<float>(elapsed) / static_cast<float>(kToastInMs));
+        if (f.elapsed < inEnd) {
+            const float t = EaseOutCubic(static_cast<float>(f.elapsed) / static_cast<float>(kToastInMs));
             slide = t;
             alpha = (toast.anim == 1) ? t : 1.0f;
-        } else if (elapsed < holdEnd) {
+        } else if (f.elapsed < holdEnd) {
             slide = 1.0f;
             alpha = 1.0f;
-        } else if (elapsed < outEnd) {
-            const float t = EaseOutCubic(static_cast<float>(elapsed - holdEnd) / static_cast<float>(kToastOutMs));
+        } else if (f.elapsed < outEnd) {
+            const float t = EaseOutCubic(static_cast<float>(f.elapsed - holdEnd) / static_cast<float>(kToastOutMs));
             slide = 1.0f - t;
             alpha = 1.0f - t;
         } else {
-            DestroyToastByHwnd(toast.hwnd);
+            f.expired = true;
+            return f;
+        }
+        f.y = (toast.anim == 1)
+                  ? toast.targetY
+                  : toast.targetY + static_cast<int>(toast.slideRangePx * (1.0f - slide));
+        f.alpha = static_cast<BYTE>(std::clamp(alpha, 0.0f, 1.0f) * 255.0f + 0.5f);
+        return f;
+    }
+
+    void UpdateToastFrame(ToastOverlay& toast) {
+        if (!toast.hwnd || !toast.bitmap || !toast.bitmap->dc) {
             return;
         }
 
-        const int y = (toast.anim == 1)
-                          ? toast.targetY
-                          : toast.targetY + static_cast<int>(toast.slideRangePx * (1.0f - slide));
-        const BYTE alphaByte = static_cast<BYTE>(std::clamp(alpha, 0.0f, 1.0f) * 255.0f + 0.5f);
+        const ToastFrame frame = ComputeToastFrame(toast, AnimNowMs());
+        TraceEvent("overlay", "toast_frame",
+                   {TraceI64("elapsed_ms", static_cast<int64_t>(frame.elapsed)),
+                    TraceBool("expired", frame.expired)});
+        if (frame.expired) {
+            DestroyToastByHwnd(toast.hwnd);
+            return;
+        }
+        const int y = frame.y;
+        const BYTE alphaByte = frame.alpha;
         POINT dst{toast.targetX, y};
         POINT src{0, 0};
         SIZE size{toast.bitmap->width, toast.bitmap->height};
@@ -672,6 +756,90 @@ struct OverlayService::Impl {
         blend.AlphaFormat = AC_SRC_ALPHA;
         UpdateLayeredWindow(toast.hwnd, nullptr, &dst, &size, toast.bitmap->dc, &src,
                             0, &blend, ULW_ALPHA);
+    }
+
+    /* ---- 调试查询 (overlay 线程上调用) ---- */
+
+    ToastOverlay* FindToast(HWND owner) {
+        auto it = ownerToast.find(owner);
+        if (it == ownerToast.end()) return nullptr;
+        auto t = toasts.find(it->second);
+        return (t == toasts.end()) ? nullptr : t->second.get();
+    }
+
+    static void AppendJsonString(std::string& out, const std::wstring& w) {
+        std::string u8;
+        if (!w.empty()) {
+            const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                              nullptr, 0, nullptr, nullptr);
+            u8.resize(static_cast<size_t>(n > 0 ? n : 0));
+            if (n > 0) {
+                WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                    u8.data(), n, nullptr, nullptr);
+            }
+        }
+        out += '"';
+        for (unsigned char c : u8) {
+            switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+            }
+        }
+        out += '"';
+    }
+
+    std::string ToastInfoJson(HWND owner) {
+        ToastOverlay* toast = FindToast(owner);
+        if (!toast || !toast->bitmap) return "{\"visible\":false}";
+        const ToastFrame f = ComputeToastFrame(*toast, AnimNowMs());
+        if (f.expired) return "{\"visible\":false}";
+        POINT origin{0, 0};
+        ClientToScreen(owner, &origin);
+        std::string o = "{\"visible\":true,\"text\":";
+        AppendJsonString(o, toast->text);
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+                      ",\"icon\":%d,\"position\":%d,\"anim\":%d,\"duration_ms\":%d,"
+                      "\"elapsed_ms\":%llu,\"alpha\":%d,\"x\":%d,\"y\":%d,"
+                      "\"width\":%d,\"height\":%d,\"dpi\":%u,\"text_clipped\":%s}",
+                      toast->icon, toast->position, toast->anim, toast->durationMs,
+                      static_cast<unsigned long long>(f.elapsed), static_cast<int>(f.alpha),
+                      toast->targetX - origin.x, f.y - origin.y,
+                      toast->bitmap->width, toast->bitmap->height, toast->dpi,
+                      toast->textClipped ? "true" : "false");
+        o += buf;
+        return o;
+    }
+
+    /* 预乘 BGRA → 直通 BGRA (PNG 存的是非预乘)。 */
+    bool CopyToastPixels(HWND owner, int& w, int& h, std::vector<uint8_t>& px) {
+        ToastOverlay* toast = FindToast(owner);
+        if (!toast || !toast->bitmap || !toast->bitmap->bits) return false;
+        if (ComputeToastFrame(*toast, AnimNowMs()).expired) return false;
+        GdiFlush();
+        w = toast->bitmap->width;
+        h = toast->bitmap->height;
+        const auto* src = static_cast<const uint8_t*>(toast->bitmap->bits);
+        px.assign(src, src + static_cast<size_t>(w) * h * 4);
+        for (size_t i = 0; i < px.size(); i += 4) {
+            const uint8_t a = px[i + 3];
+            if (a == 0 || a == 255) continue;
+            for (int c = 0; c < 3; ++c) {
+                px[i + c] = static_cast<uint8_t>(std::min(255, (px[i + c] * 255 + a / 2) / a));
+            }
+        }
+        return true;
     }
 
     void DestroyToastForOwner(HWND owner) {
@@ -688,12 +856,13 @@ struct OverlayService::Impl {
             return;
         }
         ToastOverlay* toast = it->second.get();
-        if (toast->timerPeriodSet) {
-            timeEndPeriod(1);
-            toast->timerPeriodSet = false;
+        if (toast->ticking) {
+            /* 显式退订, 不等 PostMessage 失败自动清理 (HWND 可能被系统复用)。 */
+            FrameTicker::Instance().Forget(toast->hwnd);
+            toast->ticking = false;
         }
         if (toast->hwnd && IsWindow(toast->hwnd)) {
-            KillTimer(toast->hwnd, kToastTimerId);
+            KillTimer(toast->hwnd, kToastHoldTimerId);
             DestroyWindow(toast->hwnd);
         }
         ownerToast.erase(toast->owner);
@@ -742,9 +911,20 @@ struct OverlayService::Impl {
         }
 
         switch (msg) {
+        case kToastFrameMessage:
+            FrameTicker::Instance().Ack(hwnd);
+            if (toast) {
+                /* 可能就此到期销毁 (toast 失效), 先记下 hwnd 再查是否还在。 */
+                auto* impl = OverlayService::Instance().impl_;
+                impl->UpdateToastFrame(*toast);
+                auto it = impl->toasts.find(hwnd);
+                if (it != impl->toasts.end()) ScheduleToastFrames(*it->second);
+            }
+            return 0;
         case WM_TIMER:
-            if (wParam == kToastTimerId && toast) {
-                OverlayService::Instance().impl_->UpdateToastFrame(*toast);
+            if (wParam == kToastHoldTimerId && toast) {
+                KillTimer(hwnd, kToastHoldTimerId);   // 一次性: 停留快结束, 接上心跳淡出
+                ScheduleToastFrames(*toast);
                 return 0;
             }
             break;
@@ -788,6 +968,10 @@ void OverlayService::InvokeSync(std::function<void()> fn) {
     impl_->InvokeSync(std::move(fn));
 }
 
+void OverlayService::InvokeAsync(std::function<void()> fn) {
+    impl_->InvokeAsync(std::move(fn));
+}
+
 void OverlayService::ShowToast(HWND owner, const std::wstring& text, int durationMs,
                                int position, int icon, int anim) {
     auto request = std::make_unique<Impl::Request>();
@@ -806,6 +990,53 @@ void OverlayService::DismissOwner(HWND owner) {
     request->type = Impl::RequestType::DismissOwner;
     request->owner = owner;
     impl_->Post(std::move(request));
+}
+
+std::string OverlayService::DebugToastInfoJson(HWND owner) {
+    std::string out = "{\"visible\":false}";
+    if (!owner) return out;
+    /* InvokeSync 与 ShowToast 同队列: 之前投的 ShowToast 此刻已经建好窗口。 */
+    impl_->InvokeSync([&]() { out = impl_->ToastInfoJson(owner); });
+    return out;
+}
+
+int OverlayService::DebugScreenshotToast(HWND owner, const wchar_t* outPath) {
+    if (!owner || !outPath) return -1;
+    int w = 0, h = 0;
+    std::vector<uint8_t> px;
+    bool ok = false;
+    impl_->InvokeSync([&]() { ok = impl_->CopyToastPixels(owner, w, h, px); });
+    if (!ok || w <= 0 || h <= 0) return -1;
+
+    /* 编码在调用线程做 (不占 overlay 线程)。调用线程可能已是 STA, 那就沿用。 */
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninit = SUCCEEDED(co);
+    int rc = 0;
+    {
+        Microsoft::WRL::ComPtr<IWICImagingFactory> wic;
+        Microsoft::WRL::ComPtr<IWICStream> stream;
+        Microsoft::WRL::ComPtr<IWICBitmapEncoder> encoder;
+        Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> frame;
+        WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+        const UINT stride = static_cast<UINT>(w) * 4;
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(wic.GetAddressOf())))) rc = -2;
+        else if (FAILED(wic->CreateStream(stream.GetAddressOf()))) rc = -3;
+        else if (FAILED(stream->InitializeFromFilename(outPath, GENERIC_WRITE))) rc = -4;
+        else if (FAILED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr,
+                                           encoder.GetAddressOf()))) rc = -5;
+        else if (FAILED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache))) rc = -6;
+        else if (FAILED(encoder->CreateNewFrame(frame.GetAddressOf(), nullptr))) rc = -7;
+        else if (FAILED(frame->Initialize(nullptr))) rc = -8;
+        else if (FAILED(frame->SetSize(static_cast<UINT>(w), static_cast<UINT>(h)))) rc = -9;
+        else if (FAILED(frame->SetPixelFormat(&fmt))) rc = -10;
+        else if (FAILED(frame->WritePixels(static_cast<UINT>(h), stride,
+                                           stride * static_cast<UINT>(h), px.data()))) rc = -11;
+        else if (FAILED(frame->Commit())) rc = -12;
+        else if (FAILED(encoder->Commit())) rc = -13;
+    }
+    if (uninit) CoUninitialize();
+    return rc;
 }
 
 void OverlayService::Stop() {

@@ -16,6 +16,8 @@
 #include "widget.h"
 #include "renderer.h"
 #include "render_handles.h"
+#include "image_shadow_geom.h"
+#include "zoom_motion.h"
 
 #include <d2d1.h>
 #include <d2d1_3.h>      /* ID2D1SvgDocument — Build 70+ (L20) SVG 原生路径 */
@@ -57,6 +59,13 @@ public:
     // 全图缩略图兜底（在任何瓦块到位前作背景画面）。stride = pw * 4 时可省。
     void SetPreview(const void* bgra, uint32_t pw, uint32_t ph, uint32_t stride,
                     Renderer& r);
+
+    // 免拷贝版: 借用宿主缓冲 (owner 保活, 换下一张 / Clear 且渲染端放手后归还)。
+    // premultiplied=true 时按 BGRA premul 上传, 不再做逐像素预乘 —— 全不透明的图
+    // straight 与 premul 字节相同, 直接传 true。参数不合法时 owner 立即归还。
+    void SetPreviewShared(const void* bgra, uint32_t pw, uint32_t ph, uint32_t stride,
+                          bool premultiplied, std::shared_ptr<const void> owner,
+                          Renderer& r);
 
     // 喂某级某瓦块。tx/ty 为该 level 网格坐标；最右一列/最下一行允许 tw < tileSize。
     void SetTile(uint32_t level, uint32_t tx, uint32_t ty,
@@ -119,6 +128,18 @@ public:
     // 一整块暗色矩形。几何见 image_shadow_geom.h (有单测)。
     void     SetShadow(bool on)           { shadow_ = on; }
     bool     Shadow() const               { return shadow_; }
+    // ShadowStyle: 阴影档位 (Hairline / Soft / Window)。默认 Soft。纯观感,
+    // 由宿主选 —— 库替用户拍板必错 (见 CHANGELOG build 283 那轮调参教训)。
+    void     SetShadowStyle(imgshadow::Style s) { shadowStyle_ = s; }
+    imgshadow::Style ShadowStyle() const  { return shadowStyle_; }
+    // ShadowOutset (build 321): >0 = 阴影画在控件矩形**外面** (最多外扩这么多 dip),
+    // 围着"图片可见部分"画。给"窗口 = 图 + 透明边距"的无边框看图窗口用: 画布控件
+    // 只占图片区域, 阴影落在四周的透明边距里。0 (默认) = 旧行为, 阴影画在控件内。
+    void     SetShadowOutset(float dip)   { shadowOutset_ = dip > 0.0f ? dip : 0.0f; }
+    float    ShadowOutset() const         { return shadowOutset_; }
+    // 当前档位建议的 Fit() 内边距 (dip)。不留够, 图片一贴视口边阴影就被裁成硬边。
+    // 宿主应与自己的最小内边距取 max (关阴影时也该留一点白)。
+    float    ShadowFitPadding() const;
     // FitPadding (dip): Fit() 计算 zoom 时四周留出的内边距。默认 0 = 长边贴满
     // 视口 (旧行为)。开了图片阴影就必须留一点, 否则阴影整条画在视口外看不见。
     // 画布很小时按短边 25% 自动夹紧, 见 imgshadow::ClampFitPadding。
@@ -165,6 +186,39 @@ public:
     void  Fit();    // 长边贴合视口（rotation-aware: 用 effective W/H）
     void  Reset();  // 1:1 居中
 
+    // ---- 平滑缩放 (build 301 起; 302 改为 Qt 式匀速分段) ----
+    // 以 (anchorX, anchorY) 为锚点缩放到 z: 一段 durationMs 的匀速运动 (log 空间),
+    // 到点硬停。durationMs <= 0 或尚无图像时等同 SetZoomAround 一步到位 (不读
+    // 系统动画开关, 由宿主决定)。
+    // 动画中再次调用: 同向 → 新的一段与未走完的段叠加 (越滚越快, 终点精确逐格
+    // 相乘); 反向 → 清掉积压, 从当前画面立刻掉头。锚点换成新位置。
+    // 动画期间只重绘: 不切金字塔级、不 fire 视口回调 (同拖拽, 防止逐帧排瓦块
+    // 解码); 到位时统一切级 + fire 一次。Zoom() 返回画面上的当前值,
+    // TargetZoom() 返回终点。
+    // 其他改视口的入口 (SetZoom/SetZoomAround/SetPan/Fit/Reset/SetRotation/
+    // Begin/Clear/按下鼠标) 都会先让动画停在当前画面, 再执行自身逻辑。
+    void  AnimateZoomAround(float z, float anchorX, float anchorY, float durationMs);
+    float TargetZoom() const;
+    // 下一格缩放的起算点: 无动画 = 当前; 同向 = 终点 (每格都算数);
+    // 正在反向运动 = 当前画面 (立刻掉头)。连续步进用它乘倍数。
+    float ZoomStepBase(bool zoomIn) const;
+    bool  ZoomAnimating() const      { return zoomAnim_.active; }
+    // 立刻跳到终点并提交 (切级 + fire 视口回调)。宿主要读"最终倍率"前调它。
+    void  FinishZoomAnimation();
+    // 每帧由窗口动画循环调用; 返回 false = 动画已结束。
+    bool  TickZoomAnimation();
+    /* 平滑缩放走窗口动画心跳: 漏登记会让在飞的缩放停在半路。在绘制前推进,
+     * 本帧 OnDraw 用的就是新倍率。 */
+    bool AnimationActive() const override { return zoomAnim_.active; }
+    AnimTick TickAnimation() override {
+        if (!zoomAnim_.active) return {false, false};
+        TickZoomAnimation();
+        return {true, zoomAnim_.active};
+    }
+    // 内置滚轮缩放 (WheelZoomEnabled) 的平滑时长, 默认 0 = 保持旧的一步到位。
+    void  SetWheelZoomSmoothMs(float ms) { wheelZoomSmoothMs_ = ms > 0.0f ? ms : 0.0f; }
+    float WheelZoomSmoothMs() const      { return wheelZoomSmoothMs_; }
+
     // ---- 旋转（90° 倍数）----
     // pan 存屏幕空间, 不随 rotation 变 — 鼠标拖动方向永远匹配视觉方向,
     // 跟 image_view_plus 行为一致. zoom 保留, fit 用 rotated 视觉 AABB.
@@ -182,6 +236,21 @@ public:
         uint32_t visibleTx1, visibleTy1;
     };
     std::function<void(const Viewport&)> onViewportChanged;
+
+    // ---- 视图变换反馈 (build 309) ----
+    // onViewportChanged 为了不触发瓦块解码风暴, 拖动途中 / 缩放动画途中都不发,
+    // 只在落定时发一次 —— 宿主叠在画布上的东西 (标记点等) 因此跟不上画面。
+    // 这条是轻量版: zoom / pan / rotation 实际变了就发 (拖动每次移动、动画每帧、
+    // 每次落定), 不做任何瓦块工作。interacting=true 表示还在拖 / 还在动画, 之后
+    // 必有一次 interacting=false 的落定回调。UI 线程同步 fire。
+    struct Transform {
+        float zoom;
+        float panX;
+        float panY;
+        int   rotation;
+        bool  interacting;
+    };
+    std::function<void(const Transform&)> onTransformChanged;
 
     // ---- 数据形状查询 ----
     bool      HasInfo() const        { return info_.fullWidth > 0; }
@@ -216,6 +285,10 @@ public:
     D2D1_SIZE_F SizeHint() const override;
 
 private:
+    // SetPreview / SetPreviewShared 共用: 先移除旧 preview 资源, 再采用新 key。
+    void DropPreviewResource_();
+    void AdoptPreviewResource_(ResourceKey key, uint32_t pw, uint32_t ph);
+
     // ---- 状态 ----
     Info     info_{};
     bool     autoLevel_ = true;
@@ -225,6 +298,8 @@ private:
     bool     panLockY_ = false;
     bool     checkerboard_ = false;    // 图区垫棋盘 (透明像素对比背景); 默认关
     bool     shadow_ = false;          // 图片外圈投影 + 描边 (显示图片边界); 默认关
+    imgshadow::Style shadowStyle_ = imgshadow::Style::Soft;  // 阴影档位; 见 SetShadowStyle
+    float    shadowOutset_ = 0.0f;     // >0 = 阴影画在控件矩形外; 见 SetShadowOutset
     float    fitPadding_ = 0.0f;       // Fit() 留的内边距 (dip); 默认 0 = 贴满视口
     uint32_t activeLevel_ = 0;
     // L115: 上一个 active level — 切级时 TrimToViewport_ 保留它的 tile, 让 OnDraw
@@ -244,6 +319,19 @@ private:
      * DIP 算阈值会选错 level (永远偏向上采样, fit 大图模糊). Begin 时从
      * Renderer.RT()->GetDpi 读 + cache. */
     float dpi_scale_ = 1.0f;
+
+    /* 平滑缩放状态。锚点固定为"屏幕点 + 该点下的图像坐标", 每帧按当前倍率
+     * 解析求 pan (ApplyZoomAtAnchor_), 终点与一步到位的 SetZoomAround 一致,
+     * 不会因逐帧累积而漂移。 */
+    zoommotion::State zoomAnim_{};
+    float   zoomAnimAnchorSX_ = 0.0f, zoomAnimAnchorSY_ = 0.0f;
+    float   zoomAnimAnchorIX_ = 0.0f, zoomAnimAnchorIY_ = 0.0f;
+    int64_t zoomAnimLastQpc_ = 0;
+    float   wheelZoomSmoothMs_ = 0.0f;
+    /* 设 zoom_ 并按锚点反算 pan (不切级、不通知)。 */
+    void  ApplyZoomAtAnchor_(float z, float ix, float iy, float ax, float ay);
+    /* 动画停在当前画面: 切级到当前倍率; notify=true 时再 fire 视口回调。 */
+    void  StopZoomAnimation_(bool notify);
 
     bool  dragging_ = false;
     float dragStartX_ = 0, dragStartY_ = 0;
@@ -398,6 +486,9 @@ private:
     void     ConstrainPan();
     void     RequestViewportCommit();
     void     NotifyViewport();
+    // build 309: fire onTransformChanged。interacting 由当前状态算 (正在拖 /
+    // 缩放动画在飞), 不由调用处传, 免得哪处漏传。
+    void     NotifyTransform_();
     void     InvalidateAllWindows();
 };
 

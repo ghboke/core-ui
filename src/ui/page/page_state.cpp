@@ -122,8 +122,8 @@ bool ParseBackdropBlurText(const std::string& value, float& out) {
     return false;
 }
 
-void ApplyDynamicPositionOverrides(Widget* w) {
-    if (w) w->ApplyDynamicPositionOverrides();
+void ApplyDynamicOverrides(Widget* w) {
+    if (w) w->ApplyDynamicOverrides();
 }
 
 void ParseDynamicAbsSide(const ui::expr::Value& v, float& slot, std::string& rawSlot) {
@@ -174,7 +174,7 @@ bool ApplyDynamicAbsSideBinding(Widget* w, const std::string& prop,
     } else {
         return false;
     }
-    ApplyDynamicPositionOverrides(w);
+    ApplyDynamicOverrides(w);
     ui::RequestLayout();
     return true;
 }
@@ -197,6 +197,17 @@ JSValue JsTranslateTrampoline(JSContext* ctx, JSValueConst this_val,
     if (!key) return JS_NewString(ctx, "");
     std::string out = page->Translate(key);
     JS_FreeCString(ctx, key);
+    /* build 316: $t(key, a0, a1, …) → 译文里的 {0} {1} … 换成参数 (数字也行)。 */
+    for (int i = 1; i < argc; ++i) {
+        const char* a = JS_ToCString(ctx, argv[i]);
+        const std::string ph = "{" + std::to_string(i - 1) + "}";
+        const std::string val = a ? a : "";
+        if (a) JS_FreeCString(ctx, a);
+        for (size_t pos = out.find(ph); pos != std::string::npos;
+             pos = out.find(ph, pos + val.size())) {
+            out.replace(pos, ph.size(), val);
+        }
+    }
     return JS_NewStringLen(ctx, out.data(), out.size());
 }
 
@@ -354,6 +365,11 @@ void SetHeightMaybeAnimated(Widget* w, float target) {
 }
 
 void SetBgMaybeAnimated(Widget* w, const D2D1_COLOR_F& target) {
+    /* 记下覆盖, 否则下一次 recomputeStyle 会把 bgColor 清成透明 (见 widget.h
+     * 的 Dynamic overrides 说明)。动画那条记的也是**目标色**: 动画途中撞上
+     * 重算时停在目标色, 比停在透明合理。 */
+    w->dynamicBgSet = true;
+    w->dynamicBg = target;
     const auto* tA = FindTransition(w, 8);
     if (tA) {
         if (auto* win = OwnerWindow(w)) {
@@ -489,6 +505,9 @@ void PageState::SetLocale(const std::string& locale) {
     };
     if (page_.root) retranslate(page_.root.get());
 
+    /* build 316: 宿主按 key 绑定的文字 / 标题 / 页面变量一并重译。 */
+    ReapplyKeyTexts();
+
     // Locale change rewrote every $t() label's text via ApplyBindingToWidget,
     // which only repaints (InvalidateAllWindows) — it does NOT relayout. A label
     // measured in the old locale keeps that rect, so a wider translation (e.g.
@@ -498,6 +517,117 @@ void PageState::SetLocale(const std::string& locale) {
     // whether the window is foreground / gets a later paint. One pass, not
     // per-binding, keeps a 50-label locale switch from doing 50 full relayouts.
     ui::GetContext().RelayoutAllWindows();
+}
+
+// ---- build 316: 宿主按 key 设的文字 ---------------------------------------
+
+std::wstring PageState::FormatKeyText(const KeyText& t) const {
+    std::wstring out = ToWide(Translate(t.key));
+    for (size_t i = 0; i < t.args.size(); ++i) {
+        const std::wstring& a = t.args[i];
+        std::wstring val;
+        if (a.size() >= 2 && a[0] == L'@' && a[1] == L'@') {
+            val = a.substr(1);                              /* "@@x" → 字面 "@x" */
+        } else if (!a.empty() && a[0] == L'@') {
+            val = ToWide(Translate(ToUtf8(a.substr(1))));  /* "@key" → 译文 */
+        } else {
+            val = a;
+        }
+        const std::wstring ph = L"{" + std::to_wstring(i) + L"}";
+        for (size_t pos = out.find(ph); pos != std::wstring::npos;
+             pos = out.find(ph, pos + val.size())) {
+            out.replace(pos, ph.size(), val);
+        }
+    }
+    return out;
+}
+
+void PageState::ApplyWidgetText(Widget* w, TextSlot slot, const std::wstring& text) {
+    if (!w) return;
+    switch (slot) {
+        case TextSlot::Text:
+            if (auto* l = dynamic_cast<LabelWidget*>(w))       l->SetText(text);
+            else if (auto* b = dynamic_cast<ButtonWidget*>(w)) b->SetText(text);
+            break;
+        case TextSlot::Tooltip:
+            w->tooltip = text;
+            break;
+        case TextSlot::TitlebarTitle:
+            if (auto* tb = dynamic_cast<TitleBarWidget*>(w)) tb->SetTitle(text);
+            break;
+    }
+    ui::GetContext().RequestInvalidateAll();
+}
+
+void PageState::ApplyWindowTitle(uint64_t win, const std::wstring& text) {
+    if (auto* wi = ui::GetContext().GetWindow(win)) wi->SetTitle(text);
+}
+
+void PageState::BindWidgetText(const WidgetPtr& w, TextSlot slot, KeyText t) {
+    if (!w) return;
+    UnbindWidgetText(w.get(), slot);
+    ApplyWidgetText(w.get(), slot, FormatKeyText(t));
+    widgetTextBindings_.push_back({w, slot, std::move(t)});
+}
+
+bool PageState::UnbindWidgetText(Widget* w, TextSlot slot) {
+    const auto before = widgetTextBindings_.size();
+    widgetTextBindings_.erase(
+        std::remove_if(widgetTextBindings_.begin(), widgetTextBindings_.end(),
+                       [&](const WidgetTextBinding& b) {
+                           auto sp = b.widget.lock();
+                           return !sp || (sp.get() == w && b.slot == slot);
+                       }),
+        widgetTextBindings_.end());
+    return widgetTextBindings_.size() != before;
+}
+
+void PageState::BindComboItems(const WidgetPtr& w, std::vector<std::string> keys) {
+    auto* cb = dynamic_cast<ComboBoxWidget*>(w.get());
+    if (!cb) return;
+    /* 复用 <option>@key 的机制: 选项带 i18n key, SetLocale 遍历时 RetranslateItems。
+     * (控件得在本页面的树里 —— 宿主建的下拉也是挂进页面才显示, 满足。) */
+    std::vector<std::wstring> items;
+    items.reserve(keys.size());
+    for (const auto& k : keys) items.push_back(ToWide(Translate(k)));
+    cb->SetItems(std::move(items));
+    cb->SetI18nItemKeys(std::move(keys));
+    ui::GetContext().RequestInvalidateAll();
+}
+
+void PageState::BindWindowTitle(uint64_t win, KeyText t) {
+    ApplyWindowTitle(win, FormatKeyText(t));
+    windowTitleBindings_[win] = std::move(t);
+}
+
+bool PageState::UnbindWindowTitle(uint64_t win) {
+    return windowTitleBindings_.erase(win) > 0;
+}
+
+void PageState::SetTextKey(const std::string& name, KeyText t) {
+    SetString(name, ToUtf8(FormatKeyText(t)));
+    textVarBindings_[name] = std::move(t);
+}
+
+bool PageState::UnbindTextVar(const std::string& name) {
+    return textVarBindings_.erase(name) > 0;
+}
+
+void PageState::ReapplyKeyTexts() {
+    /* 控件已销毁的绑定顺手清掉。 */
+    widgetTextBindings_.erase(
+        std::remove_if(widgetTextBindings_.begin(), widgetTextBindings_.end(),
+                       [](const WidgetTextBinding& b) { return b.widget.expired(); }),
+        widgetTextBindings_.end());
+    for (const auto& b : widgetTextBindings_) {
+        if (auto sp = b.widget.lock()) ApplyWidgetText(sp.get(), b.slot, FormatKeyText(b.text));
+    }
+    for (auto it = windowTitleBindings_.begin(); it != windowTitleBindings_.end();) {
+        if (!ui::GetContext().GetWindow(it->first)) { it = windowTitleBindings_.erase(it); continue; }
+        ApplyWindowTitle(it->first, FormatKeyText(it->second));
+        ++it;
+    }
+    for (const auto& [name, t] : textVarBindings_) SetString(name, ToUtf8(FormatKeyText(t)));
 }
 
 // ---- Lifecycle hooks --------------------------------------------------
@@ -564,7 +694,7 @@ void PageState::RefreshThemeStyles() {
     // theme palette — so every `var(--xxx)` resolves against new colors.
     std::function<void(Widget*)> walk = [&](Widget* w) {
         if (!w) return;
-        if (w->recomputeStyle) w->recomputeStyle(w->lastStateBits);
+        if (w->recomputeStyle) w->RecomputeStyleNow(w->lastStateBits);
         for (auto& c : w->Children()) walk(c.get());
     };
     walk(page_.root.get());
@@ -608,6 +738,11 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         }
     } _invalidate{shouldInvalidate};
 
+    // build 304: <use :href> → 换引用的 symbol。
+    if (prop == "use.href") {
+        if (auto* svg = dynamic_cast<SvgWidget*>(w)) svg->SetUseHref(v.ToString());
+        return;
+    }
     // SVG shape attribute: "shape[N].<attr>" routes to SvgWidget::SetShapeProperty.
     if (prop.size() > 6 && prop.compare(0, 6, "shape[") == 0) {
         size_t close = prop.find(']', 6);
@@ -622,6 +757,18 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         return;
     }
 
+    // build 313: <select> 含 <option v-for> / {{ }} 时整组选项是一条数组绑定。
+    if (prop == "items") {
+        if (auto* combo = dynamic_cast<ComboBoxWidget*>(w)) {
+            std::vector<std::wstring> items;
+            if (v.IsArray()) {
+                items.reserve(v.AsArray().size());
+                for (const auto& it : v.AsArray()) items.push_back(ToWide(it.ToString()));
+            }
+            combo->SetItems(std::move(items));
+        }
+        return;
+    }
     if (prop == "text") {
         if (auto* lbl = dynamic_cast<LabelWidget*>(w))  lbl->SetText(ToWide(v.ToString()));
         else if (auto* btn = dynamic_cast<ButtonWidget*>(w)) btn->SetText(ToWide(v.ToString()));
@@ -647,7 +794,7 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
         if (!tok.empty()) tokens.push_back(std::move(tok));
         w->dynamicClasses = std::move(tokens);
         std::function<void(Widget*)> refresh = [&](Widget* x) {
-            if (x->recomputeStyle) x->recomputeStyle(x->lastStateBits);
+            if (x->recomputeStyle) x->RecomputeStyleNow(x->lastStateBits);
             for (auto& c : x->Children()) refresh(c.get());
         };
         refresh(w);
@@ -709,7 +856,7 @@ void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const u
             // this the widget's color/cursor stay stuck at the previous state
             // until some unrelated event triggers a recomputeStyle.
             std::function<void(Widget*)> refresh = [&](Widget* x) {
-                if (x->recomputeStyle) x->recomputeStyle(x->lastStateBits);
+                if (x->recomputeStyle) x->RecomputeStyleNow(x->lastStateBits);
                 for (auto& c : x->Children()) refresh(c.get());
             };
             refresh(w);
@@ -853,10 +1000,18 @@ void PageState::WireMenus() {
     menus_.clear();
     menuById_.clear();
     triggers_.clear();
-    menuItemHandlers_.clear();
     compiledToMenu_.clear();
     if (page_.menus.empty()) return;
     WireSubtreeMenus(page_.menus, menus_);
+}
+
+/* 编译期静态外观 (背景 / 材质 / 模糊); 反应式的那部分由 PopulateMenu 每次补。
+ * 共用 shell 与迭代里新建的子菜单实例都走这里。 */
+static void ApplyStaticMenuLook(ContextMenu& menu, const CompiledMenu& cm) {
+    if (cm.hasBgColor) menu.SetBgColor(cm.bgColor);
+    if (cm.hasFrostedMaterial) menu.SetFrostedMaterial(cm.frostedMaterial);
+    if (cm.hasBackdropBlur) menu.SetBackdropBlur(cm.backdropBlur);
+    menu.SetMinWidth(cm.minWidth);
 }
 
 void PageState::WireSubtreeMenus(const std::vector<CompiledMenu>& subMenus,
@@ -883,25 +1038,34 @@ void PageState::WireSubtreeMenus(const std::vector<CompiledMenu>& subMenus,
     std::function<std::shared_ptr<ContextMenu>(const CompiledMenu&)> buildOne;
     buildOne = [&](const CompiledMenu& cm) -> std::shared_ptr<ContextMenu> {
         auto menu = std::make_shared<ContextMenu>();
-        if (cm.hasBgColor) menu->SetBgColor(cm.bgColor);
-        if (cm.hasFrostedMaterial) menu->SetFrostedMaterial(cm.frostedMaterial);
-        if (cm.hasBackdropBlur) menu->SetBackdropBlur(cm.backdropBlur);
+        ApplyStaticMenuLook(*menu, cm);
         compiledToMenu_[&cm] = menu.get();
         /* 递归预建所有 submenu shells, 注册它们自己的 hook. submenu 本身的
          * trigger 是 parent menu item, 不走 widget trigger; 但仍走同款 Show
          * 路径所以 hook 会触发. */
-        for (const auto& mi : cm.items) {
-            if (mi.submenu) {
-                auto sub = buildOne(*mi.submenu);
-                outMenus.push_back(sub);
+        /* 迭代里的子菜单 (<menu v-for> / <template v-for> 之内) 每次现建
+         * (PopulateMenuItem), 不预建 shell —— 预建时没有迭代变量, 初始
+         * populate 只会求值报错。<template v-if> 里的照常预建。 */
+        std::function<void(const std::vector<CompiledMenuItem>&)> prebuild;
+        prebuild = [&](const std::vector<CompiledMenuItem>& items) {
+            for (const auto& mi : items) {
+                if (!mi.vForArrayExpr.empty()) continue;
+                if (mi.group) prebuild(mi.groupItems);
+                else if (mi.submenu) outMenus.push_back(buildOne(*mi.submenu));
             }
-        }
+        };
+        prebuild(cm.items);
         /* hook capture: this + 持久 cm 指针 (cm 在 page_.menus 里, 跟 page 生命同寿)
          * + 裸 menu 指针 (shared_ptr 在 menus_ / outMenus 里持有). */
         const CompiledMenu* cmPtr = &cm;
         ContextMenu*        rawMenu = menu.get();
         PageState*          self = this;
         menu->SetBeforeShowHook([self, cmPtr, rawMenu] {
+            /* build 343: 非建页线程 (子菜单悬停展开 = OverlayService 线程)
+             * 不重建 —— 那里跑 QuickJS 会失败, 内容退回模板原样 (`@key`
+             * 原样、:stroke/:background 不生效)。父菜单 populate 已在建页
+             * 线程把子菜单填好 (PopulateMenuItem), 沿用即可。 */
+            if (std::this_thread::get_id() != self->ownerThread_) return;
             self->PopulateMenu(rawMenu, *cmPtr, {});
         });
         /* 初始 populate 一次, 让没经过 Show 路径的直接调用 (Bounds/MenuWidth)
@@ -1108,16 +1272,22 @@ void PageState::PopulateMenu(
      * wrapper widget 走完整 CSS 级联拿 SizeHint (跟 PopulateMenuItem 真正
      * add 进 menu 时用同一套, 估算值跟运行时严格相等). */
     {
-        std::function<void(const CompiledMenu&, float&, bool&, float&)> scan;
-        scan = [&scan, this](const CompiledMenu& m, float& maxW, bool& hasSub, float& maxC) {
-            for (const auto& mi : m.items) {
+        std::function<void(const std::vector<CompiledMenuItem>&, bool, float&, bool&, float&)> scan;
+        scan = [&scan, this](const std::vector<CompiledMenuItem>& items, bool shareWidth,
+                             float& maxW, bool& hasSub, float& maxC) {
+            for (const auto& mi : items) {
                 if (mi.separator) continue;
+                if (mi.group) {  // <template>: 子项算作所在菜单的行
+                    scan(mi.groupItems, shareWidth, maxW, hasSub, maxC);
+                    continue;
+                }
                 float w = mi.shortcut.length() * 6.5f;
                 if (w > maxW) maxW = w;
                 if (mi.submenu) {
                     hasSub = true;
-                    if (m.shareWidthWithSubmenus) {
-                        scan(*mi.submenu, maxW, hasSub, maxC);
+                    if (shareWidth) {
+                        scan(mi.submenu->items, mi.submenu->shareWidthWithSubmenus,
+                             maxW, hasSub, maxC);
                     }
                 }
                 /* 真实 measurement, build 83 (正确 CSS spec): build wrapper widget tree,
@@ -1146,13 +1316,55 @@ void PageState::PopulateMenu(
         float maxShortcutAll = 0;
         bool  anySubmenu     = false;
         float maxContentAll  = 0;
-        scan(cm, maxShortcutAll, anySubmenu, maxContentAll);
+        scan(cm.items, cm.shareWidthWithSubmenus, maxShortcutAll, anySubmenu, maxContentAll);
         menu->SetReservedShortcutWidth(maxShortcutAll);
         menu->SetReservedHasSubmenu(anySubmenu);
         menu->SetReservedContentWidth(maxContentAll);
     }
 
-    for (const auto& mi : cm.items) {
+    PopulateMenuItems(menu, cm.items, locals);
+
+    /* Build 85+: 跨菜单树传播 — 算完 parent 的最终 MenuWidth, 回写到所有
+     * submenu 当 minPropagatedWidth, 让 submenu 至少跟 parent 同宽. 整族
+     * 菜单视觉一致 (不再 submenu 缩到自身文字宽度).
+     * build 249: share-width=false 让调用方关闭这条传播, 使子菜单按自身
+     * 内容列宽度收缩。 */
+    float parentWidth = cm.shareWidthWithSubmenus ? menu->MenuWidth() : 0.0f;
+    std::function<void(const std::vector<CompiledMenuItem>&)> propagate;
+    propagate = [&propagate, this, parentWidth](const std::vector<CompiledMenuItem>& items) {
+        for (const auto& mi : items) {
+            if (mi.group) { propagate(mi.groupItems); continue; }
+            if (mi.submenu) {
+                auto it = compiledToMenu_.find(mi.submenu.get());
+                if (it != compiledToMenu_.end() && it->second) {
+                    it->second->SetMinPropagatedWidth(parentWidth);
+                }
+                propagate(mi.submenu->items);
+            }
+        }
+    };
+    propagate(cm.items);
+
+    /* build 303: 迭代里新建的子菜单实例不在 compiledToMenu_ 里, 按实际挂上的
+     * items 再走一遍 (对共用 shell 是同值重设, 无副作用)。 */
+    std::function<void(const ContextMenu&)> propagateLive;
+    propagateLive = [&propagateLive, parentWidth](const ContextMenu& m) {
+        for (int i = 0; i < m.ItemCount(); ++i) {
+            if (auto sub = m.SubmenuAt(i)) {
+                sub->SetMinPropagatedWidth(parentWidth);
+                propagateLive(*sub);
+            }
+        }
+    };
+    propagateLive(*menu);
+}
+
+/* 一串编译期子项按当前 JS state 展开进 menu: 处理 v-for (menuitem / 嵌套 menu /
+ * template 同一套), 其余交给 PopulateMenuItem。<template> 分组也递归走这里。 */
+void PageState::PopulateMenuItems(
+        ContextMenu* menu, const std::vector<CompiledMenuItem>& items,
+        const std::vector<std::pair<std::string, JSValue>>& locals) {
+    for (const auto& mi : items) {
         if (!mi.vForArrayExpr.empty()) {
             /* v-for: eval array expr → 遍历, 每次塞 iter / index 变量进 locals
              * 后 PopulateMenuItem. 空数组 / 非数组 → skip 这条 declaration. */
@@ -1184,26 +1396,6 @@ void PageState::PopulateMenu(
             PopulateMenuItem(menu, mi, locals);
         }
     }
-
-    /* Build 85+: 跨菜单树传播 — 算完 parent 的最终 MenuWidth, 回写到所有
-     * submenu 当 minPropagatedWidth, 让 submenu 至少跟 parent 同宽. 整族
-     * 菜单视觉一致 (不再 submenu 缩到自身文字宽度).
-     * build 249: share-width=false 让调用方关闭这条传播, 使子菜单按自身
-     * 内容列宽度收缩。 */
-    float parentWidth = cm.shareWidthWithSubmenus ? menu->MenuWidth() : 0.0f;
-    std::function<void(const CompiledMenu&)> propagate;
-    propagate = [&propagate, this, parentWidth](const CompiledMenu& m) {
-        for (const auto& mi : m.items) {
-            if (mi.submenu) {
-                auto it = compiledToMenu_.find(mi.submenu.get());
-                if (it != compiledToMenu_.end() && it->second) {
-                    it->second->SetMinPropagatedWidth(parentWidth);
-                }
-                propagate(*mi.submenu);
-            }
-        }
-    };
-    propagate(cm);
 }
 
 void PageState::PopulateMenuItem(
@@ -1211,6 +1403,12 @@ void PageState::PopulateMenuItem(
         const std::vector<std::pair<std::string, JSValue>>& locals) {
     /* item-level v-if / v-show: 求 false → skip, 也不占位 (separator 同款) */
     if (!mi.vIfExpr.empty() && !EvalBool(mi.vIfExpr, locals, true)) return;
+
+    /* <template>: 自身不占行, 子项带着当前迭代变量展开到同一个菜单。 */
+    if (mi.group) {
+        PopulateMenuItems(menu, mi.groupItems, locals);
+        return;
+    }
 
     auto toWide = [](const std::string& s) -> std::wstring {
         if (s.empty()) return {};
@@ -1289,23 +1487,151 @@ void PageState::PopulateMenuItem(
         }
     }
 
-    /* enabled: bound 优先, 默认 true. ContextMenu 端的 disabled state 走
-     * AddItemContent 之后 SetEnabled(id, false). */
+    /* enabled: bound 优先, 默认 true. 只作用于这一行 (SetLastItemEnabled). */
     bool enabled = mi.boundEnabledExpr.empty()
         ? true : EvalBool(mi.boundEnabledExpr, locals, true);
 
-    if (mi.submenu) {
+    bool added = false;
+    if (mi.submenu && !locals.empty()) {
+        /* build 303: 处在迭代里 (<menu v-for> 本身, 或外层有 v-for) 的子菜单
+         * 每次 populate 新建一个实例, 带着迭代变量当场填好 —— 共用的 shell
+         * 只有一份, 子菜单弹出时也拿不到迭代变量。实例挂在本行上, 父菜单
+         * 下次 Clear 时一起释放。 */
+        auto sub = std::make_shared<ContextMenu>();
+        ApplyStaticMenuLook(*sub, *mi.submenu);
+        PopulateMenu(sub.get(), *mi.submenu, locals);
+        menu->AddSubmenu(content, sub);
+        added = true;
+    } else if (mi.submenu) {
         /* Submenu entry: 用 compiler 合成的 <label>title</label> 当 entry widget. */
         auto it = compiledToMenu_.find(mi.submenu.get());
         if (it != compiledToMenu_.end() && it->second) {
+            /* build 343: 共用 shell 跟父菜单一起在建页线程填好 (同上面迭代里的
+             * 子菜单实例) —— 悬停展开时 shell 自己的 hook 在 OverlayService
+             * 线程上, 会跳过重建。 */
+            PopulateMenu(it->second, *mi.submenu, {});
             menu->AddSubmenu(content, it->second->shared_from_this());
+            added = true;
         }
     } else {
-        menu->AddItemContent(mi.itemId, shortcut, content);
-        menu->SetLastItemMeta(mi.strId, mi.attrs);  // 补字符串 id + 全部属性 (点击回调用)
+        std::string strId = mi.strId;
+        auto attrs = ResolveMenuItemAttrs(mi, locals, strId);
+        menu->AddItemContent(ResolveMenuItemNumericId(mi, strId, locals, *menu),
+                             shortcut, content);
+        menu->SetLastItemMeta(strId, std::move(attrs));  // 字符串 id + 全部属性 (点击回调用)
+        if (!mi.onClick.empty()) menu->SetLastItemAction(MakeMenuItemAction(mi.onClick, locals));
+        added = true;
     }
-    if (!enabled) menu->SetEnabled(mi.itemId, false);
-    if (!mi.onClick.empty()) menuItemHandlers_[mi.strId] = mi.onClick;
+    if (added && !enabled) menu->SetLastItemEnabled(false);
+}
+
+/* <menuitem @click="expr"> / onclick="expr" → 已绑定本行迭代变量的动作 (build 303)。
+ * 跟 v-for 行事件同一种闭包: (locals..., $event), 裸方法名自动带 $event 调用,
+ * 调用形式 `run(x.cmd)` 直接求值。菜单项的 $event 为 undefined。
+ *
+ * 生命周期: 动作挂在 MenuItem 上, 还会被复制进投递中的 MenuClickInfo, 可能比
+ * JS runtime 活得久 (热重载 / 页面销毁时消息还在队列里)。所以持有的 JS 值
+ * 用 jsAlive_ 守着: runtime 没了就既不调用也不释放。 */
+std::function<void()> PageState::MakeMenuItemAction(
+        const std::string& sourceJs,
+        const std::vector<std::pair<std::string, JSValue>>& locals) {
+    if (!jsRt_ || !jsAlive_) return {};
+    JSContext* ctx = jsRt_->ctx();
+    std::set<std::string> localSet;
+    std::vector<std::string> paramNames;
+    for (const auto& kv : locals) {
+        localSet.insert(kv.first);
+        paramNames.push_back(kv.first);
+    }
+    std::string rew = ui::uix::RewriteTemplateExpr(sourceJs, localSet);
+    JSValue fn = jsRt_->CompileLoopHandlerClosure(rew, paramNames, "<menuitem @click>");
+    if (JS_IsException(fn)) {
+        errors_.push_back("<menuitem> @click compile error: " + jsRt_->lastError() +
+                          "\n  source: " + sourceJs);
+        return {};
+    }
+
+    struct Bound {
+        JSContext* ctx = nullptr;
+        JSValue fn = JS_UNDEFINED;
+        std::vector<JSValue> args;
+        std::weak_ptr<char> alive;
+        ~Bound() {
+            if (alive.expired()) return;
+            JS_FreeValue(ctx, fn);
+            for (auto& a : args) JS_FreeValue(ctx, a);
+        }
+    };
+    auto b = std::make_shared<Bound>();
+    b->ctx = ctx;
+    b->fn = fn;
+    b->alive = jsAlive_;
+    for (const auto& kv : locals) b->args.push_back(JS_DupValue(ctx, kv.second));
+
+    PageState* self = this;
+    return [self, b]() {
+        if (b->alive.expired()) return;
+        std::vector<JSValue> argv = b->args;
+        argv.push_back(JS_UNDEFINED);  // $event
+        JSValue r = JS_Call(b->ctx, b->fn, self->jsState_, (int)argv.size(), argv.data());
+        if (JS_IsException(r)) {
+            JSValue exc = JS_GetException(b->ctx);
+            const char* msg = JS_ToCString(b->ctx, exc);
+            self->errors_.push_back(std::string("<menuitem> @click threw: ") +
+                                    (msg ? msg : "(no message)"));
+            if (msg) JS_FreeCString(b->ctx, msg);
+            JS_FreeValue(b->ctx, exc);
+        }
+        JS_FreeValue(b->ctx, r);
+    };
+}
+
+/* 静态属性打底, 再用 :attr 的本次求值覆盖 (build 303)。:id 同时写回 strId。
+ * 求值为 undefined/null 的绑定属性不写入 —— 跟 DOM 里 :attr="null" 移除属性一致。 */
+std::vector<std::pair<std::string, std::string>> PageState::ResolveMenuItemAttrs(
+        const CompiledMenuItem& mi,
+        const std::vector<std::pair<std::string, JSValue>>& locals,
+        std::string& strId) {
+    auto attrs = mi.attrs;
+    for (const auto& [name, expr] : mi.boundAttrs) {
+        JSValue v = EvalBoundExpr(expr, locals);
+        bool present = !JS_IsUndefined(v) && !JS_IsNull(v) && !JS_IsException(v);
+        std::string s;
+        if (present && jsRt_) {
+            const char* c = JS_ToCString(jsRt_->ctx(), v);
+            s = c ? c : "";
+            if (c) JS_FreeCString(jsRt_->ctx(), c);
+        }
+        if (jsRt_) JS_FreeValue(jsRt_->ctx(), v);
+
+        auto it = std::find_if(attrs.begin(), attrs.end(),
+                               [&](const auto& kv) { return kv.first == name; });
+        if (!present) {
+            if (it != attrs.end()) attrs.erase(it);
+            if (name == "id") strId.clear();
+            continue;
+        }
+        if (it != attrs.end()) it->second = s;
+        else attrs.push_back({name, s});
+        if (name == "id") strId = s;
+    }
+    return attrs;
+}
+
+/* 内部数字 id (hit-test / debug / ItemIdAt)。数字串 id 直接用; 否则静态项沿用
+ * 编译期 autoId, 循环里的项 (locals 非空) 每行另发一个 —— 编译期 id 是整条
+ * v-for 共用的。动态号段远离手写的数字 id。 */
+int PageState::ResolveMenuItemNumericId(
+        const CompiledMenuItem& mi, const std::string& strId,
+        const std::vector<std::pair<std::string, JSValue>>& locals,
+        const ContextMenu& menu) {
+    if (strId != mi.strId && !strId.empty()) {
+        char* end = nullptr;
+        long n = std::strtol(strId.c_str(), &end, 10);
+        if (end && *end == '\0' && n >= 0 && n < kDynamicMenuIdBase) return (int)n;
+    }
+    if (locals.empty()) return mi.itemId;
+    return kDynamicMenuIdBase + menu.ItemCount();
 }
 
 void PageState::AttachWindow(uint64_t winHandle) {
@@ -1370,33 +1696,9 @@ void PageState::AttachWindow(uint64_t winHandle) {
         };
     }
 
-    // <menuitem onclick="methodName"> — dispatch to the JS method bound on
-    // jsState_. Methods{} from `export default` were merged onto dataObj
-    // before MakeReactive, so jsState_.<name> resolves through the proxy
-    // to the JSFunction we then call with this=jsState_.
-    auto prev = win->onMenuItemClick;
+    // <menuitem @click / onclick> 不再在这里按 id 查表分派: 动作在 populate 时
+    // 绑好本行迭代变量, 随点击载荷走, 由窗口 WM_APP+100 直接执行 (build 303)。
     PageState* self = this;
-    win->onMenuItemClick = [self, prev](const MenuClickInfo* info) {
-        auto it = info ? self->menuItemHandlers_.find(info->id)
-                       : self->menuItemHandlers_.end();
-        if (it != self->menuItemHandlers_.end() && self->jsRt_ &&
-            !JS_IsUndefined(self->jsState_)) {
-            JSContext* ctx = self->jsRt_->ctx();
-            JSValue fn = JS_GetPropertyStr(ctx, self->jsState_, it->second.c_str());
-            if (JS_IsFunction(ctx, fn)) {
-                JSValue r = JS_Call(ctx, fn, self->jsState_, 0, nullptr);
-                if (JS_IsException(r)) {
-                    JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
-                }
-                JS_FreeValue(ctx, r);
-                JS_FreeValue(ctx, fn);
-                return;
-            }
-            JS_FreeValue(ctx, fn);
-        }
-        if (prev) prev(info);
-    };
-
     win->onPageResize = [self](int width, int height) {
         if (self) self->DispatchQuickJSResize(width, height);
     };
@@ -1620,6 +1922,10 @@ void PageState::DetachQuickJS() {
     if (!JS_IsUndefined(jsOptions_)) JS_FreeValue(ctx, jsOptions_);
     jsState_   = JS_UNDEFINED;
     jsOptions_ = JS_UNDEFINED;
+    /* 菜单项动作持有 JS 值 (迭代变量 + 闭包): runtime 还在时清掉 items 让它们
+     * 正常释放; 仍在消息队列里的点击载荷靠 jsAlive_ 失效后自动变成空操作。 */
+    for (auto& m : menus_) if (m) m->Clear();
+    jsAlive_.reset();
     jsRt_.reset();
 }
 
@@ -1629,6 +1935,7 @@ void PageState::AttachQuickJS(CompiledPage page) {
     page_ = std::move(page);
 
     jsRt_ = std::make_unique<ui::uix::ScriptRuntime>();
+    jsAlive_ = std::make_shared<char>(0);
     jsRt_->SetUserData(this);
     JSContext* ctx = jsRt_->ctx();
 
@@ -1782,12 +2089,55 @@ void PageState::AttachQuickJS(CompiledPage page) {
     // 9. Menus.
     WireMenus();
 
+    // 9b. Host watches (ui_page_watch) — 热重载后按名字重新挂上。
+    for (auto& w : watches_) InstallWatch(*w);
+
     for (auto& e : page_.errors) errors_.push_back(e);
 
     // 10. Initial mount hooks — fire once for every widget already in the
     // root tree (anything outside v-if/v-for is mounted at this point).
     // v-if and v-for paths fire their own hooks at mount time.
     if (page_.root) DispatchMountHooks(page_.root.get());
+}
+
+/* ui_page_watch (build 304, 对齐 Vue watch): name 对应的状态值变了就回调宿主,
+ * 载荷是新值的 JSON。同一 name 只留一个回调, cb 为空即取消。注册时不回调。 */
+void PageState::Watch(const std::string& name, WatchCallback cb) {
+    auto it = std::find_if(watches_.begin(), watches_.end(),
+                           [&](const auto& w) { return w->name == name; });
+    if (it != watches_.end()) {
+        if (jsRt_ && (*it)->effectId) jsRt_->DisposeEffect((*it)->effectId);
+        watches_.erase(it);
+    }
+    if (!cb) return;
+    auto w = std::make_unique<HostWatch>();
+    w->name = name;
+    w->cb = std::move(cb);
+    if (jsRt_) InstallWatch(*w);
+    watches_.push_back(std::move(w));
+}
+
+/* effect 里读 state[name] 并转 JSON —— 读的过程把用到的键收集成依赖。跟上次
+ * 比较, 变了才回调; 先更新 last 再回调, 宿主在回调里写回 (规范化) 时嵌套触发
+ * 的这一轮能正确判断"是否又变了", 值稳定后自然停下。回调期间关闭依赖收集。 */
+void PageState::InstallWatch(HostWatch& w) {
+    w.primed = false;
+    HostWatch* wp = &w;
+    w.effectId = jsRt_->WatchEffect([this, wp]() {
+        ui::expr::Value v;
+        std::string json = GetValue(wp->name, v) ? ui::expr::EmitJson(v) : "null";
+        if (!wp->primed) {
+            wp->primed = true;
+            wp->last = std::move(json);
+            return;
+        }
+        if (json == wp->last) return;
+        wp->last = json;
+        WatchCallback cb = wp->cb;   // 回调可能取消本监听 (销毁 wp), 先拷一份
+        std::string name = wp->name;
+        jsRt_->RunUntracked([&] { cb(name, json); });
+    });
+    jsEffectIds_.push_back(w.effectId);
 }
 
 void PageState::WireQuickJSConditionals() {
@@ -1899,7 +2249,7 @@ void PageState::WireConditional(const CompiledConditional& c) {
                 // its MatchNode chain from the LIVE tree, picking up
                 // ancestor dynamicClasses.
                 std::function<void(Widget*)> reapply = [&](Widget* x) {
-                    if (x->recomputeStyle) x->recomputeStyle(x->lastStateBits);
+                    if (x->recomputeStyle) x->RecomputeStyleNow(x->lastStateBits);
                     for (auto& c : x->Children()) reapply(c.get());
                 };
                 if (rtRaw->mounted) reapply(rtRaw->mounted.get());
@@ -2303,9 +2653,10 @@ void PageState::WireLoopScopeEventEx(Widget* target, const std::string& evName,
     if (!target || !jsRt_) return;
     JSContext* ctx = jsRt_->ctx();
 
-    // callHandler: prepends [outerItem, outerIdx?,] item, idx? before $event.
+    // invoke: prepends [outerItem, outerIdx?,] item, idx? before $event.
     // outer scope only present when this v-for is nested inside v-if inside v-for.
-    auto callHandler = [this, ctx, fn, iter, hasIdx, evName, rt](JSValue arg) {
+    // Borrows $event — BindDomEvent owns and frees it.
+    auto invoke = [this, ctx, fn, iter, hasIdx, evName, rt](JSValue arg) {
         JSValue args[5];
         int argc = 0;
         if (rt && rt->outerIter) {
@@ -2326,33 +2677,11 @@ void PageState::WireLoopScopeEventEx(Widget* target, const std::string& evName,
             JS_FreeValue(ctx, exc);
         }
         JS_FreeValue(ctx, r);
-        JS_FreeValue(ctx, arg);
     };
 
-    if (evName == "click") {
-        target->onClick = [callHandler]() { callHandler(JS_UNDEFINED); };
-    } else if (evName == "change" || evName == "input") {
-        target->onValueChanged = [callHandler, ctx](bool v) {
-            callHandler(JS_NewBool(ctx, v));
-        };
-        target->onTextChanged = [callHandler, ctx](const std::wstring& v) {
-            std::string utf8 = ToUtf8(v);
-            callHandler(JS_NewStringLen(ctx, utf8.data(), utf8.size()));
-        };
-        target->onFloatChanged = [callHandler, ctx](float v) {
-            callHandler(JS_NewFloat64(ctx, static_cast<double>(v)));
-        };
-    } else if (evName == "dblclick") {
-        target->onMouseDblClickHook = [callHandler, ctx](const ui::MouseEvent& e) {
-            JSValue obj = JS_NewObject(ctx);
-            JS_SetPropertyStr(ctx, obj, "x",      JS_NewFloat64(ctx, e.x));
-            JS_SetPropertyStr(ctx, obj, "y",      JS_NewFloat64(ctx, e.y));
-            JS_SetPropertyStr(ctx, obj, "delta",  JS_NewFloat64(ctx, e.delta));
-            JS_SetPropertyStr(ctx, obj, "button", JS_NewInt32(ctx, e.leftBtn ? 0 : -1));
-            callHandler(obj);
-        };
+    if (!BindDomEvent(target, evName, invoke)) {
+        errors_.push_back("v-for @" + evName + " not supported");
     }
-    // Other events (mousedown / mouseup / wheel / focus / blur) — add as needed.
 }
 
 std::unique_ptr<CondInIter> PageState::BuildCondInIter(
@@ -2481,7 +2810,7 @@ std::unique_ptr<CondInIter> PageState::BuildCondInIter(
                 }
                 // Re-cascade + RebindWidgetCallbacks + DispatchMountHooks
                 std::function<void(Widget*)> reapply = [&](Widget* x) {
-                    if (x->recomputeStyle) x->recomputeStyle(x->lastStateBits);
+                    if (x->recomputeStyle) x->RecomputeStyleNow(x->lastStateBits);
                     for (auto& cc : x->Children()) reapply(cc.get());
                 };
                 if (crRaw->mounted) reapply(crRaw->mounted.get());
@@ -2649,7 +2978,7 @@ void PageState::WireQuickJSEvent(Widget* target, const std::string& evName,
     }
     jsEventFns_.push_back(fn);
 
-    auto callHandler = [this, ctx, fn](JSValue arg) {
+    auto invoke = [this, ctx, fn, evName](JSValue arg) {
         JSValue argv[1] = { arg };
         JSValue r = JS_Call(ctx, fn, jsState_, 1, argv);
         if (JS_IsException(r)) {
@@ -2658,17 +2987,35 @@ void PageState::WireQuickJSEvent(Widget* target, const std::string& evName,
             std::string s = msg ? msg : "(no message)";
             if (msg) JS_FreeCString(ctx, msg);
             JS_FreeValue(ctx, exc);
-            errors_.push_back("event handler threw: " + s);
+            errors_.push_back("@" + evName + " handler threw: " + s);
         }
         JS_FreeValue(ctx, r);
+    };
+
+    if (!BindDomEvent(target, evName, invoke)) {
+        errors_.push_back("@" + evName + " not supported on QuickJS path");
+    }
+}
+
+/* DOM 事件名 → widget hook 的唯一分派表 (build 303)。顶层元素和 v-for 行
+ * (含 v-for > v-if > v-for) 都走这里, 保证"写在哪都一样" —— 以前 v-for 行
+ * 自己抄了一份只含 click/change/input/dblclick 的子集, 其余事件静默失效。
+ * invoke 借用 $event (不接管所有权), 这里负责释放 —— dragstart 要在调用
+ * 之后读回被改写的 data, 所以所有权不能交出去。 */
+bool PageState::BindDomEvent(Widget* target, const std::string& evName,
+                             std::function<void(JSValue)> invoke) {
+    JSContext* ctx = jsRt_->ctx();
+
+    auto fire = [ctx, invoke](JSValue arg) {
+        invoke(arg);
         JS_FreeValue(ctx, arg);
     };
 
     // MouseEvent → JS object mirroring DOM MouseEvent/WheelEvent. Legacy
     // fields x/y/delta are kept for pages written against the old shape.
     // `target` is captured raw — safe because the hook lives on the widget
-    // itself and dies with it. Each invocation builds a fresh object; the
-    // closure callee owns it via JS_FreeValue in callHandler.
+    // itself and dies with it. Each invocation builds a fresh object; `fire`
+    // frees it after the handler returns.
     auto mouseEventValue = [ctx, target](const ui::MouseEvent& e) -> JSValue {
         JSValue obj = JS_NewObject(ctx);
         // DOM: client* = window coords, offset* = target-local coords.
@@ -2691,62 +3038,40 @@ void PageState::WireQuickJSEvent(Widget* target, const std::string& evName,
         JS_SetPropertyStr(ctx, obj, "delta",  JS_NewFloat64(ctx, e.delta));
         return obj;
     };
+    auto onMouse = [fire, mouseEventValue](const ui::MouseEvent& e) {
+        fire(mouseEventValue(e));
+    };
+    auto onPlain = [fire]() { fire(JS_UNDEFINED); };
 
     if (evName == "click") {
-        target->onClick = [callHandler]() { callHandler(JS_UNDEFINED); };
+        target->onClick = onPlain;
     } else if (evName == "mousedown") {
-        target->onMouseDownHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
-            callHandler(mouseEventValue(e));
-        };
+        target->onMouseDownHook = onMouse;
     } else if (evName == "mousemove") {
-        target->onMouseMoveHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
-            callHandler(mouseEventValue(e));
-        };
+        target->onMouseMoveHook = onMouse;
     } else if (evName == "mouseup") {
-        target->onMouseUpHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
-            callHandler(mouseEventValue(e));
-        };
+        target->onMouseUpHook = onMouse;
     } else if (evName == "wheel") {
-        target->onMouseWheelHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
-            callHandler(mouseEventValue(e));
-        };
+        target->onMouseWheelHook = onMouse;
     } else if (evName == "dblclick") {
-        target->onMouseDblClickHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
-            callHandler(mouseEventValue(e));
-        };
+        target->onMouseDblClickHook = onMouse;
     } else if (evName == "mouseenter") {
-        target->onMouseEnterHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
-            callHandler(mouseEventValue(e));
-        };
+        target->onMouseEnterHook = onMouse;
     } else if (evName == "mouseleave") {
         // Leave carries no cursor position (see onMouseLeaveHook comment).
-        target->onMouseLeaveHook = [callHandler]() { callHandler(JS_UNDEFINED); };
+        target->onMouseLeaveHook = onPlain;
     } else if (evName == "contextmenu") {
-        target->onContextMenuHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
-            callHandler(mouseEventValue(e));
-        };
+        target->onContextMenuHook = onMouse;
     } else if (evName == "dragstart") {
         // $event carries `data` (the payload, defaulting to drag-data) which
         // the handler may reassign — DOM dataTransfer.setData equivalent.
-        // Can't go through callHandler: the object must stay alive after the
-        // call so the reassigned `data` can be read back.
-        target->onDragStartHook = [this, ctx, fn, mouseEventValue](
+        target->onDragStartHook = [ctx, invoke, mouseEventValue](
                 const ui::MouseEvent& e, std::wstring& data) {
             JSValue obj = mouseEventValue(e);
             std::string utf8 = ToUtf8(data);
             JS_SetPropertyStr(ctx, obj, "data",
                               JS_NewStringLen(ctx, utf8.data(), utf8.size()));
-            JSValue argv[1] = { obj };
-            JSValue r = JS_Call(ctx, fn, jsState_, 1, argv);
-            if (JS_IsException(r)) {
-                JSValue exc = JS_GetException(ctx);
-                const char* msg = JS_ToCString(ctx, exc);
-                errors_.push_back(std::string("@dragstart handler threw: ") +
-                                  (msg ? msg : "(no message)"));
-                if (msg) JS_FreeCString(ctx, msg);
-                JS_FreeValue(ctx, exc);
-            }
-            JS_FreeValue(ctx, r);
+            invoke(obj);
             JSValue nd = JS_GetPropertyStr(ctx, obj, "data");
             if (JS_IsString(nd)) {
                 const char* s = JS_ToCString(ctx, nd);
@@ -2756,53 +3081,50 @@ void PageState::WireQuickJSEvent(Widget* target, const std::string& evName,
             JS_FreeValue(ctx, obj);
         };
     } else if (evName == "dragend") {
-        target->onDragEndHook = [callHandler, ctx](bool dropped) {
-            callHandler(JS_NewBool(ctx, dropped));
+        target->onDragEndHook = [fire, ctx](bool dropped) {
+            fire(JS_NewBool(ctx, dropped));
         };
     } else if (evName == "dragenter") {
         target->dropTarget = true;
-        target->onDragEnterHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
-            callHandler(mouseEventValue(e));
-        };
+        target->onDragEnterHook = onMouse;
     } else if (evName == "dragover") {
         target->dropTarget = true;
-        target->onDragOverHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
-            callHandler(mouseEventValue(e));
-        };
+        target->onDragOverHook = onMouse;
     } else if (evName == "dragleave") {
         target->dropTarget = true;
-        target->onDragLeaveHook = [callHandler]() { callHandler(JS_UNDEFINED); };
+        target->onDragLeaveHook = onPlain;
     } else if (evName == "drop") {
         // Listening for drop implies droppable (no dragover-preventDefault
         // dance) — CanAcceptDrop() already treats onDropHook as acceptance.
-        target->onDropHook = [callHandler, mouseEventValue, ctx](
+        target->onDropHook = [fire, mouseEventValue, ctx](
                 const std::wstring& data, const ui::MouseEvent& e) {
             JSValue obj = mouseEventValue(e);
             std::string utf8 = ToUtf8(data);
             JS_SetPropertyStr(ctx, obj, "data",
                               JS_NewStringLen(ctx, utf8.data(), utf8.size()));
-            callHandler(obj);
+            fire(obj);
         };
     } else if (evName == "submit") {
-        target->onSubmitHook = [callHandler]() { callHandler(JS_UNDEFINED); };
+        target->onSubmitHook = onPlain;
     } else if (evName == "focus") {
-        target->onFocusHook = [callHandler]() { callHandler(JS_UNDEFINED); };
+        target->onFocusHook = onPlain;
     } else if (evName == "blur") {
-        target->onBlurHook  = [callHandler]() { callHandler(JS_UNDEFINED); };
+        target->onBlurHook  = onPlain;
     } else if (evName == "change" || evName == "input") {
-        target->onValueChanged = [callHandler, ctx](bool v) {
-            callHandler(JS_NewBool(ctx, v));
+        target->onValueChanged = [fire, ctx](bool v) {
+            fire(JS_NewBool(ctx, v));
         };
-        target->onTextChanged = [callHandler, ctx](const std::wstring& v) {
+        target->onTextChanged = [fire, ctx](const std::wstring& v) {
             std::string utf8 = ToUtf8(v);
-            callHandler(JS_NewStringLen(ctx, utf8.data(), utf8.size()));
+            fire(JS_NewStringLen(ctx, utf8.data(), utf8.size()));
         };
-        target->onFloatChanged = [callHandler, ctx](float v) {
-            callHandler(JS_NewFloat64(ctx, static_cast<double>(v)));
+        target->onFloatChanged = [fire, ctx](float v) {
+            fire(JS_NewFloat64(ctx, static_cast<double>(v)));
         };
     } else {
-        errors_.push_back("@" + evName + " not supported on QuickJS path");
+        return false;
     }
+    return true;
 }
 
 void PageState::WireQuickJSModelWrite(Widget* target, const std::string& propName) {

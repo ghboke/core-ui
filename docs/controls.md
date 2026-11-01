@@ -199,9 +199,14 @@ ui_progress_set_indeterminate(w, 1);
 
 功能：光标闪烁、文本选择、Ctrl+C/V/X/A、Shift+方向键选择。
 
+密码模式：`<TextInput password="true" />`（.uix 页面写 `<input type="password">`），每个字符显示成 `●`，Ctrl+C / Ctrl+X 不把内容
+放进剪贴板（可以粘贴），`ui_text_input_get_text` 仍返回明文。
+
 C API：
 ```c
 ui_text_input_set_text(w, L"text");
+ui_text_input_select_all(w);          // 全选 (input.select()), 之后输入整体替换
+ui_text_input_set_password(w, 1);     // 密码模式
 const wchar_t* t = ui_text_input_get_text(w);  // 内部指针，不要 free
 ```
 
@@ -308,7 +313,18 @@ ui_titlebar_set_title(tb, L"New Title");
 ui_titlebar_show_buttons(tb, showMin, showMax, showClose);
 ui_titlebar_show_icon(tb, show);
 ui_titlebar_add_widget(tb, custom_widget);
+
+// 与 min/max/close 同款的控制按钮, 贴在最小化左侧, 可加多个 (先加的离最小化最近)
+UiWidget menuBtn = ui_titlebar_add_caption_button(tb, L"\xE700");  // MDL2 汉堡
+ui_widget_on_click(menuBtn, on_menu_click, ud);
+ui_titlebar_caption_button_set_glyph(menuBtn, L"\xE712");          // 换字形
+ui_titlebar_caption_button_set_svg(menuBtn,                        // 或改用 SVG (16×16, currentColor)
+    "<svg viewBox=\"0 0 16 16\"><path stroke=\"currentColor\" d=\"M3 4.5h10M3 8h10M3 11.5h10\"/></svg>");
+ui_titlebar_caption_button_set_badge(menuBtn, 1);                  // 右上角红点
+ui_window_invalidate(win);
 ```
+
+布局 (右→左): close · max · min · 控制按钮 (紧贴, 无间隙) · 4px · `add_widget` 控件。
 
 ## IconButton
 

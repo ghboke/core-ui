@@ -24,7 +24,10 @@ enum class EasingFunction {
     EaseOutElastic,
     EaseInBounce,
     EaseOutBounce,
-    EaseOutBack
+    EaseOutBack,
+    /* WinUI 3 ControlFastOutSlowInKeySpline = cubic-bezier(0, 0, 0, 1): 控件状态过渡
+     * (悬停 / 按下, 83ms) 用的那条。新值只能往后加, CSS transition 按整数存。 */
+    FluentFastOutSlowIn
 };
 
 UI_API float ApplyEasing(EasingFunction func, float t);

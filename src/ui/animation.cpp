@@ -1,12 +1,22 @@
 #include "animation.h"
+#include "anim_clock.h"
 #include "widget.h"
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 
 namespace ui {
 
 // ---- AnimatedFloat ----
+
+namespace {
+std::atomic<float> g_timeScale{1.0f};
+}
+
+void AnimatedFloat::SetGlobalTimeScale(float factor) {
+    g_timeScale.store(std::clamp(factor, 1.0f, 20.0f), std::memory_order_relaxed);
+}
 
 void AnimatedFloat::SetImmediate(float value) {
     current_ = value;
@@ -33,6 +43,16 @@ void AnimatedFloat::Retarget(float value, const AnimationSpec& spec) {
     start_ = current_;
     startTick_ = 0;
     active_ = true;
+    runScale_ = 1.0f;
+}
+
+void AnimatedFloat::RetargetScaled(float value, float durationScale) {
+    if (target_ == value) {   // 目标没变: 不重开这一程, 跟 Retarget 一致
+        Retarget(value);
+        return;
+    }
+    Retarget(value);
+    runScale_ = std::clamp(durationScale, 0.0f, 1.0f);
 }
 
 void AnimatedFloat::SetIdleTarget(float value) {
@@ -52,8 +72,10 @@ float AnimatedFloat::Sample(uint64_t now) {
         start_ = current_;
     }
 
-    float u = spec_.durationMs > 0.0f
-        ? std::clamp((float)(now - startTick_) / spec_.durationMs, 0.0f, 1.0f)
+    const float durationMs =
+        spec_.durationMs * runScale_ * g_timeScale.load(std::memory_order_relaxed);
+    float u = durationMs > 0.0f
+        ? std::clamp((float)(now - startTick_) / durationMs, 0.0f, 1.0f)
         : 1.0f;
     float eased = ApplyEasing(spec_.easing, u);
     current_ = start_ + (target_ - start_) * eased;
@@ -147,7 +169,7 @@ void AnimationManager::Animate(Widget* target, AnimProperty prop, float from, fl
                                std::function<void()> onComplete) {
     if (!target) return;
 
-    uint64_t now = GetTickCount64();
+    uint64_t now = AnimNowMs();
     float startValue = from;
     for (auto& a : anims_) {
         if (a.target == target && a.property == prop) {
@@ -199,7 +221,7 @@ void AnimationManager::FadeOut(Widget* target, float durationMs) {
 bool AnimationManager::Tick() {
     if (anims_.empty()) return false;
 
-    uint64_t now = GetTickCount64();
+    uint64_t now = AnimNowMs();
     for (auto& a : anims_) {
         if (a.active) a.Tick(now);
     }

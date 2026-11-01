@@ -1,5 +1,8 @@
 #pragma once
 #include <d2d1.h>
+#include <atomic>
+#include <cstdint>
+#include <mutex>
 #include <string>
 
 /* wingdi.h defines RGBA macro which conflicts with our Rgba function */
@@ -496,8 +499,8 @@ constexpr wchar_t kFontFamily[] = L"Segoe UI";
 
 // Runtime-mutable global defaults (since 1.3.0)
 // Set via ui_theme_set_default_font / ui_theme_set_cjk_font / ui_theme_set_text_render_mode.
-// Thread note: these are process-global; change them before widget rendering for
-// consistency (existing TextFormat cache gets invalidated per Renderer separately).
+// Thread note: process-global; build 314 起运行时修改对已打开窗口立即生效 (见下方
+// TextSettings 的 generation 机制)。
 enum class TextRenderMode {
     Smooth = 0,       // GRAYSCALE + NATURAL_SYM，当前默认 / WinUI 风
     ClearType,        // CLEARTYPE + NATURAL，Office/Chrome
@@ -506,21 +509,63 @@ enum class TextRenderMode {
     Aliased,          // ALIASED，无抗锯齿 / 像素字体场景
 };
 
-inline std::wstring&  _defaultFontStorage() { static std::wstring s = L"Segoe UI"; return s; }
-inline std::wstring&  _latinFontStorage()   { static std::wstring s;               return s; }
-inline std::wstring&  _cjkFontStorage()     { static std::wstring s;               return s; }
-inline TextRenderMode& _renderModeStorage() { static TextRenderMode s = TextRenderMode::Smooth; return s; }
+// build 314: 这些全局值运行时可改, 而且渲染线程 (RenderWindow 的 Renderer) 也要读,
+// 所以统一放进一把锁保护的存储, 每次修改 generation +1。Renderer 发现 generation
+// 变了, 就在**自己的线程上**取一份 TextSettings 快照、清 TextFormat 缓存、重建回退链
+// (见 Renderer::EnsureTextSettingsCurrent)。下面的指针式 getter 只给宿主 API
+// (ui_theme_get_*) 在 UI 线程用。
+struct TextSettings {
+    std::wstring   defaultFont = L"Segoe UI";
+    std::wstring   latinFont;           // 空 = 未设
+    std::wstring   cjkFont;             // 空 = 未设
+    std::wstring   textLocale;          // build 314: BCP-47 排版区域; 空 = 跟随系统
+    TextRenderMode renderMode = TextRenderMode::Smooth;
+    uint64_t       generation = 1;   // 快照时填入, 与 _textSettingsGen 对应
+};
+inline std::mutex&            _textSettingsMutex() { static std::mutex m; return m; }
+inline TextSettings&          _textSettings()      { static TextSettings s; return s; }
+inline std::atomic<uint64_t>& _textSettingsGen()   { static std::atomic<uint64_t> g{1}; return g; }
 
-inline const wchar_t* DefaultFontFamily()                         { return _defaultFontStorage().c_str(); }
-inline void           SetDefaultFontFamily(const wchar_t* family) { _defaultFontStorage() = family ? family : L"Segoe UI"; }
-inline const wchar_t* LatinFontFamily()                           { return _latinFontStorage().empty() ? nullptr : _latinFontStorage().c_str(); }
-inline const wchar_t* CjkFontFamily()                             { return _cjkFontStorage().empty()   ? nullptr : _cjkFontStorage().c_str(); }
-inline void           SetCjkFonts(const wchar_t* latin, const wchar_t* cjk) {
-    _latinFontStorage() = latin ? latin : L"";
-    _cjkFontStorage()   = cjk   ? cjk   : L"";
+inline TextSettings SnapshotTextSettings() {
+    std::lock_guard<std::mutex> lk(_textSettingsMutex());
+    TextSettings s = _textSettings();
+    s.generation = _textSettingsGen().load(std::memory_order_acquire);
+    return s;
 }
-inline TextRenderMode GetTextRenderMode()                  { return _renderModeStorage(); }
-inline void           SetTextRenderMode(TextRenderMode m)  { _renderModeStorage() = m; }
+/* 热路径 (每次取 TextFormat) 只读这个原子量, 不加锁。 */
+inline uint64_t TextSettingsGeneration() {
+    return _textSettingsGen().load(std::memory_order_acquire);
+}
+template <typename Fn> inline void _UpdateTextSettings(Fn&& fn) {
+    std::lock_guard<std::mutex> lk(_textSettingsMutex());
+    fn(_textSettings());
+    _textSettingsGen().fetch_add(1, std::memory_order_acq_rel);
+}
+
+inline const wchar_t* DefaultFontFamily()                         { return _textSettings().defaultFont.c_str(); }
+inline void           SetDefaultFontFamily(const wchar_t* family) {
+    _UpdateTextSettings([&](TextSettings& s) { s.defaultFont = family ? family : L"Segoe UI"; });
+}
+inline const wchar_t* LatinFontFamily() { return _textSettings().latinFont.empty() ? nullptr : _textSettings().latinFont.c_str(); }
+inline const wchar_t* CjkFontFamily()   { return _textSettings().cjkFont.empty()   ? nullptr : _textSettings().cjkFont.c_str(); }
+inline void           SetCjkFonts(const wchar_t* latin, const wchar_t* cjk) {
+    _UpdateTextSettings([&](TextSettings& s) {
+        s.latinFont = latin ? latin : L"";
+        s.cjkFont   = cjk   ? cjk   : L"";
+    });
+}
+// build 314: 文字排版区域 (BCP-47, 如 "ja-JP")。决定 CJK 统一汉字取哪种字形。
+inline const wchar_t* TextLocale() { return _textSettings().textLocale.empty() ? nullptr : _textSettings().textLocale.c_str(); }
+inline void           SetTextLocale(const wchar_t* locale) {
+    _UpdateTextSettings([&](TextSettings& s) { s.textLocale = locale ? locale : L""; });
+}
+inline TextRenderMode GetTextRenderMode() {
+    std::lock_guard<std::mutex> lk(_textSettingsMutex());
+    return _textSettings().renderMode;
+}
+inline void SetTextRenderMode(TextRenderMode m) {
+    _UpdateTextSettings([&](TextSettings& s) { s.renderMode = m; });
+}
 
 // Font sizes (Fluent 2 official)
 constexpr float kFontSizeCaption2  =  10.0f;   // caption2

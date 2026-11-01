@@ -153,6 +153,8 @@ export default {
 - 裸标识符 (`@click="inc"`) → auto-call `inc.call(this, $event)`
 - 调用形式 (`@click="addN(5)"`) → 直接 eval
 - 赋值 (`@click="count = count + 1"`) → 直接 eval
+- 显式传事件对象 (`@drop="onDrop(item, $event)"`) → `$event` 是隐式参数，不会被加 `this.`
+- `v-for` 行内支持的事件与普通元素完全相同（含拖放 / 右键 / 焦点）
 
 `$event`：
 | 事件 | $event |

@@ -295,6 +295,7 @@ static void dumpWidget(std::ostringstream& ss, Widget* w, int d, Renderer* r) {
     if (!w->visible)  ss << ",\n" << ind1 << "\"visible\": false";
     if (!w->enabled)  ss << ",\n" << ind1 << "\"enabled\": false";
     if (w->opacity < 1.0f) ss << ",\n" << ind1 << "\"opacity\": " << jsonFloat(w->opacity);
+    if (!w->tooltip.empty()) ss << ",\n" << ind1 << "\"tooltip\": " << jsonStr(w->tooltip);
 
     // type-specific
     appendTypeProps(ss, w, d + 1, r);

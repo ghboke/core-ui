@@ -1,4 +1,5 @@
 #include "svg_widget.h"
+#include "svg_symbols.h"
 #include "../renderer.h"
 #include "../css/value.h"
 #include "../theme.h"  // theme::Current() — fallback color for SVG currentColor
@@ -780,9 +781,32 @@ std::string SvgWidget::BuildDocumentXml() const {
     return os.str();
 }
 
+void SvgWidget::SetUseHref(const std::string& href) {
+    if (href == useHref_ && useResolved_) return;
+    useHref_ = href;
+    useResolved_ = false;
+    shapes_.clear();            // 旧图标立刻撤下; 新的在 ResolveUse 装入
+    boundShapeAttrs_.clear();   // shape 下标换了一套, 旧的绑定缓存作废
+    // 重绘由调用方负责: :href 绑定走 ApplyBindingToWidget, 它结束时统一 invalidate。
+}
+
+bool SvgWidget::ResolveUse() {
+    if (useResolved_) return true;
+    const SvgSymbol* sym = ResolveSvgSymbol(useHref_);
+    if (!sym) return false;     // 可能 sprite 还没编译到; 下次绘制再试
+    shapes_ = sym->shapes;
+    if (sym->vpWidth > 0 && sym->vpHeight > 0) {
+        vpWidth = sym->vpWidth;
+        vpHeight = sym->vpHeight;
+    }
+    useResolved_ = true;
+    return true;
+}
+
 void SvgWidget::OnDraw(Renderer& r) {
     Widget::OnDraw(r);
     if (!visible) return;
+    ResolveUse();
 
     float rectW = rect.right - rect.left;
     float rectH = rect.bottom - rect.top;

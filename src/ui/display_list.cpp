@@ -25,6 +25,7 @@ DisplayList::DisplayList(DisplayList&& other) noexcept
       svg_document_refs(std::move(other.svg_document_refs)),
       svg_text_refs(std::move(other.svg_text_refs)),
       quad_refs(std::move(other.quad_refs)),
+      polyline_refs(std::move(other.polyline_refs)),
       owned_resources_(std::move(other.owned_resources_)) {
     other.owned_resources_.clear();
 }
@@ -45,6 +46,7 @@ DisplayList& DisplayList::operator=(DisplayList&& other) noexcept {
     svg_document_refs = std::move(other.svg_document_refs);
     svg_text_refs = std::move(other.svg_text_refs);
     quad_refs = std::move(other.quad_refs);
+    polyline_refs = std::move(other.polyline_refs);
     owned_resources_ = std::move(other.owned_resources_);
     other.owned_resources_.clear();
     return *this;
@@ -59,6 +61,7 @@ void DisplayList::Clear() {
     svg_document_refs.clear();
     svg_text_refs.clear();
     quad_refs.clear();
+    polyline_refs.clear();
     ReleaseOwnedResources();
 }
 
@@ -132,6 +135,14 @@ void DisplayListRecorder::PopTransform() {
     AddCommand(DrawCommandType::PopTransform);
 }
 
+void DisplayListRecorder::PushLayer() {
+    AddCommand(DrawCommandType::PushLayer);
+}
+
+void DisplayListRecorder::PopLayer() {
+    AddCommand(DrawCommandType::PopLayer);
+}
+
 void DisplayListRecorder::FillRect(D2D1_RECT_F rect, D2D1_COLOR_F color) {
     auto& cmd = AddCommand(DrawCommandType::FillRect);
     cmd.rect = rect;
@@ -147,11 +158,43 @@ void DisplayListRecorder::FillQuad(const D2D1_POINT_2F pts[4], D2D1_COLOR_F colo
     cmd.color = color;
 }
 
-void DisplayListRecorder::DrawRect(D2D1_RECT_F rect, D2D1_COLOR_F color, float strokeWidth) {
+void DisplayListRecorder::DrawPolyline(const D2D1_POINT_2F* pts, size_t count,
+                                       D2D1_COLOR_F color, float strokeWidth,
+                                       bool closed, int dash) {
+    if (!pts || count < 2) return;
+    PolylineRef poly;
+    poly.pts.assign(pts, pts + count);
+    poly.closed = closed;
+    list_.polyline_refs.push_back(std::move(poly));
+    auto& cmd = AddCommand(DrawCommandType::DrawPolyline);
+    cmd.polyline_index = (uint32_t)(list_.polyline_refs.size() - 1);
+    cmd.color = color;
+    cmd.stroke_width = strokeWidth;
+    cmd.dash_style = (uint8_t)dash;
+}
+
+void DisplayListRecorder::FillEllipse(D2D1_RECT_F rect, D2D1_COLOR_F color) {
+    auto& cmd = AddCommand(DrawCommandType::FillEllipse);
+    cmd.rect = rect;
+    cmd.color = color;
+}
+
+void DisplayListRecorder::DrawEllipse(D2D1_RECT_F rect, D2D1_COLOR_F color, float strokeWidth,
+                                      int dash) {
+    auto& cmd = AddCommand(DrawCommandType::DrawEllipse);
+    cmd.rect = rect;
+    cmd.color = color;
+    cmd.stroke_width = strokeWidth;
+    cmd.dash_style = (uint8_t)dash;
+}
+
+void DisplayListRecorder::DrawRect(D2D1_RECT_F rect, D2D1_COLOR_F color, float strokeWidth,
+                                   int dash) {
     auto& cmd = AddCommand(DrawCommandType::DrawRect);
     cmd.rect = rect;
     cmd.color = color;
     cmd.stroke_width = strokeWidth;
+    cmd.dash_style = (uint8_t)dash;
 }
 
 void DisplayListRecorder::FillRoundedRect(D2D1_RECT_F rect, float rx, float ry, D2D1_COLOR_F color) {
@@ -183,12 +226,13 @@ void DisplayListRecorder::DrawBlurredRoundedRect(D2D1_RECT_F rect, float rx, flo
 }
 
 void DisplayListRecorder::DrawLine(D2D1_POINT_2F p0, D2D1_POINT_2F p1,
-                                   D2D1_COLOR_F color, float strokeWidth) {
+                                   D2D1_COLOR_F color, float strokeWidth, int dash) {
     auto& cmd = AddCommand(DrawCommandType::DrawLine);
     cmd.p0 = p0;
     cmd.p1 = p1;
     cmd.color = color;
     cmd.stroke_width = strokeWidth;
+    cmd.dash_style = (uint8_t)dash;
 }
 
 void DisplayListRecorder::DrawText(std::wstring text, D2D1_RECT_F rect, TextStyle style) {
@@ -199,12 +243,14 @@ void DisplayListRecorder::DrawText(std::wstring text, D2D1_RECT_F rect, TextStyl
 }
 
 void DisplayListRecorder::DrawImage(ImageRef image, D2D1_RECT_F dst,
-                                    ImageSampling sampling, float opacity) {
+                                    ImageSampling sampling, float opacity,
+                                    CompositeMode composite) {
     auto& cmd = AddCommand(DrawCommandType::DrawImage);
     cmd.rect = dst;
     cmd.image_ref_index = AddImageRef(image);
     cmd.sampling = sampling;
     cmd.opacity = opacity;
+    cmd.composite = composite;
 }
 
 void DisplayListRecorder::FillImagePattern(ImageRef image, D2D1_RECT_F rect) {

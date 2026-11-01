@@ -69,6 +69,7 @@ struct WindowHints {
     std::wstring title;                // empty → unset
     int         width       = 0;      // 0 → unset (use caller default)
     int         height      = 0;
+    bool        autoHeight  = false;  // height="auto": 高度跟随内容 (build 328)
     int         minWidth    = 0;
     int         minHeight   = 0;
     int         resizable   = -1;     // -1=unset, 0=no, 1=yes
@@ -96,6 +97,10 @@ struct CompiledMenuItem {
     std::string  onClick;               // 触发时调用的 JS method 名
     bool         separator = false;     // true → <separator/>
     CompiledMenuPtr submenu;            // 嵌套 submenu (parent item 旁边有 ▸ arrow)
+    /* build 303: <template v-for / v-if> — 自身不产生行, 按条件 / 迭代把
+     * groupItems 展开到所在菜单 (Vue 的 <template> 语义)。 */
+    bool         group = false;
+    std::vector<CompiledMenuItem> groupItems;
     /* Body 子节点 (AST) — 反应式 widget 模板. PopulateMenuItem 在每次 Show
      * 时用 CompileIterationTemplate 实例化一棵新 widget tree, 装到 MenuItem.
      * 多次 Show 之间 widget tree 全部重建 (跟 v-for 同款 pattern). 没有
@@ -104,6 +109,9 @@ struct CompiledMenuItem {
     /* 反应式 attrs — 跟 widget 系 :x / v-if / v-for 同套 expr 求值. */
     std::string  boundShortcutExpr; // :shortcut="..." — 求 string
     std::string  boundEnabledExpr;  // :enabled="..." — 求 bool, false → disabled
+    /* 其余 :attr (含 :id / :data-*) — 每次 populate 按当前迭代求值成字符串,
+     * 覆盖进该项 attrs; :id 同时决定 strId (build 303)。 */
+    std::vector<std::pair<std::string,std::string>> boundAttrs;
     std::string  vIfExpr;           // v-if / v-show
     std::string  vForArrayExpr;     // v-for="x in items"
     std::string  vForIterVar;
@@ -124,6 +132,7 @@ struct CompiledMenu {
     std::string  boundFrostedMaterialExpr; // :frosted-material / :material — 求 bool
     bool         hasBackdropBlur = false;
     float        backdropBlur = -1.0f;
+    float        minWidth = 0.0f;       // build 307: min-width (DIP), 0 = 不限; 子菜单不继承
     std::string  boundBackdropBlurExpr; // :backdrop-blur / :backdrop-filter — 求 number 或 blur(...)
     std::vector<CompiledMenuItem> items;
     /* Phase E (L17 / build 73): 整个 menu / submenu 的 v-if / v-show. 求 false

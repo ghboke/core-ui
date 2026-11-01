@@ -56,8 +56,10 @@ public:
 
     void Start();
     void Stop();
+    /* layered: HwndLayeredUlw 必填 (窗口与渲染线程共享的帧缓冲), 其它类型忽略。 */
     void RegisterWindow(RenderWindowId id, HWND hwnd,
-                        RenderSurfaceKind surfaceKind = RenderSurfaceKind::HwndSwapChain);
+                        RenderSurfaceKind surfaceKind = RenderSurfaceKind::HwndSwapChain,
+                        std::shared_ptr<LayeredFrameBuffer> layered = nullptr);
     void UnregisterWindow(RenderWindowId id);
     void Submit(FrameJob job);
     bool PresentPrepared(RenderWindowId id, bool skipVSync, uint32_t timeoutMs);
@@ -79,7 +81,13 @@ private:
     RenderThread& operator=(const RenderThread&) = delete;
 
     void ThreadMain();
+    /* 只挑能交的: 要交帧名额的任务 (见 JobNeedsFrameSlot) 窗口拿到名额才算。 */
     std::optional<FrameJob> TakeNextJobLocked();
+    static bool JobNeedsFrameSlot(const FrameJob& job);
+    /* 有任务但都在等名额: 放开锁等任一窗口的可等待对象或新任务 (wakeEvent_), 超时
+     * 则这些窗口不等了照画 (系统没在取帧时不让窗口卡住)。 */
+    void WaitForFrameSlotLocked(std::unique_lock<std::mutex>& lock);
+    void Wake();
     void HandleDeviceLostLocked(RenderWindowId failedWindow,
                                 RenderDeviceStatus status,
                                 uint64_t failedGeneration,
@@ -113,6 +121,7 @@ private:
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
+    HANDLE wakeEvent_ = nullptr;   // 自动复位; 与 cv_ 同时通知, 给等名额时的 WaitForMultipleObjects
     std::thread worker_;
     bool running_ = false;
     bool stopRequested_ = false;

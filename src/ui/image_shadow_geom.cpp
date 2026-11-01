@@ -7,35 +7,51 @@ namespace {
 
 float MaxOf(float a, float b) { return a > b ? a : b; }
 float MinOf(float a, float b) { return a < b ? a : b; }
+float AbsOf(float a) { return a < 0.0f ? -a : a; }
 
-/* 视觉规格 (2026-08-07 用户定): **CSS box-shadow 那种量级, 宽度约 2px**。
- *   浅色: blur 2 / y+1 / 黑 22%; 描边 黑 10%
- *   深色: blur 2 / y+1 / 黑 24%; 描边 白 14%
- * 大致等价于 `box-shadow: 0 1px 2px rgba(0,0,0,.22)` + 1px 描边。
+/* 视觉规格。三档由宿主选 —— 这纯属观感, 库替用户拍板必错 (build 283 那轮
+ * blur 14 -> 6 -> 10 连猜三轮全错, 教训见 CHANGELOG)。
  *
- * 深色画布上黑投影几乎不可见, 边界感靠那道淡亮描边撑。浅色也留了一道极淡暗
- * 描边 —— 纯投影对"白底画布上的白图"基本无效, 而那恰是最需要看清边界的场景。
- * 收到 2px 这一档后, 描边其实成了主角, 投影只负责托一下。
+ * Hairline: build 283 的原始规格, 约 2px 的 CSS 阴影 + 一道 1dip 实描边。
+ *   浅色 blur 2 / y+1 / spread 2 / 黑 22% + 描边 黑 10%
+ *   深色 同几何 / 黑 24% + 描边 白 14%
+ *   spread 2 是把当时"外扩一个 blur"的行为按 CSS 语义写明, 观感等价。
  *
- * 调参教训 (前后错了三轮, 都是我自己臆测"好看"的量级): 初版 blur 14 / y+3 /
- * 黑 20% -> "又大又宽"; 收到 blur 6 -> 仍不对; 放宽到 blur 10 但调淡 -> "一样个蛋"。
- * 真实需求一直是 **2px 级的 CSS 阴影**, 比我猜的小一个数量级。教训: 这类纯观感
- * 参数不要靠自己审美迭代, 要么拿到明确数值, 要么一次给足档位让用户挑。
- * 另注意 blur 是 dip, 1.5x DPI 上实际约 3px。 */
-constexpr float kLightBlur = 2.0f;
-constexpr float kLightOffsetY = 1.0f;
-constexpr float kLightShadowAlpha = 0.22f;
-constexpr float kLightHairlineAlpha = 0.10f;
+ * Soft / Window: 窗口投影那一路 —— 两层, 近层紧实定形、远层大而淡铺开,
+ *   不画实描边 (那道硬线正是"生硬"的来源), 靠渐隐托出边界。
+ *   深色下黑投影几乎不可见, 所以仍留一道很淡的亮描边保底, 否则深色画布上的
+ *   深色图会彻底失去边界。 */
 
-constexpr float kDarkBlur = 2.0f;
-constexpr float kDarkOffsetY = 1.0f;
-constexpr float kDarkShadowAlpha = 0.24f;
-constexpr float kDarkHairlineAlpha = 0.14f;
+// Hairline (build 283 原始规格)
+constexpr float kHairBlur = 2.0f;
+constexpr float kHairOffsetY = 1.0f;
+constexpr float kHairSpread = 2.0f;
+constexpr float kHairAlphaLight = 0.22f;
+constexpr float kHairAlphaDark = 0.24f;
+constexpr float kHairStrokeLight = 0.10f;
+constexpr float kHairStrokeDark = 0.14f;
+
+// Soft: 0 2px 6px rgba(0,0,0,.16) + 0 8px 20px rgba(0,0,0,.14)
+constexpr Layer kSoftNear{2.0f, 6.0f, 0.0f, 0.16f};
+constexpr Layer kSoftFar{8.0f, 20.0f, 0.0f, 0.14f};
+
+// Window: 0 4px 12px rgba(0,0,0,.18) + 0 14px 36px rgba(0,0,0,.18)
+constexpr Layer kWindowNear{4.0f, 12.0f, 0.0f, 0.18f};
+constexpr Layer kWindowFar{14.0f, 36.0f, 0.0f, 0.18f};
+
+/* 深色主题下投影提一点 (画布本身暗, 同样 alpha 的黑几乎看不出来), 并补一道
+ * 淡亮描边。数值刻意保守: 描边一重就又回到"生硬"。 */
+constexpr float kSoftDarkAlphaBoost = 0.06f;
+constexpr float kSoftStrokeDark = 0.08f;
+constexpr float kWindowStrokeDark = 0.10f;
 
 /* 档位阈值 (dip, 图片在屏上的短边)。悬浮按钮那套要 120dip 才放得下, 阴影
  * 48dip 就还有意义, 所以阈值比 chrome_policy.h 的低。 */
 constexpr float kFullMinShortEdge = 48.0f;
 constexpr float kCompactMinShortEdge = 20.0f;
+
+/* 建议内边距只留 3/4 个 blur: 最外那截尾巴 alpha 不足 5%, 为它多吃画布不划算。 */
+constexpr float kFitPaddingBlurShare = 0.75f;
 
 }  // namespace
 
@@ -45,6 +61,17 @@ RectF Intersect(const RectF& a, const RectF& b) {
     out.top = MaxOf(a.top, b.top);
     out.right = MinOf(a.right, b.right);
     out.bottom = MinOf(a.bottom, b.bottom);
+    return out;
+}
+
+RectF Union(const RectF& a, const RectF& b) {
+    if (!Valid(a)) return b;
+    if (!Valid(b)) return a;
+    RectF out;
+    out.left = MinOf(a.left, b.left);
+    out.top = MinOf(a.top, b.top);
+    out.right = MaxOf(a.right, b.right);
+    out.bottom = MaxOf(a.bottom, b.bottom);
     return out;
 }
 
@@ -65,20 +92,51 @@ float TierScale(Tier tier) {
     return 0.0f;
 }
 
-Params ParamsForTheme(bool dark) {
+Style StyleFromInt(int v) {
+    switch (v) {
+    case 0: return Style::Hairline;
+    case 2: return Style::Window;
+    case 1: break;
+    default: break;   // 越界: 回落到默认档, 不当作错误
+    }
+    return Style::Soft;
+}
+
+Params ParamsFor(Style style, bool dark) {
     Params p;
+    switch (style) {
+    case Style::Hairline: {
+        Layer l;
+        l.offsetY = kHairOffsetY;
+        l.blur = kHairBlur;
+        l.spread = kHairSpread;
+        l.alpha = dark ? kHairAlphaDark : kHairAlphaLight;
+        p.layers[0] = l;
+        p.layerCount = 1;
+        p.hairlineAlpha = dark ? kHairStrokeDark : kHairStrokeLight;
+        p.hairlineLight = dark;
+        return p;
+    }
+    case Style::Window:
+        p.layers[0] = kWindowNear;
+        p.layers[1] = kWindowFar;
+        p.layerCount = 2;
+        p.hairlineAlpha = dark ? kWindowStrokeDark : 0.0f;
+        p.hairlineLight = dark;
+        break;
+    case Style::Soft:
+    default:
+        p.layers[0] = kSoftNear;
+        p.layers[1] = kSoftFar;
+        p.layerCount = 2;
+        p.hairlineAlpha = dark ? kSoftStrokeDark : 0.0f;
+        p.hairlineLight = dark;
+        break;
+    }
     if (dark) {
-        p.blur = kDarkBlur;
-        p.offsetY = kDarkOffsetY;
-        p.shadowAlpha = kDarkShadowAlpha;
-        p.hairlineAlpha = kDarkHairlineAlpha;
-        p.hairlineLight = true;
-    } else {
-        p.blur = kLightBlur;
-        p.offsetY = kLightOffsetY;
-        p.shadowAlpha = kLightShadowAlpha;
-        p.hairlineAlpha = kLightHairlineAlpha;
-        p.hairlineLight = false;
+        for (int i = 0; i < p.layerCount; ++i) {
+            p.layers[i].alpha += kSoftDarkAlphaBoost;
+        }
     }
     return p;
 }
@@ -86,24 +144,58 @@ Params ParamsForTheme(bool dark) {
 Params ScaleParams(const Params& p, float scale) {
     Params out = p;
     if (scale <= 0.0f) {
-        out.blur = 0.0f;
-        out.offsetY = 0.0f;
-        out.shadowAlpha = 0.0f;
+        for (int i = 0; i < kMaxLayers; ++i) out.layers[i] = Layer{};
+        out.layerCount = 0;
         out.hairlineAlpha = 0.0f;
         return out;
     }
     /* 只缩几何, 不缩不透明度 —— 小图上的阴影该变窄, 不该变淡到看不见。 */
-    out.blur = p.blur * scale;
-    out.offsetY = p.offsetY * scale;
+    for (int i = 0; i < out.layerCount; ++i) {
+        out.layers[i].offsetY *= scale;
+        out.layers[i].blur *= scale;
+        out.layers[i].spread *= scale;
+    }
     return out;
 }
 
-RectF ShadowBounds(const RectF& img, float blur, float offsetY) {
+float RecommendedFitPadding(const Params& p) {
+    float need = 0.0f;
+    for (int i = 0; i < p.layerCount; ++i) {
+        const Layer& l = p.layers[i];
+        if (l.alpha <= 0.0f) continue;
+        const float extent = MaxOf(0.0f, l.spread) + AbsOf(l.offsetY) +
+                             MaxOf(0.0f, l.blur) * kFitPaddingBlurShare;
+        need = MaxOf(need, extent);
+    }
+    return need;
+}
+
+RectF LayerGeomRect(const RectF& img, const Layer& l) {
     RectF out;
-    out.left = img.left - blur;
-    out.top = img.top - blur + offsetY;
-    out.right = img.right + blur;
-    out.bottom = img.bottom + blur + offsetY;
+    out.left = img.left - l.spread;
+    out.top = img.top - l.spread + l.offsetY;
+    out.right = img.right + l.spread;
+    out.bottom = img.bottom + l.spread + l.offsetY;
+    return out;
+}
+
+RectF LayerBounds(const RectF& img, const Layer& l) {
+    const RectF g = LayerGeomRect(img, l);
+    const float blur = MaxOf(0.0f, l.blur);
+    RectF out;
+    out.left = g.left - blur;
+    out.top = g.top - blur;
+    out.right = g.right + blur;
+    out.bottom = g.bottom + blur;
+    return out;
+}
+
+RectF ShadowBounds(const RectF& img, const Params& p) {
+    RectF out;
+    for (int i = 0; i < p.layerCount; ++i) {
+        if (p.layers[i].alpha <= 0.0f) continue;
+        out = Union(out, LayerBounds(img, p.layers[i]));
+    }
     return out;
 }
 
@@ -124,13 +216,13 @@ RectF HairlineRect(const RectF& img) {
     return out;
 }
 
-int ShadowBands(const RectF& img, const RectF& viewport,
-                float blur, float offsetY, RectF* out) {
+int ShadowBands(const RectF& img, const RectF& viewport, const RectF& bounds,
+                RectF* out) {
     if (!out) return 0;
     if (!Valid(viewport)) return 0;
+    if (!Valid(bounds)) return 0;
 
-    const RectF s = ShadowBounds(img, blur, offsetY);
-    if (!Valid(s)) return 0;
+    const RectF& s = bounds;
 
     /* s 减去 img, 分解成互不重叠的四条。上下两条横跨整个 s 宽度, 左右两条只占
      * 图片的纵向区间 —— 这样四条天然不重叠。

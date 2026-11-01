@@ -83,6 +83,29 @@ typedef struct UiRect {
     float left, top, right, bottom;
 } UiRect;
 
+typedef struct UiPoint {
+    float x, y;
+} UiPoint;
+
+/* 位图绘制的采样方式 (ui_draw_bitmap_ex)。
+ * NEAREST 存在的理由: 马赛克 / 像素画放大时必须是硬边方块, LINEAR 会把
+ * 块与块之间插值成渐变 —— 打码看着像模糊而不是马赛克。 */
+/* 描边线型 (ui_draw_*_ex 的 dash 参数)。
+ * 虚线段长是**描边宽度的倍数** (D2D 语义): 线越粗段越长, 且在缩放变换下
+ * 与线宽同步缩放 —— 同一份绘制代码画到屏幕和烧录到图像里, 虚线疏密一致。 */
+typedef enum UiDashStyle {
+    UI_DASH_SOLID    = 0,
+    UI_DASH_DASH     = 1,
+    UI_DASH_DOT      = 2,
+    UI_DASH_DASH_DOT = 3
+} UiDashStyle;
+
+typedef enum UiImageSampling {
+    UI_IMAGE_SAMPLING_NEAREST = 0,
+    UI_IMAGE_SAMPLING_LINEAR  = 1,   /* ui_draw_bitmap 的行为 */
+    UI_IMAGE_SAMPLING_CUBIC   = 2    /* 缩小时质量最好 */
+} UiImageSampling;
+
 /* ------------------------------------------------------------------ */
 /* Window configuration                                               */
 /* ------------------------------------------------------------------ */
@@ -137,6 +160,21 @@ typedef struct UiWindowConfig {
      * x/y/width/height 在 start_maximized=1 时仍要填 — 那是用户双击 titlebar
      * 还原后的位置/尺寸, lib 不会丢弃. */
     int start_maximized;
+    /* 1 = 用复制模式 (DXGI bitblt) 交换链; 0 (default) = flip model。
+     * 注意: 它**不能**让"程序频繁改窗口尺寸"不出错帧 —— 复制模式只在屏幕静止时
+     * 碰巧与窗口尺寸同步, 屏幕上有别的动画 (视频、终端) 时照样合成"新矩形 + 旧
+     * 画面"。那种窗口用下面的 layered_canvas。保留本字段只为兼容 318。
+     * 代价: 每次 Present 多一次拷贝 (约 1ms)。只能建窗时指定。 */
+    int copy_swap_chain;
+    /* build 319: 1 = 分层画布窗口 (WS_EX_LAYERED + UpdateLayeredWindow)。
+     * 给"程序频繁改窗口位置/尺寸、且窗口内容就是一张画面"的窗口用 (看图器无边框
+     * 随图缩放): 渲染线程离屏绘制并读回内存, UI 线程一次 UpdateLayeredWindow 同时
+     * 提交位置 + 尺寸 + 画面, 屏幕有其他动画时也不出错帧。改矩形请用
+     * ui_window_set_rect (可放在 canvas visual transaction 里与内容一起提交)。
+     * 约束: 建窗时指定, 不能运行中切换; 自动跳过开场动画; 不支持最大化预置;
+     * 窗口总是不透明 (背景用主题窗口色)。
+     * 代价: 每帧一次 GPU→CPU 读回 —— 2560x1600 约 2ms, 5K 整屏约 7ms; 静止不耗。 */
+    int layered_canvas;
 } UiWindowConfig;
 
 /* ------------------------------------------------------------------ */
@@ -262,6 +300,11 @@ UI_API void     ui_menu_set_backdrop_blur(UiMenu menu, float radius);
  * + card bg. hover item highlight (6px) 不动 — 它是 item 级视觉, 不属于
  * 容器圆角范畴. submenu 单独设, 不继承父菜单. */
 UI_API void     ui_menu_set_corner_radius(UiMenu menu, float radius);
+/* 弹出菜单打开动画 (参照 WinUI 3 MenuFlyout: 250ms 画卷式展开 —— 内容不动, 下边缘从卡片
+ * 顶边推到底 —— 加 83ms 淡入; 菜单落在锚点上方时上边缘从底往上推)。进程全局, 右键菜单 / 子菜单 / 菜单栏下拉都生效, 下次弹出起作用;
+ * 默认开。由 DComp 合成器驱动, 不占 UI 线程。只有打开动画, 关闭仍立即隐藏。 */
+UI_API void     ui_menu_set_open_animation(int enabled);
+UI_API int      ui_menu_get_open_animation(void);
 UI_API void     ui_menu_show(UiWindow win, UiMenu menu, float x, float y);
 UI_API void     ui_menu_close(UiWindow win);
 
@@ -344,7 +387,10 @@ typedef struct UiMsgBoxParams {
 typedef struct UiMsgBoxResult {
     int button;        /* 被点按钮索引 (Esc/关闭 = cancel_idx) */
     int checked;       /* 勾选框终态 0/1 (无勾选框 = check_initial 原样) */
-    int _reserved[2];  /* ABI 余量 — 加结果维度不破返回布局 */
+    int cancelled;     /* build 339: 1 = Esc / 关闭 / WM_QUIT / IPC dialog_cancel 收场
+                        * (button 此时 = cancel_idx); 0 = 点了按钮或 Enter。
+                        * 用于区分 "按 Esc" 和 "点了 cancel_idx 那个按钮"。 */
+    int _reserved[1];  /* ABI 余量 — 加结果维度不破返回布局 */
 } UiMsgBoxResult;
 
 UI_API UiMsgBoxResult ui_msgbox_ex(UiWindow win, const UiMsgBoxParams* params);
@@ -360,12 +406,27 @@ UI_API void ui_window_on_menu(UiWindow win, UiMenuCallback cb, void* userdata);
 /* 读点击项的 "id" 属性 (key 如 "cmd_delete" 或数字串 "1000")。无 id → NULL。
  * 返回的指针仅在回调期间有效。UTF-8。 */
 UI_API const char* ui_menu_item_id(UiMenuItem item);
-/* 读点击项的任意静态属性 (如 "data-index" / "shortcut" / 自定义)。缺 → NULL。
- * 返回的指针仅在回调期间有效。UTF-8。 */
+/* 读点击项的任意属性 (如 "data-index" / "shortcut" / 自定义)。build 303 起含
+ * `:attr` 绑定属性 (v-for 里按每一项求值)。缺 → NULL。
+ * 返回的指针仅在回调期间有效。UTF-8。
+ * 写了 @click / onclick 的项由页面 JS 消费, 不会回调 ui_window_on_menu。 */
 UI_API const char* ui_menu_item_attr(UiMenuItem item, const char* name);
 
 typedef void (*UiRightClickCallback)(UiWindow win, float x, float y, void* userdata);
 UI_API void ui_window_on_right_click(UiWindow win, UiRightClickCallback cb, void* userdata);
+
+/* L297: 鼠标"扩展键"按下 — 中键和侧键 X1 (后退) / X2 (前进)。
+ * vk 是 Win32 VK 码: VK_MBUTTON(0x04) / VK_XBUTTON1(0x05) / VK_XBUTTON2(0x06),
+ * 可以直接跟键盘的 vk 共用一套快捷键表。x/y 是客户区 DIP 坐标。
+ *
+ * 左键和右键不走这条路: 左键有完整的 widget 分发 (on_mouse_down 等), 右键有
+ * ui_window_on_right_click。这三个扩展键 lib 内部没有任何默认行为, 也不进
+ * widget 事件树 (MouseEvent 只有 leftBtn/rightBtn), 所以只给窗口级回调。
+ * cb=NULL 解绑。 */
+typedef void (*UiWindowMouseButtonCallback)(UiWindow win, int vk, float x, float y,
+                                            void* userdata);
+UI_API void ui_window_on_mouse_button(UiWindow win, UiWindowMouseButtonCallback cb,
+                                      void* userdata);
 
 /* L219: 标题栏背景"拖动"(按下后超过系统拖动阈值)回调。仅当
  * ui_window_set_titlebar_drag_intercept(win, 1) 开启拦截时触发 —— 此时标题栏背景
@@ -548,6 +609,15 @@ UI_API void     ui_image_view_plus_get_crop_rect(UiWidget w, float* x, float* y,
 UI_API void     ui_image_view_plus_set_crop_aspect(UiWidget w, float ratio);   /* 0=free */
 UI_API void     ui_image_view_plus_reset_crop(UiWidget w);
 
+/* 屏幕 (窗口 DIP) ↔ 图像像素 互转, 随当前 zoom / pan / rotation。
+ * 图像坐标一律是**原图坐标** (不含旋转), 与 set_crop_rect 等 API 同口径。
+ * 宿主在图上做标注 / 命中测试 / 定位浮层时用。无图或尺寸非法时出 0。
+ * 语义与 ui_ocr_img_view 的同名函数对齐。 */
+UI_API void     ui_image_view_plus_screen_to_image(UiWidget w, float sx, float sy,
+                                                    float* ix, float* iy);
+UI_API void     ui_image_view_plus_image_to_screen(UiWidget w, float ix, float iy,
+                                                    float* sx, float* sy);
+
 typedef void (*UiCropCallback)(UiWidget widget, float x, float y, float w, float h, void* userdata);
 UI_API void     ui_image_view_plus_on_crop_changed(UiWidget w, UiCropCallback cb, void* userdata);
 
@@ -599,11 +669,37 @@ typedef struct UiGhImgViewport {
 
 typedef void (*UiGhImgViewViewportCallback)(UiWidget w, const UiGhImgViewport* vp, void* userdata);
 
+/* build 309: 视图变换 (轻量)。见 ui_gh_img_view_on_transform。 */
+typedef struct UiGhImgViewTransform {
+    float zoom;
+    float pan_x, pan_y;
+    int   rotation;      /* 0/90/180/270, CW */
+    int   interacting;   /* 1 = 还在拖动 / 缩放动画途中, 之后必有一次 0; 0 = 已落定 */
+} UiGhImgViewTransform;
+
+typedef void (*UiGhImgViewTransformCallback)(UiWidget w, const UiGhImgViewTransform* t, void* userdata);
+
 UI_API UiWidget ui_gh_img_view(void);
 UI_API void     ui_gh_img_view_begin(UiWidget w, UiWindow win, const UiGhImgViewInfo* info);
 UI_API void     ui_gh_img_view_set_preview(UiWidget w, UiWindow win,
                                             const void* bgra, uint32_t pw, uint32_t ph,
                                             uint32_t stride);
+
+/* build 322: 免拷贝 preview。库直接借用 bgra, 不整幅拷贝 (set_preview 每张大图在
+ * UI 线程拷一份并常驻)。
+ *   - release(userdata) 恰好回调一次: preview 被替换 / clear / 控件销毁, 且渲染线程
+ *     不再持有之后; 参数不合法 (控件/窗口无效、bgra 为 NULL、尺寸为 0) 时立即回调。
+ *     可能在任意线程回调 (含渲染线程), 回调里不要调 core-ui API。
+ *   - 回调之前 bgra 必须保持有效且内容不变。
+ *   - premultiplied=1: bgra 已是 premul, 上传时不再逐像素预乘。全不透明的图 straight
+ *     与 premul 字节相同, 直接传 1 (42MP 省约 29ms 渲染线程 + 一份临时整幅缓冲)。
+ *   - release 为 NULL 时退回 set_preview 的拷贝行为。 */
+typedef void (*UiPixelReleaseCallback)(void* userdata);
+UI_API void     ui_gh_img_view_set_preview_shared(UiWidget w, UiWindow win,
+                                                   const void* bgra, uint32_t pw, uint32_t ph,
+                                                   uint32_t stride, int premultiplied,
+                                                   UiPixelReleaseCallback release,
+                                                   void* userdata);
 UI_API void     ui_gh_img_view_set_tile(UiWidget w, UiWindow win,
                                          uint32_t level, uint32_t tx, uint32_t ty,
                                          const void* bgra, uint32_t tw, uint32_t th,
@@ -670,6 +766,23 @@ UI_API int      ui_gh_img_view_get_checkerboard(UiWidget w);
  * 只画外圈: 整块模糊铺在图片底下的话, 透明 PNG 在关棋盘时会透出暗块。 */
 UI_API void     ui_gh_img_view_set_shadow(UiWidget w, int on);
 UI_API int      ui_gh_img_view_get_shadow(UiWidget w);
+/* 阴影档位 (build 295+)。纯观感, 由宿主选:
+ *   0 = Hairline —— 2px 级 CSS 阴影 + 一道 1dip 实描边 (build 283 原始规格)
+ *   1 = Soft (默认) —— 0 2px 6px + 0 8px 20px 两层, 不画实描边
+ *   2 = Window —— 0 4px 12px + 0 14px 36px, 接近系统窗口投影
+ * 越界值回落到默认档。深色主题下两个软档仍保留一道很淡的亮描边 —— 黑投影在深色
+ * 画布上几乎不可见, 没有它深色图会彻底失去边界。 */
+UI_API void     ui_gh_img_view_set_shadow_style(UiWidget w, int style);
+UI_API int      ui_gh_img_view_get_shadow_style(UiWidget w);
+/* 当前档位 + 当前主题建议的 Fit() 内边距 (dip)。留不够, 图片一贴视口边阴影就被
+ * 裁成硬边; 宿主应与自己的最小内边距取 max, 再喂给 ui_gh_img_view_set_fit_padding。 */
+UI_API float    ui_gh_img_view_shadow_fit_padding(UiWidget w);
+/* 阴影外画 (build 321)。默认 0 = 阴影画在控件矩形内 (需要 fit padding 留位置)。
+ * >0 = 阴影画在控件矩形**外**, 最多外扩 dip, 围着图片可见部分 (图片 ∩ 控件矩形)
+ * 画; 溢出时即围着控件矩形。给"窗口 = 图 + 透明边距"的无边框窗口用: 画布控件只
+ * 占图片区域, 阴影落在边距里。父节点不能 overflow:hidden, 否则会被裁掉。 */
+UI_API void     ui_gh_img_view_set_shadow_outset(UiWidget w, float dip);
+UI_API float    ui_gh_img_view_get_shadow_outset(UiWidget w);
 /* 适应窗口 (ui_gh_img_view_fit) 时四周留出的内边距 (dip)。默认 0 = 长边贴满视口。
  * **开了图片阴影就必须留一点**, 否则图片贴着视口边, 阴影整条画在视口外看不见。
  * 画布很小时按短边 25% 自动夹紧, 不会把可用空间吃光。 */
@@ -700,6 +813,32 @@ UI_API void     ui_gh_img_view_set_pan(UiWidget w, float x, float y);
 UI_API void     ui_gh_img_view_fit(UiWidget w);
 UI_API void     ui_gh_img_view_reset(UiWidget w);
 
+/* 平滑缩放 (build 301 起; 302 改为 Qt 式匀速分段)。以 (anchor_x, anchor_y) 为锚点
+ * 缩放到 zoom, 锚点坐标系同 set_zoom_around。每次调用 = 一段 duration_ms 的匀速
+ * 运动 (log 空间视觉匀速), 到点硬停。duration_ms <= 0 或尚无图像时等同
+ * set_zoom_around 一步到位。库不读系统"显示动画"开关, 是否动画由宿主决定。
+ * 动画中再调用: 同向 → 与未走完的段叠加 (越滚越快, 终点精确逐格相乘);
+ * 反向 → 清掉积压从当前画面立刻掉头。锚点换新位置。
+ * 动画期间不切金字塔级、不 fire viewport callback (同拖拽); 到位时 fire 一次。
+ * get_zoom 返回画面上的当前值; 下一格的起算点用 get_zoom_step_base。
+ * set_zoom / set_zoom_around / set_pan / fit / reset / set_rotation / 换图 /
+ * 按下鼠标都会先让动画停在当前画面。 */
+UI_API void     ui_gh_img_view_zoom_around_smooth(UiWidget w, float zoom,
+                                                   float anchor_x, float anchor_y,
+                                                   float duration_ms);
+/* 动画终点倍率; 无动画时等于 get_zoom。 */
+UI_API float    ui_gh_img_view_get_target_zoom(UiWidget w);
+/* 下一格缩放的起算点 (build 302): 无动画 = 当前; 同向 = 终点; 正在反向运动 =
+ * 当前画面。宿主 "起算点 × 每格倍数" 后传给 zoom_around_smooth。
+ * zoom_in: 1 = 这一格是放大。 */
+UI_API float    ui_gh_img_view_get_zoom_step_base(UiWidget w, int zoom_in);
+/* 1 = 正在平滑缩放。 */
+UI_API int      ui_gh_img_view_is_zoom_animating(UiWidget w);
+/* 立刻跳到终点并提交 (切级 + fire viewport callback)。宿主要读"最终倍率/pan"前调。 */
+UI_API void     ui_gh_img_view_finish_zoom_animation(UiWidget w);
+/* 内置滚轮缩放 (wheel_zoom_enabled=1 时) 的平滑时长, 默认 0 = 一步到位 (旧行为)。 */
+UI_API void     ui_gh_img_view_set_wheel_zoom_smooth_ms(UiWidget w, float ms);
+
 /* Rotation (90° 倍数, CW). pan/zoom 不变. angle: 任意 int → 规整到
  * 0/90/180/270 (mod 360 + round to nearest 90). pan 存屏幕空间, 鼠标
  * 拖动方向永远匹配视觉方向, 跟旋转角度解耦. Begin / Clear 把 rotation
@@ -710,6 +849,16 @@ UI_API int      ui_gh_img_view_get_rotation(UiWidget w);
 UI_API void     ui_gh_img_view_on_viewport(UiWidget w,
                                             UiGhImgViewViewportCallback cb,
                                             void* userdata);
+
+/* build 309: 视图变换回调 — zoom / pan / rotation 实际变了就 fire (UI 线程同步):
+ * 拖动的每次移动、缩放动画的每一帧 (interacting=1), 以及每次落定 (interacting=0:
+ * 松手 / 动画到位 / 命令式 set_zoom / set_pan / 旋转 / fit)。
+ * 与 on_viewport 的分工: on_viewport 为免瓦块解码风暴, 拖动 / 动画途中不发, 只
+ * 适合排瓦块; 叠在画布上的东西 (标记点、选框) 要跟画面走就用这条。不做瓦块工作,
+ * 回调里也别做重活 —— 拖动时每次鼠标移动都会来。cb=NULL 取消。 */
+UI_API void     ui_gh_img_view_on_transform(UiWidget w,
+                                             UiGhImgViewTransformCallback cb,
+                                             void* userdata);
 
 /* Tile evict callback — NotifyViewport 内 trim viewport 外 tile 时, lib 对
  * 每个被清的 tile fire 一次, caller 同步自己端"已 push"状态 (典型
@@ -912,6 +1061,18 @@ UI_API void     ui_titlebar_set_icon_pixels(UiWidget titlebar,
                                              const void* rgba, int width, int height);
 UI_API void     ui_titlebar_set_bg_color(UiWidget titlebar, UiColor color);
 UI_API void     ui_titlebar_add_widget(UiWidget titlebar, UiWidget custom_widget);
+/* 在最小化左侧追加一个与 min/max/close 同款的控制按钮 (46×标题栏高、直角悬停
+ * 底色、Segoe MDL2 字形如 L"\xE700"、跟随主题)。可多次调用: 先加的贴着最小化,
+ * 后加的依次往左; ui_titlebar_add_widget 的控件排在它们左边。返回按钮句柄,
+ * 可用 ui_widget_on_click / set_tooltip / get_rect / set_visible。失败返回 0。 */
+UI_API UiWidget ui_titlebar_add_caption_button(UiWidget titlebar, const wchar_t* glyph);
+UI_API void     ui_titlebar_caption_button_set_glyph(UiWidget button, const wchar_t* glyph);
+/* 用 SVG 代替字形: 画在按钮中心 16×16 DIP 框内 (建议 viewBox="0 0 16 16"),
+ * 用 currentColor 跟随主题前景色; 悬停 / 按下底色不变。NULL 或 "" 恢复字形。 */
+UI_API void     ui_titlebar_caption_button_set_svg(UiWidget button, const char* svg);
+/* 图标右上角红点 (#E81123, 直径 6 DIP), on=0 隐藏。和其它 setter 一样不自动
+ * 重绘, 调用方需 ui_window_invalidate。 */
+UI_API void     ui_titlebar_caption_button_set_badge(UiWidget button, int on);
 /* Title font weight. Default 400 (NORMAL). Typical values:
    400 NORMAL / 500 MEDIUM / 600 SEMI_BOLD / 700 BOLD. */
 UI_API void     ui_titlebar_set_title_weight(UiWidget titlebar, int weight);
@@ -945,6 +1106,12 @@ UI_API void ui_widget_set_opacity(UiWidget w, float opacity);  /* 0.0 = 全透�
 UI_API float ui_widget_get_opacity(UiWidget w);
 UI_API void ui_widget_set_enabled(UiWidget w, int enabled);
 UI_API void ui_widget_set_bg_color(UiWidget w, UiColor color);
+/* 运行时改字号 / 文字色 (等价于 CSS 的 font-size / color)。任意 widget 可用,
+ * 主要是给 TextInput 这类没有专用 setter 的控件留的运行时口子 —— 比如宿主
+ * 要让画布上的浮动输入框跟被编辑文字同号, 好让光标和选区位置对得上。
+ * size <= 0 / alpha = 0 表示"回到 CSS 或主题默认"。 */
+UI_API void ui_widget_set_font_size(UiWidget w, float size);
+UI_API void ui_widget_set_text_color(UiWidget w, UiColor color);
 
 UI_API int    ui_widget_get_visible(UiWidget w);
 UI_API int    ui_widget_get_enabled(UiWidget w);
@@ -999,6 +1166,13 @@ UI_API void  ui_slider_set_value(UiWidget w, float value);
 UI_API const wchar_t* ui_text_input_get_text(UiWidget w);
 UI_API void           ui_text_input_set_text(UiWidget w, const wchar_t* text);
 UI_API void           ui_text_input_set_read_only(UiWidget w, int read_only);
+/* build 340: 密码模式 (对标 <input type="password">): 每个字符显示成 '●',
+ * Ctrl+C / Ctrl+X 不把内容放进剪贴板, 可以粘贴。get_text 仍返回明文。
+ * .uix 页面写 <input type="password">, markup 写 <TextInput password="true" />。 */
+UI_API void           ui_text_input_set_password(UiWidget w, int on);
+/* build 311: 全选 (对标网页 input.select()), 之后输入会整体替换。常用于弹出
+ * 填好当前值的输入框, 配合 ui_window_focus_widget 让用户直接改写。 */
+UI_API void           ui_text_input_select_all(UiWidget w);
 
 /* ------------------------------------------------------------------ */
 /* TextArea (multi-line text input)                                   */
@@ -1141,10 +1315,14 @@ UI_API void ui_window_focus_widget(UiWindow win, UiWidget w);
  * dispatch loop 写死只识别 TextArea/ImageView/ImageViewPlus/GhImgView/
  * ScrollView 五种, CustomWidget 不在内, mouse_wheel 实际收不到.
  *
- * 这个 API 接 Widget::onMouseWheelHook (跟 .uix @wheel 同一条路径, 在
- * OnMouseWheel 分发开头无条件 fire, 不挑 widget 类型). x/y 是 widget 内
- * 屏幕坐标, delta 正值上滚 / 负值下滚 (跟 WM_MOUSEWHEEL WHEEL_DELTA 同号).
- * cb=NULL 解绑. */
+ * 这个 API 接 Widget::onMouseWheelHook (跟 .uix @wheel 同一条路径, 不挑
+ * widget 类型). x/y 是相对挂回调的这个 widget 左上角的坐标, delta 正值上滚 /
+ * 负值下滚 (跟 WM_MOUSEWHEEL WHEEL_DELTA 同号). cb=NULL 解绑.
+ *
+ * build 310+: 按 DOM 语义冒泡 —— 从鼠标下最深的控件往上, 最近的挂了回调的
+ * 祖先接管 (只触发一次)。途中自带滚动的控件 (ScrollView / TextArea 等) 真的
+ * 滚了就截停; 内容没溢出 / 关了内置缩放的不挡。叠在画布上的小控件不用各自挂,
+ * 挂在公共父容器上即可。 */
 typedef void (*UiWidgetWheelCallback)(UiWidget w, float x, float y,
                                        float delta, void* userdata);
 UI_API void ui_widget_on_mouse_wheel(UiWidget w,
@@ -1223,6 +1401,11 @@ UI_API UiColor ui_theme_divider(void);        /* divider/border */
 typedef void* UiDrawCtx;
 
 typedef void (*UiCustomDrawCallback)(UiWidget w, UiDrawCtx ctx, UiRect rect, void* ud);
+/* btn: **1 = 左键按下, 0 = 没按左键** (来自 MouseEvent::leftBtn, 不是按钮编号)。
+ * 按"0 号键=左键"的直觉写 `if (btn != 0) return 0` 会把所有左键操作全挡掉,
+ * 表现为 custom widget 完全不响应鼠标, 且看不出任何报错。
+ * x/y 是窗口 DIP 坐标, 与 draw 回调拿到的 rect 同一坐标系。
+ * 返回非 0 表示吞掉事件。mouse_up 回调的 btn 恒为 0。 */
 typedef int  (*UiCustomMouseCallback)(UiWidget w, float x, float y, int btn, void* ud);
 typedef int  (*UiCustomWheelCallback)(UiWidget w, float x, float y, float delta, void* ud);
 typedef int  (*UiCustomKeyCallback)(UiWidget w, int vk, void* ud);
@@ -1253,17 +1436,107 @@ UI_API void ui_custom_set_focusable(UiWidget w, int focusable);
 /* ------------------------------------------------------------------ */
 UI_API void  ui_draw_fill_rect(UiDrawCtx ctx, UiRect rect, UiColor color);
 UI_API void  ui_draw_rect(UiDrawCtx ctx, UiRect rect, UiColor color, float width);
+/* 椭圆 (含正圆) —— rect 是**外接矩形**, 跟 ui_draw_rect 同一套入参口径:
+ * 拖框画圆时手上就是这个矩形, 不用调用方自己换算圆心半径。 */
+UI_API void  ui_draw_fill_ellipse(UiDrawCtx ctx, UiRect rect, UiColor color);
+UI_API void  ui_draw_ellipse(UiDrawCtx ctx, UiRect rect, UiColor color, float width);
 UI_API void  ui_draw_fill_rounded_rect(UiDrawCtx ctx, UiRect rect, float rx, float ry, UiColor color);
 UI_API void  ui_draw_rounded_rect(UiDrawCtx ctx, UiRect rect, float rx, float ry, UiColor color, float width);
 UI_API void  ui_draw_line(UiDrawCtx ctx, float x1, float y1, float x2, float y2, UiColor color, float width);
+/* 折线 —— 整条走一个路径几何 + 圆头圆角线型。铅笔笔迹必须用它而不是拿
+ * ui_draw_line 逐段拼: 逐段描边在转折处会露出缺口、半透明色在接头处叠深,
+ * 而且几百个点就是几百条绘制命令。count < 2 不画; closed 非 0 首尾相连。 */
+UI_API void  ui_draw_polyline(UiDrawCtx ctx, const UiPoint* pts, int count,
+                               UiColor color, float width, int closed);
+/* 任意四边形填充 (pts 按环绕序; 三个点重合即退化成三角形 —— 箭头的实心
+ * 箭头帽就是这么画的)。FillRect + transform 只能画平行四边形, 梯形 / 三角
+ * 形必须走真几何。 */
+UI_API void  ui_draw_fill_quad(UiDrawCtx ctx, const UiPoint pts[4], UiColor color);
 UI_API void  ui_draw_text(UiDrawCtx ctx, const wchar_t* text, UiRect rect, UiColor color, float fontSize);
 UI_API void  ui_draw_text_ex(UiDrawCtx ctx, const wchar_t* text, UiRect rect, UiColor color,
                               float fontSize, int align, int bold);
 UI_API float ui_draw_measure_text(UiDrawCtx ctx, const wchar_t* text, float fontSize);
 UI_API void  ui_draw_bitmap(UiDrawCtx ctx, const uint8_t* pixels,
                              int width, int height, int stride, UiRect dest);
+/* 同 ui_draw_bitmap, 但可指定采样方式 (UI_IMAGE_SAMPLING_*) 与不透明度。
+ * ui_draw_bitmap 等价于 sampling=LINEAR, opacity=1。 */
+UI_API void  ui_draw_bitmap_ex(UiDrawCtx ctx, const uint8_t* pixels,
+                                int width, int height, int stride, UiRect dest,
+                                int sampling, float opacity);
+/* ---- 宿主持有的位图 (build 338) ----
+ * ui_draw_bitmap 每次调用都复制一份像素、按新图上传显卡; 每帧都画的同一张图 (小地图
+ * 缩略图之类) 改用句柄: 像素只交一次, 之后每帧按句柄画, 显卡位图只上传一次。
+ * 像素格式同 ui_draw_bitmap (BGRA 预乘), 库保存自己的拷贝, 调用返回后 pixels 可释放。
+ * 内容变了就 destroy 旧的再 create 新的。参数不合法返回 0。 */
+typedef uint64_t UiBitmap;
+UI_API UiBitmap ui_bitmap_create(const uint8_t* pixels, int width, int height, int stride);
+/* 已交给渲染线程、还没画完的帧里遇到已销毁的句柄会跳过这一张。传 0 无操作。 */
+UI_API void     ui_bitmap_destroy(UiBitmap bmp);
+/* sampling / opacity 同 ui_draw_bitmap_ex。句柄无效 (0 / 已销毁) 时什么都不画。 */
+UI_API void     ui_draw_bitmap_handle(UiDrawCtx ctx, UiBitmap bmp, UiRect dest,
+                                      int sampling, float opacity);
+/* ---- 虚线变体 ----
+ * 与不带 _ex 的同名函数只差一个 dash 参数 (UI_DASH_*)。dash=SOLID 时行为
+ * 与原函数完全一致。选框用虚线、标注圈用点线之类都走这里。 */
+UI_API void  ui_draw_line_ex(UiDrawCtx ctx, float x1, float y1, float x2, float y2,
+                              UiColor color, float width, int dash);
+UI_API void  ui_draw_rect_ex(UiDrawCtx ctx, UiRect rect, UiColor color, float width, int dash);
+UI_API void  ui_draw_ellipse_ex(UiDrawCtx ctx, UiRect rect, UiColor color, float width, int dash);
+UI_API void  ui_draw_polyline_ex(UiDrawCtx ctx, const UiPoint* pts, int count,
+                                  UiColor color, float width, int closed, int dash);
+
 UI_API void  ui_draw_push_clip(UiDrawCtx ctx, UiRect rect);
 UI_API void  ui_draw_pop_clip(UiDrawCtx ctx);
+
+/* 仿射变换栈。m 是 D2D 行向量语义的 3x2 矩阵, 按 {_11,_12,_21,_22,_31,_32}
+ * 传入 (即 {a,b,c,d,tx,ty}); 变换点 = (x,y,1) * m。push 的矩阵与当前变换
+ * **相乘**而非替换, 可嵌套; 必须与 pop 成对。
+ *
+ * 存在理由: 让宿主能在自己的坐标系里画 —— 比如图片标注在"图像像素坐标"
+ * 里画一次给屏幕 (push 缩放/平移矩阵), 再原样画一次到离屏位图做烧录
+ * (push 单位矩阵)。线宽和字号随变换一起缩放, 两条路径共用一份绘制代码。 */
+UI_API void  ui_draw_push_transform(UiDrawCtx ctx, const float m[6]);
+UI_API void  ui_draw_pop_transform(UiDrawCtx ctx);
+
+/* ---- 透明图层 + 合成模式 (build 344) ----
+ * push_layer / pop_layer 之间的内容画进一张独立的透明中间层, pop 时整张按普通
+ * 叠加合回去。必须成对, 可嵌套, 可与 clip / transform 交错 (各自成对即可)。
+ * 层内 ClearType 文字自动改灰度抗锯齿 (透明背景上 ClearType 会画糊)。
+ *
+ * ui_draw_bitmap_composite 按指定合成方式画位图, 像素格式同 ui_draw_bitmap
+ * (BGRA 预乘), sampling 同 ui_draw_bitmap_ex:
+ *   UI_COMPOSITE_SOURCE_OVER — 普通叠加, 等价于 ui_draw_bitmap_ex(opacity=1)。
+ *   UI_COMPOSITE_DEST_OUT    — 按位图 alpha 清掉目标 (目标 *= 1 - 源alpha), 源颜色
+ *                              不用。放在图层里用 = 橡皮擦: 只挖掉层内画过的东西,
+ *                              层下面的内容 (含透明度) 原样露出; 不在图层里用会把
+ *                              窗口底色一起挖穿。
+ * 认不得的 composite 值按 SOURCE_OVER 处理。 */
+#define UI_COMPOSITE_SOURCE_OVER 0
+#define UI_COMPOSITE_DEST_OUT    1
+UI_API void  ui_draw_push_layer(UiDrawCtx ctx);
+UI_API void  ui_draw_pop_layer(UiDrawCtx ctx);
+UI_API void  ui_draw_bitmap_composite(UiDrawCtx ctx, const uint8_t* pixels,
+                                       int width, int height, int stride, UiRect dest,
+                                       int sampling, int composite);
+
+/* ---- 离屏绘制 (把矢量图元烧录成像素) --------------------------------
+ * ui_offscreen_begin 返回一个可喂给任意 ui_draw_* 的 UiDrawCtx, 背后是一张
+ * width×height 的 BGRA premultiplied 位图, 初始全透明。
+ *
+ * **坐标单位是像素**, 不是 DIP —— 离屏目标 DPI 固定 96。所以同一份绘制代码,
+ * 画屏幕时 push 一个缩放/平移矩阵, 烧录时 push 单位矩阵, 即可得到一致结果。
+ *
+ * 失败返 NULL, 最常见的原因是 width/height 超过设备单张纹理上限 (常见 16384)
+ * —— 调用方据此决定先降分辨率。
+ *
+ * ui_offscreen_end 结束绘制并把像素回读到 out_bgra (至少 height*stride 字节,
+ * stride 传 0 视作 width*4), 成功返 1。**无论成败 ctx 都被销毁**, 之后不可
+ * 再用。只能对 ui_offscreen_begin 返回的 ctx 调用, 传别处来的 ctx 返 0。
+ *
+ * 约束: begin 与 end 必须在同一线程; 不可嵌套; 该线程需已 CoInitialize。
+ * 不要在 widget 的 draw 回调里发起 —— 那是渲染流程内部, 应在事件处理里做。 */
+UI_API UiDrawCtx ui_offscreen_begin(int width, int height);
+UI_API int       ui_offscreen_end(UiDrawCtx ctx, uint8_t* out_bgra, int stride);
 
 /* ------------------------------------------------------------------ */
 /* Debug / Inspector                                                  */
@@ -1280,6 +1553,16 @@ UI_API int      ui_debug_screenshot(UiWindow win, const wchar_t* outPath);  /* �
 UI_API int      ui_debug_screenshot_menu(UiWindow win, const wchar_t* outPath);
 /* 截单个 widget。widget 必须已布局（rect 非空），输出 PNG。 */
 UI_API int      ui_debug_screenshot_widget(UiWindow win, UiWidget w, const wchar_t* outPath);
+/* toast (ui_toast / ui_toast_ex) 画在库的独立分层窗口上, tree / screenshot 都看不到,
+ * 用这两个查 (build 330)。都会先等之前的 ui_toast* 请求处理完, 刚弹就查也拿得到。
+ *   ui_debug_toast_info: 当前 toast 的 JSON, free 用 ui_debug_free。
+ *     {"visible":false} 或 {"visible":true,"text","icon","position","anim",
+ *     "duration_ms","elapsed_ms","alpha"(0-255 当前帧),"x","y","width","height"
+ *     (相对窗口客户区, 物理 px, 当前帧),"dpi","text_clipped"(超宽文字自动折行 (build 331), 超过 4 行才截断并为 true)}
+ *   ui_debug_screenshot_toast: toast 位图存 PNG (带透明, 满不透明度, 不含淡入淡出)。
+ *     0 成功; -1 当前没有 toast; 其余负数 = 编码 / 写文件失败。 */
+UI_API char*    ui_debug_toast_info(UiWindow win);
+UI_API int      ui_debug_screenshot_toast(UiWindow win, const wchar_t* outPath);
 
 /* ------------------------------------------------------------------ */
 /* Debug server — named-pipe IPC（库级，所有应用均可一行启用）          */
@@ -1392,6 +1675,10 @@ UI_API int   ui_debug_screenshot_submenu_path(UiWindow win, const int* path, int
    ui_debug_set_menu_autoclose(0) 关掉自动关闭；否则菜单打开后 50ms 内就被关掉。
    参数 enabled=0 表示关闭自动关闭，=1 恢复正常。 */
 UI_API void  ui_debug_set_menu_autoclose(int enabled);
+/* 菜单打开动画放慢倍数, 看动画细节用。1 = 正常速度, 夹在 [1, 20]。 */
+UI_API void  ui_debug_set_menu_anim_slowmo(float factor);
+/* 控件动画 (开关滑动 / 悬停 / 按下等 AnimatedFloat) 放慢倍数, 同上, 夹在 [1, 20]。 */
+UI_API void  ui_debug_set_widget_anim_slowmo(float factor);
 
 /* 在 UI 线程上同步执行 fn(ud)。跨线程调用时内部用 SendMessage 到窗口，
    已在 UI 线程时直接调用。返回前 fn 必已执行完成。主要给自动化脚本 / 调试 pipe
@@ -1404,6 +1691,15 @@ UI_API void  ui_window_invoke_sync(UiWindow win, void (*fn)(void* ud), void* ud)
 /* 覆盖窗口最小尺寸（DIP）。传 0 恢复默认（theme::kMinWidth/kMinHeight，480×360）。
    用于无边框画布等场景：窗口随 widget 尺寸动态缩放，需要小于主题默认最小尺寸。 */
 UI_API void  ui_window_set_min_size(UiWindow win, int w_dip, int h_dip);
+
+/* build 328: 窗口高度跟随内容 (.uix 写 <window height="auto"> 等价于建窗后调
+ * enable=1)。开启后每次排版都把客户区高度定成根节点在当前宽度下需要的高度 ——
+ * 文字折行、换语言、显隐某一行都会自动跟上; 不超过所在屏工作区, 不低于
+ * ui_window_set_min_size 给的高度。宽度不变, 窗口左上角不动 (向下长 / 收)。
+ * enable=1 每次调用都会立即按当前内容量一次: 宿主改完文字后、show 前计算居中
+ * 位置时再调一次, 随后 ui_window_get_rect_screen 读到的就是最终高度。
+ * 最大化 / 开关动画进行中不调整。enable=0 关闭, 保持当前尺寸。 */
+UI_API void  ui_window_set_auto_height(UiWindow win, int enable);
 
 /* 运行时切换窗口边框：
  *   frameless != 0 → 无系统边框 / 标题栏（需自己放 TitleBar）
@@ -1442,6 +1738,11 @@ UI_API void  ui_widget_set_drag_window(UiWidget w, int enable);
    时背景闪减到最小. */
 UI_API void  ui_window_set_rect(UiWindow win, int x_screen, int y_screen,
                                  int w_dip, int h_dip);
+/* build 320: 同 ui_window_set_rect, 但宽高也是**屏幕物理像素**。非整数缩放
+ * (150% 等) 下 DIP 取整后某些像素宽高根本到不了 (1291 DIP → 1937 px, 1290 → 1935,
+ * 1936 无解), 窗口要和画面逐像素对齐 (看图器无边框窗口 = 图) 时用这个。 */
+UI_API void  ui_window_set_rect_px(UiWindow win, int x_screen, int y_screen,
+                                    int w_px, int h_px);
 UI_API void  ui_window_set_size(UiWindow win, int w_dip, int h_dip);
 UI_API void  ui_window_set_position(UiWindow win, int x_screen, int y_screen);
 UI_API void  ui_window_get_rect_screen(UiWindow win,
@@ -1488,6 +1789,20 @@ UI_API void  ui_window_enable_canvas_mode(UiWindow win, int enable);
  * ratio_w 或 ratio_h 任一 <= 0 = disable (默认). */
 UI_API void  ui_window_set_aspect_lock(UiWindow win, int ratio_w, int ratio_h);
 
+/* build 321: 分层画布窗口 (layered_canvas) 透明底。默认 0 = 不透明 (背景用主题窗口色)。
+ * 1 = 清屏用全透明, 页面不画背景的地方透出桌面, alpha 为 0 的像素鼠标点穿。
+ * 用途: 窗口四周留透明边距画图片阴影 (配合 ui_gh_img_view_set_shadow_outset、
+ * ui_window_set_resize_inset)。非 layered_canvas 窗口无效。 */
+UI_API void  ui_window_set_layered_transparent(UiWindow win, int on);
+
+/* build 321: 缩放边框内缩 (dip)。默认 0 = 感应带在窗口外沿。>0 时:
+ *   - resize 感应带跨在"窗口内缩 dip 后的内容矩形"边缘 (外侧最多 kResizeBorder, 内侧
+ *     kResizeBorder);
+ *   - 边距里感应带以外的区域返回 HTNOWHERE (不拖窗、不缩放);
+ *   - ui_window_set_aspect_lock 的比例按内容矩形算。
+ * 与透明底配合, 让"图 + 四周阴影"的窗口仍然从图片边缘缩放。 */
+UI_API void  ui_window_set_resize_inset(UiWindow win, float dip);
+
 /* ------------------------------------------------------------------ */
 /* Font / Text rendering (since 1.3.0)                                 */
 /* ------------------------------------------------------------------ */
@@ -1513,6 +1828,14 @@ UI_API const wchar_t*   ui_theme_get_default_font(void);
 UI_API void             ui_theme_set_cjk_font(const wchar_t* latin, const wchar_t* cjk);
 UI_API const wchar_t*   ui_theme_get_cjk_latin_font(void);
 UI_API const wchar_t*   ui_theme_get_cjk_cjk_font(void);
+
+/* build 314: 文字排版区域 (BCP-47, 如 L"ja-JP" / L"zh-TW")。同一个 CJK 统一汉字
+   在不同区域字形不同 (日文 "直" "骨" 与中文写法不一样), DirectWrite 按它选字形。
+   NULL / L"" = 跟随系统区域 (默认)。get 未设置时返回 L""。
+   上面的 ui_theme_set_* (字体 / 排版区域 / 渲染模式) 运行时调用会立即作用到所有
+   已打开窗口: 清文字格式缓存、重建回退字体链并重新排版。 */
+UI_API void             ui_theme_set_text_locale(const wchar_t* locale);
+UI_API const wchar_t*   ui_theme_get_text_locale(void);
 
 /* 设置全局默认文字渲染模式。 */
 UI_API void             ui_theme_set_text_render_mode(UiTextRenderMode mode);
@@ -1664,8 +1987,36 @@ UI_API int      ui_page_load_language_file  (UiPage p, const char* locale,
                                               const wchar_t* path);
 
 /* Switch the active locale. Any binding that calls $t() in the template
- * re-evaluates, so labels refresh in place.                              */
+ * re-evaluates, so labels refresh in place. build 316: 宿主用 ui_page_bind_* /
+ * ui_page_set_text_key 绑定的文字也在这里一并重译。
+ * build 316: 模板里 $t 可带参数: {{ $t('files', n) }} → 译文 "{0} files" 的 {0} 换成 n。 */
 UI_API void     ui_page_set_locale(UiPage p, const char* locale);
+
+/* ---- build 316: 宿主 C++ 设的界面文字按 key 绑定 ----------------------------
+ * 宿主不要再把翻译好的字符串推给界面 (换语言后会停在旧语言); 传 key + 参数,
+ * 页面立即按当前 locale 翻译, 之后每次 ui_page_set_locale 自动重译 —— 不用
+ * 自己记着重推, 也不用销毁重建窗口。
+ *
+ *   args / argc  替换译文里的 {0} {1} …; 可为 NULL / 0。以 "@" 开头的参数本身
+ *                也按 key 翻译 (L"@win.settings"), "@@" 开头表示字面的 "@"。
+ *   控件需在该页面的控件树里 (或将挂进去); 控件销毁后绑定自动失效。
+ *   之后对同一处调用普通设置接口 (ui_label_set_text / ui_widget_set_tooltip /
+ *   ui_titlebar_set_title / ui_window_set_title / ui_page_set_text) 会解除绑定,
+ *   字面文字不会再被换语言覆盖。 */
+UI_API void     ui_page_bind_text(UiPage p, UiWidget label_or_button, const char* key,
+                                  const wchar_t* const* args, int argc);
+UI_API void     ui_page_bind_tooltip(UiPage p, UiWidget w, const char* key,
+                                     const wchar_t* const* args, int argc);
+UI_API void     ui_page_bind_titlebar_title(UiPage p, UiWidget titlebar, const char* key,
+                                            const wchar_t* const* args, int argc);
+UI_API void     ui_page_bind_window_title(UiPage p, UiWindow win, const char* key,
+                                          const wchar_t* const* args, int argc);
+/* 下拉框选项整体换成这组 key 的译文 (与 <option>@key 同一机制)。 */
+UI_API void     ui_page_bind_combobox_items(UiPage p, UiWidget combobox,
+                                            const char* const* keys, int count);
+/* 页面变量 name = key 的译文 ({{ name }} 处随语言刷新)。 */
+UI_API void     ui_page_set_text_key(UiPage p, const char* name, const char* key,
+                                     const wchar_t* const* args, int argc);
 
 /* Retrieve a UiMenu handle for a `<menu id="name">` declared in the HTML.
  * Returned menu is owned by the page; do NOT call ui_menu_destroy on it.
@@ -1699,6 +2050,20 @@ UI_API void ui_page_on_widget_mount(UiPage p, const char* widget_id,
                                      UiWidgetLifecycleCallback cb, void* userdata);
 UI_API void ui_page_on_widget_unmount(UiPage p, const char* widget_id,
                                        UiWidgetLifecycleCallback cb, void* userdata);
+
+/* build 304: 监听页面状态 (对齐 Vue `watch`)。name 对应的值变化时回调宿主,
+ * json 是新值的 UTF-8 JSON (仅回调期间有效)。
+ *   - 注册时不回调; 值没变 (含宿主写回同一个值) 不回调。
+ *   - 不分来源: 页面 JS 改的、宿主 ui_page_set_* 写的, 只要变了都回调。宿主在回调
+ *     里规范化后写回是允许的 (会再通知一次规范化后的值, 值稳定后停下)。
+ *   - 比较的是整个值的 JSON, 嵌套修改只要经过响应式代理同样触发; 推荐页面整体
+ *     替换 (`this.tree = newTree`)。
+ *   - 同一 name 只留一个回调, cb=NULL 取消; 页面热重载后自动保留。
+ *   - 不要在回调里取消同一个监听。
+ * 典型用法: 设置页 JS 拖放排序改了 menuTree, 宿主在回调里校验并写入配置。 */
+typedef void (*UiPageWatchCallback)(UiPage page, const char* name, const char* json,
+                                    void* userdata);
+UI_API void ui_page_watch(UiPage p, const char* name, UiPageWatchCallback cb, void* userdata);
 
 /* Historical process-wide feature flag. The page system now routes .uix files
  * through the QuickJS runtime (Vue 3 SFC `export default { ... }` syntax +

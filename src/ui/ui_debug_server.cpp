@@ -238,6 +238,20 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         int r = ui_debug_screenshot_menu(win, wp.c_str());
         return r == 0 ? okJson() : errJson("screenshot_menu failed (no popup open?)");
     }
+    /* toast 在独立分层窗口上, tree / screenshot 看不到 (build 330)。 */
+    if (cmd == "toast_info") {
+        char* json = ui_debug_toast_info(win);
+        if (!json) return "{\"visible\":false}";
+        std::string r = json; ui_debug_free(json);
+        return r;
+    }
+    if (cmd == "screenshot_toast") {
+        if (arg(0).empty()) return errJson("usage: screenshot_toast <path>");
+        std::wstring wp = utf8ToWide(arg(0));
+        int r = ui_debug_screenshot_toast(win, wp.c_str());
+        if (r == -1) return errJson("screenshot_toast failed (no toast showing)");
+        return r == 0 ? okJson() : errJson("screenshot_toast failed (encode/write)");
+    }
     if (cmd == "screenshot_widget") {
         if (arg(1).empty()) return errJson("usage: screenshot_widget <id> <path>");
         UiWidget w = WidgetByIdHandle(win, arg(0));
@@ -620,7 +634,11 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
             return errJson("usage: screenshot_submenu i0/i1/... <out_path>");
         std::vector<int> path;
         if (!parseMenuPath(arg(0), path)) return errJson("invalid path");
-        std::wstring wp(arg(1).begin(), arg(1).end());
+        /* 不能写 wp(arg(1).begin(), arg(1).end()): arg() 按值返回, begin/end 取自
+         * 两个不同的临时串, 路径长过 SSO (15 字节) 时区间长度是垃圾值 →
+         * std::length_error → 未捕获 → abort() (GuoheView Debug 弹 "abort() has
+         * been called")。逐字节拷贝也会把中文路径转坏。 */
+        std::wstring wp = utf8ToWide(arg(1));
         int r = ui_debug_screenshot_submenu_path(win, path.data(), (int)path.size(), wp.c_str());
         return r == 0 ? okJson() : errJson("screenshot_submenu failed");
     }
@@ -683,7 +701,7 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         ui::MsgBoxDebugInfo info = ui::MsgBoxDebugSnapshot();
         if (!info.active) return errJson("no active dialog");
         if (info.cancel_idx < 0) return errJson("dialog is not cancelable");
-        ui::MsgBoxDebugFinish(info.cancel_idx);
+        ui::MsgBoxDebugCancel();   /* = Esc: 结果带 cancelled=1 (build 339) */
         return okJson();
     }
     if (cmd == "dialog_click") {

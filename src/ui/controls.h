@@ -6,6 +6,7 @@
 #include "context_menu.h"
 #include "ui_context.h"  // GetContext().InvalidateAllWindows() from inline setters
 #include "animation.h"
+#include "text_undo.h"
 #include <cstdint>
 #include <map>
 #include <utility>
@@ -21,6 +22,11 @@ public:
     explicit LabelWidget(const std::wstring& text) : text_(text) {}
 
     WidgetPtr FontSize(float s) override { fontSize_ = s; return shared_from_this(); }
+    /* 画字用的字号: CSS 级联结果优先, 否则 FontSize() 设的值。测量 (SizeHint /
+     * HeightForWidth) 必须用同一个 —— v-if 块里的标签创建时后代选择器还没匹配,
+     * fontSize_ 停在基础规则, 挂上后样式重算只改 css.fontSize, 两边一不一致就
+     * 按小字号量宽、按大字号画, 文字被折行 (build 329)。 */
+    float DrawFontSize() const { return css.fontSize > 0 ? css.fontSize : fontSize_; }
     WidgetPtr Bold() override { bold_ = true; return shared_from_this(); }
     WidgetPtr TextColor(const D2D1_COLOR_F& c) override { color_ = c; customColor_ = true; return shared_from_this(); }
     WidgetPtr Align(int a) override { align_ = (DWRITE_TEXT_ALIGNMENT)a; return shared_from_this(); }
@@ -57,8 +63,23 @@ public:
     bool OnMouseUp(const MouseEvent& e) override;
     bool OnKeyDown(int vk) override;
     D2D1_SIZE_F SizeHint() const override;
+    /* build 323: wrap 时按给定宽度量折行后的高度 (含 padding); 不 wrap 同 SizeHint。 */
+    float HeightForWidth(float w) const override;
 
 private:
+    /* 文字区宽 availW 下折行后的高度 (按 line-height 取整行, 受 maxLines_ 限制)。
+     * 没有 measure context 时返回 -1, 调用方退回单行。 */
+    float WrappedTextHeight(float availW) const;
+    /* HeightForWidth 缓存: 布局里同一宽度会被父级反复问, DWrite 测量不便宜。
+     * 键里带上文字 / 字号 / 粗细 / 行高, 任一变化即失效。 */
+    mutable float        hfwAvailW_ = -1.0f;
+    mutable float        hfwHeight_ = 0.0f;
+    mutable float        hfwFont_   = 0.0f;
+    mutable bool         hfwBold_   = false;
+    mutable float        hfwLineH_  = 0.0f;
+    mutable int          hfwMaxLines_ = 0;
+    mutable std::wstring hfwText_;
+
     std::wstring text_;
     float fontSize_ = theme::kFontSizeNormal;
     bool bold_ = false;
@@ -112,6 +133,9 @@ public:
     bool OnMouseDown(const MouseEvent& e) override;
     bool OnMouseUp(const MouseEvent& e) override;
     D2D1_SIZE_F SizeHint() const override;
+    /* 按钮继承 HBoxWidget 只为排图标 + 文字, 高度由自身 SizeHint 定。不覆盖的话
+     * 会走 HBoxWidget::HeightForWidth 按子项量 (按钮没有子项) → 0, 按钮行被压扁。 */
+    float HeightForWidth(float w) const override { (void)w; return SizeHint().height; }
 
 private:
     std::wstring text_;
@@ -148,6 +172,12 @@ public:
     EasingFunction GetEasingFunction() const { return checkAnim_.Easing(); }
 
     void UpdateAnimation();
+    bool AnimationActive() const override { return animating_; }
+    AnimTick TickAnimation() override {
+        if (!animating_) return {false, false};
+        UpdateAnimation();
+        return {true, animating_};
+    }
 
     void OnDraw(Renderer& r) override;
     bool OnMouseUp(const MouseEvent& e) override;
@@ -187,6 +217,12 @@ public:
 
     void UpdateThumbAnimation();
     bool ThumbAnimating() const { return thumbScale_.Active(); }
+    bool AnimationActive() const override { return ThumbAnimating(); }
+    // 在清单里就每帧推进 (拇指刚播完的那帧也要采样到终值)。
+    AnimTick TickAnimation() override {
+        UpdateThumbAnimation();
+        return {true, ThumbAnimating()};
+    }
 
     void OnDraw(Renderer& r) override;
     bool OnMouseDown(const MouseEvent& e) override;
@@ -268,7 +304,18 @@ public:
         : placeholder_(placeholder) { focusable = true; ResetCaretBlink(); }
 
     const std::wstring& Text() const { return text_; }
-    void SetText(const std::wstring& t) { text_ = t; cursorPos_ = (int)t.size(); selectionStart_ = selectionEnd_ = -1; ResetCaretBlink(); }
+    /* 同值直接跳过: v-model 每次打字后都会把同样的值写回来, 不能因此清掉
+     * 撤销历史、把光标甩到末尾 (build 333)。 */
+    void SetText(const std::wstring& t) {
+        if (t == text_) return;
+        text_ = t; cursorPos_ = (int)t.size(); selectionStart_ = selectionEnd_ = -1;
+        undo_.Clear(); ResetCaretBlink();
+    }
+    void SelectAll() { selectionStart_ = 0; selectionEnd_ = (int)text_.size(); cursorPos_ = selectionEnd_; undo_.BreakMerge(); }
+    /* build 340: 屏幕上画的文字。密码模式每个字符画成 '●', 长度同 Text()。 */
+    std::wstring DisplayText() const {
+        return password ? std::wstring(text_.size(), L'\x25CF') : text_;
+    }
     static UINT EffectiveCaretBlinkMs();
     void ResetCaretBlink();
     bool ShouldShowCaret() const;
@@ -284,6 +331,7 @@ public:
 
     bool focused = false;
     bool readOnly = false;
+    bool password = false;   /* build 340: 掩码显示, 不许复制 / 剪切 */
     std::function<bool(wchar_t)> inputFilter;
     int maxLength = -1;
 
@@ -296,7 +344,11 @@ private:
     float scrollX_ = 0;
     uint64_t caretBlinkStartTick_ = 0;
     bool dragging_ = false;
+    TextUndoHistory<TextEditSnap> undo_;
 
+    void RecordEdit(TextEditKind kind, bool isSpace = false);
+    bool UndoRedo(bool redo);       /* Ctrl+Z / Ctrl+Y: 恢复快照, 没得撤返 false */
+    void AfterEdit();               /* 光标闪烁 / 滚到可见 / onTextChanged */
     int CharIndexFromX(MeasureContext& measure, float x) const;
     void DeleteSelection();
     bool HasSelection() const { return selectionStart_ >= 0 && selectionEnd_ >= 0 && selectionStart_ != selectionEnd_; }
@@ -365,6 +417,11 @@ private:
     float pressX_ = 0, pressY_ = 0;
     float dragMx_ = 0, dragMy_ = 0;   // cursor pos during chip reorder (ghost)
     uint64_t caretBlinkStartTick_ = 0;
+    struct Snap { std::vector<Elem> elems; int caret = 0; int selAnchor = -1; };
+    TextUndoHistory<Snap> undo_;
+
+    void RecordEdit(TextEditKind kind, bool isSpace = false);
+    bool UndoRedo(bool redo);
 
     const std::wstring& ChipLabel(const std::wstring& key) const;
     float ChipFontSize() const;
@@ -441,6 +498,9 @@ private:
     float dragStartY_ = 0;
     float dragStartScroll_ = 0;
     bool wrap_ = true;            /* default: browser-like soft-wrap */
+    TextUndoHistory<TextEditSnap> undo_;
+    void RecordEdit(TextEditKind kind, bool isSpace = false);
+    bool UndoRedo(bool redo);
     static constexpr float kScrollBarWidth = 4.0f;
     static constexpr float kPad = 8.0f;       /* inner padding around text */
 
@@ -488,10 +548,19 @@ public:
         : items_(std::move(items)) { focusable = true; }
 
     int SelectedIndex() const { return selectedIndex_; }
-    void SetSelectedIndex(int i) { if (i >= 0 && i < (int)items_.size()) selectedIndex_ = i; }
+    // build 313: 越界的选中请求先记下 (requestedIndex_), 等 SetItems 把列表补够
+    // 再落上 —— 动态 <option v-for> 时宿主常先推选中项、后推列表。
+    void SetSelectedIndex(int i) {
+        requestedIndex_ = i;
+        if (i >= 0 && i < (int)items_.size()) selectedIndex_ = i;
+    }
     void SetItems(std::vector<std::wstring> items) {
         items_ = std::move(items);
-        if (selectedIndex_ >= (int)items_.size()) selectedIndex_ = items_.empty() ? -1 : 0;
+        if (requestedIndex_ >= 0 && requestedIndex_ < (int)items_.size()) {
+            selectedIndex_ = requestedIndex_;
+        } else if (selectedIndex_ >= (int)items_.size()) {
+            selectedIndex_ = items_.empty() ? -1 : 0;
+        }
     }
     const std::vector<std::wstring>& Items() const { return items_; }
 
@@ -547,6 +616,7 @@ private:
     std::vector<std::wstring> items_;
     std::vector<std::string>  i18nKeys_;   // L83: parallel to items_; "" = literal
     int selectedIndex_ = 0;
+    int requestedIndex_ = -1;   // build 313: 最近一次选中请求 (可暂时越界)
     int hoveredIndex_ = -1;
     int dropdownScrollIndex_ = 0;
     bool open_ = false;
@@ -581,12 +651,22 @@ private:
     int TabHitTest(float x, float y) const;
 };
 
+/* 拖影胶囊显示的文字 (build 306): 源是 Label 用它的文字; 是容器就取其内 (深度优先)
+ * 第一段可见的非空 Label 文字 —— 对齐 HTML 默认拖影 = 元素本身的样子, 不再把
+ * drag-data 这种机器载荷露给用户。都没有返回空, 由调用方退回载荷。 */
+UI_API std::wstring DragGhostText(const Widget* source);
+
 // ---- ScrollView ----
 class UI_API ScrollViewWidget : public Widget {
 public:
     void SetContent(WidgetPtr content);
 
     float ScrollY() const { return scrollY_; }
+    /* 可滚动的最大偏移 (内容不超出视口时为 0)。拖放贴边自动滚动用。 */
+    float MaxScrollY() const {
+        const float visible = rect.bottom - rect.top;
+        return contentHeight_ > visible ? contentHeight_ - visible : 0.0f;
+    }
     /* 走与鼠标滚动同一条纯偏移路径 (build 285) —— 此前只改字段不动 rect,
      * 内容要等下一次全局布局才归位, 长列表里那次布局就是每帧 O(n) 的来源。 */
     void SetScrollY(float y) {
@@ -657,6 +737,12 @@ public:
     EasingFunction GetEasingFunction() const { return selectAnim_.Easing(); }
 
     void UpdateAnimation();
+    bool AnimationActive() const override { return animating_; }
+    AnimTick TickAnimation() override {
+        if (!animating_) return {false, false};
+        UpdateAnimation();
+        return {true, animating_};
+    }
 
     void OnDraw(Renderer& r) override;
     bool OnMouseUp(const MouseEvent& e) override;
@@ -700,17 +786,36 @@ public:
 
     void UpdateAnimation();
     void UpdateCachedColors();
+    bool AnimationActive() const override { return animating_; }
+    AnimTick TickAnimation() override {
+        if (!animating_) return {false, false};
+        UpdateAnimation();
+        return {true, animating_};
+    }
 
     void OnDraw(Renderer& r) override;
+    bool OnMouseDown(const MouseEvent& e) override;
     bool OnMouseUp(const MouseEvent& e) override;
     bool OnMouseMove(const MouseEvent& e) override;
     D2D1_SIZE_F SizeHint() const override;
+    // 圆点滑动进度 0 (关) ~ 1 (开), 只读; 测试用来验证中途打断。
+    float SlideProgress() const { return anim_.Current(); }
 
 private:
     std::wstring text_;
     bool on_ = false;
     AnimatedFloat anim_{0.0f, 200.0f, EasingFunction::EaseOutCubic};
     bool animating_ = false;
+    /* 悬停 / 按下状态动画 (WinUI ToggleSwitch, 见 toggle_visual.h): 圆点宽高 +
+     * 轨道颜色强度, 83ms。appliedInteraction_ 是上次设过目标的状态 (Interaction
+     * 的整数值), 没变就不重设。 */
+    AnimatedFloat knobW_{12.0f, 83.0f, EasingFunction::FluentFastOutSlowIn};
+    AnimatedFloat knobH_{12.0f, 83.0f, EasingFunction::FluentFastOutSlowIn};
+    AnimatedFloat stateLevel_{0.0f, 83.0f, EasingFunction::FluentFastOutSlowIn};
+    int appliedInteraction_ = 0;
+    bool knobExtendRight_ = true;   // 按住时圆点朝哪边拉长 (按下那一刻的另一侧)
+    void SyncInteraction_();
+    void SampleAll_(uint64_t now);
 
     D2D1_COLOR_F CachedTrackColorOff_;
     D2D1_COLOR_F CachedTrackColorOn_;
@@ -737,7 +842,11 @@ public:
     void SetValue(float v, bool animate = true);
     // Set value without animation. Used by PageState mount-phase dispatch.
     void SetValueImmediate(float v) { targetValue_ = std::clamp(v, min_, max_); value_ = targetValue_; valueAnim_.SetImmediate(targetValue_); animating_ = false; }
-    void SetIndeterminate(bool v) { indeterminate_ = v; }
+    void SetIndeterminate(bool v) {
+        indeterminate_ = v;
+        framesHooked_ = false;
+        if (v) HookFrames_();
+    }
     bool IsIndeterminate() const { return indeterminate_; }
 
     void SetAnimationDuration(float durationMs) { valueAnim_.SetDuration(durationMs); }
@@ -747,6 +856,13 @@ public:
     EasingFunction GetEasingFunction() const { return valueAnim_.Easing(); }
 
     void UpdateAnimation();
+    // 不定进度一直要帧 (OnDraw 按时间画流动条)。
+    bool AnimationActive() const override { return animating_ || indeterminate_; }
+    AnimTick TickAnimation() override {
+        bool ticked = false;
+        if (animating_) { UpdateAnimation(); ticked = true; }
+        return {ticked, animating_ || indeterminate_};
+    }
 
     void OnDraw(Renderer& r) override;
     D2D1_SIZE_F SizeHint() const override;
@@ -756,6 +872,10 @@ private:
     AnimatedFloat valueAnim_;
     bool animating_ = false;
     bool indeterminate_ = false;
+    /* 不定进度已登记到所在窗口的心跳。设置时可能还没挂进窗口, 由 OnDraw 补登记;
+     * 登记会触发重绘, 只登记一次。 */
+    bool framesHooked_ = false;
+    void HookFrames_();
 
     friend class UiWindowImpl;
 };
@@ -788,6 +908,8 @@ public:
     void SetActive(bool on) {
         active_ = on;
         SyncInputCaptureState();
+        framesHooked_ = false;
+        if (on && showSpinner_) HookFrames_();
     }
     bool IsActive() const { return active_; }
 
@@ -797,8 +919,15 @@ public:
     }
     bool BlockInput() const { return blockInput_; }
 
-    void SetSpinner(bool on) { showSpinner_ = on; }
+    void SetSpinner(bool on) {
+        showSpinner_ = on;
+        framesHooked_ = false;
+        if (on && active_) HookFrames_();
+    }
     bool ShowSpinner() const { return showSpinner_; }
+    // 转圈靠 OnDraw 按时间画, 只要帧不推状态。
+    bool AnimationActive() const override { return active_ && showSpinner_; }
+    AnimTick TickAnimation() override { return {false, active_ && showSpinner_}; }
 
     void SetDismissOnClick(bool on) { dismissOnClick_ = on; }
     bool DismissOnClick() const { return dismissOnClick_; }
@@ -821,6 +950,8 @@ private:
     bool showSpinner_ = true;
     bool dismissOnClick_ = false;
     uint64_t spinnerTick_ = 0;
+    bool framesHooked_ = false;   // 转圈已登记到所在窗口的心跳 (同 ProgressBar)
+    void HookFrames_();
 };
 
 // ---- ImageView (zoomable, pannable image canvas) ----
@@ -886,6 +1017,9 @@ public:
     // Loading spinner
     void SetLoading(bool on);
     bool IsLoading() const { return loading_; }
+    // 加载转圈靠 OnDraw 按时间画, 只要帧不推状态。
+    bool AnimationActive() const override { return loading_; }
+    AnimTick TickAnimation() override { return {false, loading_}; }
 
     // Animation (GIF)
     bool IsAnimated() const;
@@ -966,9 +1100,10 @@ private:
 
     // Loading spinner
     bool loading_ = false;
-    float loadingAngle_ = 0.0f;
-    UINT_PTR loadingTimerId_ = 0;
-    static constexpr UINT_PTR kLoadingTimerId = 9998;
+    /* 已登记到所在窗口的动画心跳。SetLoading 时控件可能还没挂进窗口, 由 OnDraw 补登记;
+     * 登记本身会触发一次重绘, 所以只登记一次, 不能每帧都调。 */
+    bool loadingHooked_ = false;
+    void HookLoadingFrames_();
 
     // Tiled rendering mode
     struct TileBitmap {
@@ -994,7 +1129,6 @@ private:
     UINT_PTR animTimerId_ = 0;
     static constexpr UINT_PTR kAnimTimerId = 9997;
     static void CALLBACK AnimTimerProc(HWND, UINT, UINT_PTR id, DWORD);
-    static void CALLBACK LoadingTimerProc(HWND, UINT, UINT_PTR id, DWORD);
     void AdvanceFrame();
     void StartAnimation();
 };
@@ -1048,6 +1182,10 @@ public:
     // User-added widgets go into the "custom area" between title and caption buttons
     void AddCustomWidget(WidgetPtr w) { customWidgets_.push_back(w); AddChild(w); }
 
+    // 追加一个与 min/max/close 同款的控制按钮, 紧贴在最小化左侧;
+    // 多次调用依次往左排。custom widgets 排在它们左边。
+    WidgetPtr AddCaptionButton(const std::wstring& glyph);
+
     // The window pointer is set by UiWindowImpl to wire caption button actions
     void* windowHandle = nullptr;  // HWND, set externally
 
@@ -1077,6 +1215,8 @@ public:
 private:
     std::wstring title_;
     std::vector<WidgetPtr> customWidgets_;
+    std::vector<WidgetPtr> extraCaptionBtns_;  // AddCaptionButton, 先加的贴最小化
+    float captionLeft_ = 0;  // DoLayout 算出的控制按钮区左沿 (标题文字右界用)
 
     // Built-in caption buttons (created in constructor)
     WidgetPtr closeBtn_;
@@ -1105,8 +1245,20 @@ class UI_API CaptionButtonWidget : public Widget {
 public:
     std::wstring icon;
     bool isClose = false;
+    bool badge = false;   // 右上角红点 (扩展控制按钮用, 如"有更新")
+
+    // 非空时画 SVG (中心 kSvgBox 见方, currentColor 跟随前景色) 代替字形
+    void SetSvg(const std::string& svg) { svgContent_ = svg; svgParsed_ = false; svgIcon_ = SvgIcon{}; }
+    bool HasSvg() const { return !svgContent_.empty(); }
+    static constexpr float kSvgBox = 16.0f;
 
     void OnDraw(Renderer& r) override;
+
+private:
+    std::string svgContent_;
+    SvgIcon svgIcon_;
+    bool svgParsed_ = false;
+public:
 };
 
 // ---- CustomWidget (user-defined via C callbacks) ----
@@ -1225,6 +1377,17 @@ public:
     const std::wstring& HeaderText() const { return headerText_; }
 
     void UpdateAnimation();
+    // 展开高度每帧变: 要重排, 命中区域跟着变。
+    bool AnimationActive() const override { return animating_; }
+    AnimationInvalidation AnimationInvalidationFlags() const override {
+        return AnimationInvalidation::Paint | AnimationInvalidation::Layout |
+               AnimationInvalidation::HitTest;
+    }
+    AnimTick TickAnimation() override {
+        if (!animating_) return {false, false};
+        UpdateAnimation();
+        return {true, animating_};
+    }
 
     void OnDraw(Renderer& r) override;
     void DrawTree(Renderer& r) override;
@@ -1381,6 +1544,17 @@ public:
     float CompactPaneLength() const { return compactPaneLength_; }
 
     void UpdateAnimation();
+    // 侧栏宽度每帧变: 要重排, 命中区域跟着变。
+    bool AnimationActive() const override { return animating_; }
+    AnimationInvalidation AnimationInvalidationFlags() const override {
+        return AnimationInvalidation::Paint | AnimationInvalidation::Layout |
+               AnimationInvalidation::HitTest;
+    }
+    AnimTick TickAnimation() override {
+        if (!animating_) return {false, false};
+        UpdateAnimation();
+        return {true, animating_};
+    }
 
     void OnDraw(Renderer& r) override;
     void DrawTree(Renderer& r) override;

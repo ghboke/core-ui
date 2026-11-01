@@ -9,6 +9,7 @@
 #include <dwrite_2.h>   /* IDWriteFontFallback / Builder (DWrite 1.2+) */
 #include <dwrite_3.h>   /* IDWriteTextFormat3 (DWrite 1.3+, Win10) */
 #include <wincodec.h>
+#include "exit_safe_com.h"
 #include <wrl/client.h>
 #include <string>
 #include <memory>
@@ -22,6 +23,8 @@
 using Microsoft::WRL::ComPtr;
 
 namespace ui {
+
+class LayeredFrameBuffer;
 
 // Parsed SVG icon (cached geometry for efficient rendering)
 struct SvgPathLayer {
@@ -62,18 +65,67 @@ public:
     // Use externally-owned factories (DLL shared mode)
     bool Init(ID2D1Factory1* factory, IDWriteFactory* dwFactory, IWICImagingFactory* wicFactory);
 
-    bool CreateRenderTarget(HWND hwnd);
+    /* ---- 离屏绘制 (烧录用) ----------------------------------------------
+     * 把本 Renderer 绑到一张 width×height 的 BGRA premultiplied 位图上, DPI
+     * 固定 96 —— 所以绘制坐标就是**像素**, 不是 DIP。Begin 内部已完成
+     * BeginDraw + 清成全透明, 之后照常调任意绘制方法, 最后 EndOffscreen
+     * 回读像素。
+     *
+     * 刻意**不复用**全局共享 D2D 设备, 而是自建一套: 共享设备由一把全局互斥
+     * (SharedD2DGuard) 保护, 跨 Begin/End 持锁会挡住整个 UI 的渲染, 且宿主
+     * 若在绘制回调里发起烧录就直接死锁 (非递归 mutex)。烧录是低频的用户
+     * 操作, 多花一次建设备的钱换零死锁风险, 还能整个丢到 worker 线程。
+     *
+     * 约束: Begin 与 End 必须同一线程 (D2D 单线程工厂); 不可嵌套; 该线程
+     * 需已 CoInitialize (WIC 走 COM)。 */
+    bool BeginOffscreen(uint32_t width, uint32_t height);
+    /* 结束并回读到 outBgra (至少 height*stride 字节)。stride=0 视作 width*4。
+     * 无论成败都会解绑并释放离屏资源。 */
+    bool EndOffscreen(uint8_t* outBgra, uint32_t stride);
+    bool IsOffscreen() const { return offscreenTarget_ != nullptr; }
+    /* 释放进程内复用的离屏设备 (ui_shutdown 时调)。设备是懒建的, 下次
+     * BeginOffscreen 会重新建。 */
+    static void ReleaseOffscreenDevice();
+    /* 释放全局共享的 D3D/D2D 设备 (含未被收割的预热设备), ui_shutdown 时调。
+     * 必须在所有窗口销毁之后、进程退出之前 —— 拖到 DLL 卸载才释放会让 DXGI
+     * 抛 0x87A (宿主"关闭即已停止工作")。 */
+    static void ReleaseSharedDevice();
+
+    /* copyModel: 复制模式 (bitblt) 交换链, 给程序频繁改窗口尺寸的 canvas 模式用;
+     * 默认 flip model。 */
+    bool CreateRenderTarget(HWND hwnd, bool copyModel = false);
     // Composition-mode RT for transparent/layered windows (popup menus,
     // tooltips). Builds a SwapChainForComposition with premultiplied alpha
     // and binds it via DirectComposition so per-pixel alpha is honored on
     // the desktop without WS_EX_LAYERED's GDI bottleneck. Anti-aliased
     // round corners come from D2D's normal FillRoundedRectangle path.
     bool CreateRenderTargetForLayered(HWND hwnd);
+    /* 分层窗口 (WS_EX_LAYERED + UpdateLayeredWindow) 目标: 画到离屏 D2D 位图,
+     * EndDraw 后读回进 buffer 的后台缓冲并 Publish(frameGeneration)。不建交换链,
+     * 也不碰窗口 —— 提交 (ULW) 由窗口所属的 UI 线程调 buffer->Commit。
+     * 见 layered_frame.h。 */
+    bool CreateRenderTargetUlw(HWND hwnd, std::shared_ptr<LayeredFrameBuffer> buffer);
+    bool IsUlwTarget() const { return ulwBuffer_ != nullptr; }
     void ReleaseRenderTarget();
     void Resize(UINT width, UINT height);
     void BeginDraw();
     HRESULT EndDraw();
     HRESULT PresentPrepared(bool skipVSync);
+    /* 交帧限速 (build 338): flip model 窗口交换链帧延迟设 1, 带可等待对象。渲染线程
+     * 画下一帧前先拿"交帧名额" —— 上一帧被系统取走 (下一次刷新) 才有, 所以不管上层
+     * 请求多少次, 每次刷新最多交一帧, 系统队列里不积压。名额拿到后一直留到真正
+     * Present 为止 (隐藏窗口画了不交, 名额留给下一帧, 不会丢)。
+     * 没有可等待对象 (复制模式 / 合成 / ULW) 时恒有名额。 */
+    bool TryAcquireFrameSlot();
+    /* 等名额的上限: 比最慢的常见刷新 (30Hz) 再多一点。等不到说明系统没在取帧
+     * (窗口刚被遮挡 / 驱动异常), 照画照交, 不让窗口卡死。 */
+    static constexpr DWORD kFrameSlotWaitMs = 40;
+    /* 名额未持有时可等的对象, 否则 nullptr。等到 (WAIT_OBJECT_0) 后调 MarkFrameSlotHeld。 */
+    HANDLE FrameSlotWaitable() const {
+        return frameSlotHeld_ ? nullptr : frameLatencyWaitable_;
+    }
+    void MarkFrameSlotHeld() { frameSlotHeld_ = true; }
+    void TraceDwmProbePresent(HRESULT hr, bool prepared);
     HRESULT SetSwapChainBackgroundColor(const D2D1_COLOR_F& color);
     void FlushAndTrimGpu();
 
@@ -87,6 +139,9 @@ public:
     // settle and stop re-invalidating (else a WM_PAINT flood). Auto-reset each
     // EndDraw.
     bool skipPresent = false;
+
+    /* ULW 目标: 下一次 EndDraw 读回后 Publish 用的帧号 (调用方每帧设)。 */
+    uint64_t frameGeneration = 0;
 
     void Clear(const D2D1_COLOR_F& color);
     void SetDisplayListRecorder(DisplayListRecorder* recorder);
@@ -120,9 +175,23 @@ public:
     void FillRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, const D2D1_COLOR_F& color);
     bool DrawBlurredRoundedRect(const D2D1_RECT_F& rect, float rx, float ry,
                                 float blurRadius, const D2D1_COLOR_F& color);
-    void DrawRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color, float width = 1.0f);
+    /* dash: 0=实线 1=虚线 2=点线 3=点划线。虚线的段长是**描边宽度的倍数**
+     * (D2D 语义), 所以线越粗段越长, 且在缩放变换下与线宽同步缩放。 */
+    void DrawRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color, float width = 1.0f,
+                  int dash = 0);
+    /* 椭圆 (含正圆)。入参是**外接矩形**, 内部换算成 D2D1_ELLIPSE 的圆心+半径
+     * —— 调用方 (拖框画圆 / CSS 盒模型) 手上都是矩形, 换算放一处不到处重复。 */
+    void FillEllipse(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color);
+    void DrawEllipse(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color, float width = 1.0f,
+                     int dash = 0);
     void DrawRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, const D2D1_COLOR_F& color, float width = 1.0f);
-    void DrawLine(float x1, float y1, float x2, float y2, const D2D1_COLOR_F& color, float width = 1.0f);
+    void DrawLine(float x1, float y1, float x2, float y2, const D2D1_COLOR_F& color,
+                  float width = 1.0f, int dash = 0);
+    /* 折线 —— 一个 PathGeometry 整条描边, 圆头圆角线型。铅笔笔迹必须走这条:
+     * 逐段 DrawLine 在转折处会露缺口, 半透明色还会在接头叠深, 且命令数是
+     * 点数量级。count < 2 直接返回。closed=true 首尾相连。 */
+    void DrawPolyline(const D2D1_POINT_2F* pts, size_t count,
+                      const D2D1_COLOR_F& color, float width, bool closed, int dash = 0);
     void DrawText(const std::wstring& text, const D2D1_RECT_F& rect, const D2D1_COLOR_F& color,
                   float fontSize, DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING,
                   DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL,
@@ -211,7 +280,13 @@ public:
     void RecordImage(ResourceKey key, const D2D1_RECT_F& destRect,
                      ImageSampling sampling, float opacity = 1.0f);
     void DrawImageResource(ResourceKey key, const D2D1_RECT_F& destRect,
-                           ImageSampling sampling, float opacity = 1.0f);
+                           ImageSampling sampling, float opacity = 1.0f,
+                           CompositeMode composite = CompositeMode::SourceOver);
+    /* 按指定合成方式画位图 (build 344)。DrawBitmap 走 primitive blend, 只有
+     * source-over / copy 两种; 别的合成方式只能走 ID2D1DeviceContext::DrawImage。
+     * DrawImage 没有目标矩形参数, 靠临时叠一个"位图 → destRect"的矩阵对齐。 */
+    void DrawBitmapComposite(ID2D1Bitmap* bitmap, const D2D1_RECT_F& destRect,
+                             ImageSampling sampling, CompositeMode composite);
     void FillRectWithImagePattern(ResourceKey key, ID2D1Bitmap* bitmap, const D2D1_RECT_F& rect);
     void FillGradientRect(GradientRef gradient, const D2D1_RECT_F& rect, float radius);
     void RecordSvgDocument(std::vector<SvgDocumentRef::Step> steps,
@@ -253,6 +328,12 @@ public:
     void PopOpacity();
     void PushTransform(const D2D1_MATRIX_3X2_F& transform);
     void PopTransform();
+    /* 透明图层 (build 344): 之间的内容画进独立的透明中间层, Pop 时整张
+     * source-over 合回去。层里用 CompositeMode::DestinationOut 挖洞只清层内
+     * 内容。层内 ClearType 文字临时改灰度: ClearType 要求背景不透明, 在透明
+     * 层里会画糊 (见 PushRoundedClip 的 L25 注释)。必须与 PopLayer 成对。 */
+    void PushLayer();
+    void PopLayer();
     void ReplayDisplayList(const DisplayList& list);
 
     // SVG icon support
@@ -321,6 +402,15 @@ public:
 
     // 应用当前文字渲染模式到 ctx_（在 BeginDraw 之前调用或 CreateRenderTarget 后立即调用）
     void ApplyTextRenderMode();
+    // build 314: 强制按当前全局字体 / 排版区域 / 渲染模式刷新 (清 TextFormat 缓存 +
+    // 重建回退字体链 + 重新应用渲染模式)。平时不必调: GetTextFormat / BeginDraw 会
+    // 发现全局 generation 变了自动刷新 —— 只能在本 Renderer 所属线程上调用。
+    void RefreshTextResources();
+    // 实际生效的排版区域: 全局 ui_theme_set_text_locale > 系统区域。
+    const wchar_t* TextLocaleName() const;
+    // 按当前默认字体 (family=nullptr) / 排版区域 / 回退链取 TextFormat (有缓存)。
+    ComPtr<IDWriteTextFormat> GetTextFormat(float fontSize, const wchar_t* family = nullptr,
+                                            DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL);
 
 private:
     /* 视口剔除矩形栈 (build 285). 嵌套 ScrollView 时取交集 —— 内层只可能比
@@ -381,9 +471,11 @@ private:
     IDWriteFactory*     dwFactory_  = nullptr;
     IWICImagingFactory* wicFactory_ = nullptr;
 
-    // D3D11/D2D 设备（全局共享，首个窗口创建时初始化）
-    static ComPtr<ID3D11Device>  s_d3dDevice;
-    static ComPtr<ID2D1Device>   s_d2dDevice;
+    // D3D11/D2D 设备（全局共享，首个窗口创建时初始化）。ui_shutdown 经
+    // ReleaseSharedDevice 显式释放; ExitLeakComPtr 保证退出阶段的静态析构
+    // 不再 Release (那时碰 DXGI 会抛 0x87A, 见 exit_safe_com.h)。
+    static ExitLeakComPtr<ID3D11Device>  s_d3dDevice;
+    static ExitLeakComPtr<ID2D1Device>   s_d2dDevice;
     static int                   s_deviceRefCount;
     bool EnsureSharedDevice();
     bool AcquireSharedDeviceRef();
@@ -407,26 +499,46 @@ private:
      * 同对象多接口，不增加实际资源，仅提供 SVG 等 1607+ API 的入口。*/
     ComPtr<ID2D1DeviceContext5> ctx5_;
     ComPtr<IDXGISwapChain1>    swapChain_;
+    bool                       copyModel_ = false;   /* swapChain_ 是复制模式 */
+    UINT                       swapChainFlags_ = 0;  /* 建链时的 Flags, ResizeBuffers 要原样带上 */
+    HANDLE                     frameLatencyWaitable_ = nullptr;   /* 见 TryAcquireFrameSlot */
+    bool                       frameSlotHeld_ = false;
     ComPtr<ID2D1Bitmap1>       targetBitmap_;
     HWND                       hwnd_ = nullptr;
+    /* 离屏绘制状态 (BeginOffscreen 期间非空)。设备本身是进程内复用的,
+     * 见 renderer.cpp 里的 g_offscreen* —— 跟窗口渲染那套共享设备无关。 */
+    ComPtr<ID2D1Bitmap1>       offscreenTarget_;
+    uint32_t                   offscreenW_ = 0;
+    uint32_t                   offscreenH_ = 0;
+    bool ReadbackOffscreen(uint8_t* outBgra, uint32_t stride);
     bool                       hasSharedDeviceRef_ = false;
     DWORD                      targetThreadId_ = 0;
     std::vector<D2D1_MATRIX_3X2_F> transformStack_;
+    /* PushLayer 时保存的文字抗锯齿模式, PopLayer 恢复。 */
+    std::vector<D2D1_TEXT_ANTIALIAS_MODE> layerTextAaStack_;
     // DirectComposition objects — only populated for layered/composition
     // mode (CreateRenderTargetForLayered). Held alive so the visual tree
     // stays bound to the hwnd; destruction order is automatic via ComPtr.
     ComPtr<IUnknown>           dcompDevice_;
     ComPtr<IUnknown>           dcompTarget_;
     ComPtr<IUnknown>           dcompVisual_;
+    /* ULW 目标 (CreateRenderTargetUlw): targetBitmap_ 是离屏 TARGET 位图,
+     * ulwReadback_ 是同尺寸 CPU_READ 位图, 读回经它拷进 ulwBuffer_。 */
+    std::shared_ptr<LayeredFrameBuffer> ulwBuffer_;
+    ComPtr<ID2D1Bitmap1>       ulwReadback_;
+    bool CreateUlwBitmaps(UINT width, UINT height, UINT dpi);
+    HRESULT PublishUlwFrame();
     std::unordered_map<ColorKey, ComPtr<ID2D1SolidColorBrush>, ColorKeyHash> brushCache_;
     std::unordered_map<TextFormatKey, ComPtr<IDWriteTextFormat>, TextFormatKeyHash> textFormatCache_;
+    /* 线型缓存 [dash 0..3][0=默认平头斜接, 1=圆头圆角]。
+     * dash: 0=实线 1=虚线 2=点线 3=点划线 (D2D1_DASH_STYLE 的前四种)。
+     * dash=0 且非圆头时返回 nullptr —— 那就是 D2D 默认线型, 不必建对象。 */
+    ComPtr<ID2D1StrokeStyle> strokeStyles_[4][2];
+    ID2D1StrokeStyle* GetStrokeStyle(int dash, bool round);
     /* SVG 描边图标共用一个 round-cap/round-join 风格，避免锐角处出尖刺 */
-    ComPtr<ID2D1StrokeStyle> roundStrokeStyle_;
     ID2D1StrokeStyle* GetRoundStrokeStyle();
 
     ComPtr<ID2D1SolidColorBrush> GetBrush(const D2D1_COLOR_F& color);
-    ComPtr<IDWriteTextFormat> GetTextFormat(float fontSize, const wchar_t* family = nullptr,
-                                            DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL);
     ComPtr<ID2D1Bitmap> GetCachedImageBitmap(ResourceKey key);
     void PruneImageBitmapCacheTo(const std::vector<ImageRef>& imageRefs);
     void DebugAssertTargetThread(const char* op) const;
@@ -449,6 +561,11 @@ private:
     // 构造后由 Apply... 在 TextFormat3 上 SetFontFallback。
     ComPtr<IDWriteFontFallback> fontFallback_;
     void RebuildFontFallback();
+
+    // build 314: 全局文字设置的本线程快照 + 已应用的 generation。
+    theme::TextSettings textSettings_;
+    uint64_t            textSettingsGen_ = 0;
+    void EnsureTextSettingsCurrent();
 };
 
 } // namespace ui

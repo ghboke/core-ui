@@ -41,6 +41,9 @@ public:
     void SetImmediate(float value);
     void Retarget(float value);
     void Retarget(float value, const AnimationSpec& spec);
+    // 只这一程的时长乘 durationScale (夹在 (0, 1]), 设定的 Duration() 不变。
+    // 中途掉头时按剩余距离缩短用, 否则掉头走一小段也要整程时长, 显得发粘。
+    void RetargetScaled(float value, float durationScale);
     void SetTarget(float value) { Retarget(value); }
     void SetIdleTarget(float value);
     float Sample(uint64_t now);
@@ -51,11 +54,15 @@ public:
     void SetEasing(EasingFunction easing) { spec_.easing = easing; }
     EasingFunction Easing() const { return spec_.easing; }
 
+    // 调试慢放: 所有 AnimatedFloat 的时长乘这个倍数, 夹在 [1, 20]。
+    static void SetGlobalTimeScale(float factor);
+
 private:
     float current_ = 0.0f;
     float target_ = 0.0f;
     float start_ = 0.0f;
     AnimationSpec spec_{};
+    float runScale_ = 1.0f;   // 当前这一程的时长比例, 每次重定向都会重设
     uint64_t startTick_ = 0;
     bool active_ = false;
 };

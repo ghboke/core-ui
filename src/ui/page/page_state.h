@@ -8,6 +8,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -34,6 +35,12 @@ public:
     // diff-bisecting and source compatibility.
     static void SetGlobalUseQuickJS(bool v);
     static bool GetGlobalUseQuickJS();
+
+    // ui_page_watch (build 304): 状态 name 的值变化时回调 (name, 新值 JSON)。
+    // 同一 name 只留一个; cb 为空即取消。热重载后自动重新挂上。
+    // 不要在回调里取消同一个监听 (回调运行在该监听的 effect 里)。
+    using WatchCallback = std::function<void(const std::string& name, const std::string& json)>;
+    void Watch(const std::string& name, WatchCallback cb);
 
     // Called by ui_page_open_window after window creation; wires <menu>
     // triggers + <menuitem onclick> dispatchers that need the HWND.
@@ -65,6 +72,23 @@ public:
     void SetLocale(const std::string& locale);
     const std::string& CurrentLocale() const { return currentLocale_; }
     std::string Translate(const std::string& key) const;
+
+    // ---- build 316: 宿主按 key 设的文字 (ui_page_bind_* / ui_page_set_text_key) ----
+    // 绑定时立即按当前 locale 翻译; SetLocale 时统一重译。参数替换 {0} {1} …,
+    // 以 "@" 开头的参数本身也按 key 翻译 ("@@" 开头 = 字面的 "@")。
+    enum class TextSlot { Text, Tooltip, TitlebarTitle };
+    struct KeyText {
+        std::string               key;
+        std::vector<std::wstring> args;
+    };
+    std::wstring FormatKeyText(const KeyText& t) const;
+    void BindWidgetText(const WidgetPtr& w, TextSlot slot, KeyText t);
+    bool UnbindWidgetText(Widget* w, TextSlot slot);
+    void BindComboItems(const WidgetPtr& w, std::vector<std::string> keys);
+    void BindWindowTitle(uint64_t win, KeyText t);
+    bool UnbindWindowTitle(uint64_t win);
+    void SetTextKey(const std::string& name, KeyText t);
+    bool UnbindTextVar(const std::string& name);
 
     // Errors (compile + runtime).
     const std::vector<std::string>& Errors() const { return errors_; }
@@ -105,6 +129,19 @@ private:
     std::string  currentLocale_;
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> i18nTables_;
 
+    // build 316: key 绑定。控件用 weak_ptr —— 被 v-if / 宿主销毁后自动失效。
+    struct WidgetTextBinding {
+        std::weak_ptr<Widget> widget;
+        TextSlot              slot = TextSlot::Text;
+        KeyText               text;
+    };
+    std::vector<WidgetTextBinding>              widgetTextBindings_;
+    std::unordered_map<uint64_t, KeyText>       windowTitleBindings_;
+    std::unordered_map<std::string, KeyText>    textVarBindings_;
+    void ApplyWidgetText(Widget* w, TextSlot slot, const std::wstring& text);
+    void ApplyWindowTitle(uint64_t win, const std::wstring& text);
+    void ReapplyKeyTexts();
+
     // ---- QuickJS path state ----
     void AttachQuickJS(CompiledPage page);
     void DetachQuickJS();
@@ -117,6 +154,10 @@ private:
     void WireQuickJSModelWrite(Widget* target, const std::string& propName);
     void WireQuickJSEvent(Widget* target, const std::string& evName,
                            const std::string& sourceJs);
+    // DOM 事件名 → widget hook 的唯一分派表, 顶层与 v-for 行共用。invoke
+    // 借用 $event (不接管所有权)。返回 false = 不支持的事件名。
+    bool BindDomEvent(Widget* target, const std::string& evName,
+                      std::function<void(JSValue)> invoke);
     void DispatchQuickJSResize(int width, int height);
     void ApplyBindingToWidget(Widget* w, const std::string& property,
                                const ui::expr::Value& v);
@@ -195,8 +236,37 @@ private:
      *         空 vector 表示顶层 (无 loop scope). */
     void PopulateMenu(ContextMenu* menu, const CompiledMenu& cm,
                        const std::vector<std::pair<std::string, JSValue>>& locals);
+    void PopulateMenuItems(ContextMenu* menu, const std::vector<CompiledMenuItem>& items,
+                            const std::vector<std::pair<std::string, JSValue>>& locals);
     void PopulateMenuItem(ContextMenu* menu, const CompiledMenuItem& mi,
                            const std::vector<std::pair<std::string, JSValue>>& locals);
+    /* build 303: 每次 populate 按当前迭代算出这一项的身份 (:id / :data-* 与
+     * 内部数字 id)。循环里的项不再共用编译期的那一份。 */
+    std::vector<std::pair<std::string, std::string>> ResolveMenuItemAttrs(
+        const CompiledMenuItem& mi,
+        const std::vector<std::pair<std::string, JSValue>>& locals,
+        std::string& strId);
+    int ResolveMenuItemNumericId(const CompiledMenuItem& mi, const std::string& strId,
+                                 const std::vector<std::pair<std::string, JSValue>>& locals,
+                                 const ContextMenu& menu);
+    static constexpr int kDynamicMenuIdBase = 0x40000000;
+    /* build 303: <menuitem @click> 编译成绑定了本行迭代变量的动作, 随点击载荷走。 */
+    std::function<void()> MakeMenuItemAction(
+        const std::string& sourceJs,
+        const std::vector<std::pair<std::string, JSValue>>& locals);
+    /* JS runtime 存活令牌: AttachQuickJS 建, DetachQuickJS 放。菜单动作等可能
+     * 比 runtime 活得久的持有者用 weak_ptr 判断还能不能碰 JS 值。 */
+    std::shared_ptr<char> jsAlive_;
+
+    struct HostWatch {
+        std::string name;
+        WatchCallback cb;
+        std::string last;       // 上次通知 (或初值) 的 JSON
+        bool primed = false;    // 首次运行只记初值, 不通知
+        uint64_t effectId = 0;
+    };
+    std::vector<std::unique_ptr<HostWatch>> watches_;   // 跨热重载保留
+    void InstallWatch(HostWatch& w);
     /* Eval bound expr against jsState_ + optional loop-scope locals.
      * 调用方 JS_FreeValue 返回值. 失败/无 JS state 返 JS_UNDEFINED. */
     JSValue EvalBoundExpr(const std::string& rawExpr,
@@ -218,6 +288,11 @@ private:
      * 碰到 mi.submenu 时通过它找到对应的持久 ContextMenu (submenu shell 在
      * WireSubtreeMenus 时已建好, 每次 parent rebuild 用同一个 sub 句柄). */
     std::unordered_map<const CompiledMenu*, ContextMenu*> compiledToMenu_;
+    /* build 343: 建页面 (也就是建 QuickJS 运行时) 的线程。菜单 beforeShowHook
+     * 只在这个线程上重建 —— 子菜单悬停展开走 popup 的 WM_TIMER, 跑在
+     * OverlayService 线程, 那里不能碰 JS; 子菜单内容改由父菜单 populate 时
+     * 在本线程一并填好。 */
+    std::thread::id ownerThread_ = std::this_thread::get_id();
     struct TriggerSpec {
         Widget*      triggerElement = nullptr;
         ContextMenu* menu = nullptr;
@@ -225,7 +300,6 @@ private:
     };
     std::vector<TriggerSpec> triggers_;
     uint64_t winHandle_ = 0;
-    std::unordered_map<std::string, std::string> menuItemHandlers_;  // strId → @click JS method
     mutable std::unordered_map<std::string, uint64_t> menuHandleCache_;
 };
 

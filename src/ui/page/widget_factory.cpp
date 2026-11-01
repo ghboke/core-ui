@@ -1278,7 +1278,9 @@ WidgetPtr ConstructInput(const ui::uix::Node& node, const std::string& text) {
             break;
         }
     }
-    return std::make_shared<TextInputWidget>(ph);
+    auto ti = std::make_shared<TextInputWidget>(ph);
+    ti->password = (type == "password");   /* build 340 */
+    return ti;
 }
 
 }  // namespace
@@ -1320,6 +1322,13 @@ WidgetPtr BuildWidget(const ui::uix::Node& node, const ui::css::ComputedStyle& s
             }
             else if (a.name == "drop-target" || a.name == "dropTarget") {
                 w->dropTarget = ParseBoolAttr(a.rawValue);
+            }
+            /* build 323: 静态 visible 建控件时就生效。以前不认 (默认可见), 宿主要在
+             * 建窗前逐个 set_visible(0) 补救, 漏一个首帧就闪一下。只认明确的假值,
+             * 其余 (含空值) 保持默认可见; :visible / v-show 是绑定, 不走这里。 */
+            else if (a.name == "visible") {
+                const std::string& v = a.rawValue;
+                if (v == "false" || v == "0" || v == "no") w->visible = false;
             }
             // For text-like widgets: value attribute for input, alt for img, etc. — skipped in v0
         }

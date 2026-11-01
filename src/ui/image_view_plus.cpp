@@ -1,7 +1,9 @@
 #include "image_view_plus.h"
+#include "anim_clock.h"
 #include "event.h"
 #include "resource_store.h"
 #include "theme.h"
+#include "ui_context.h"
 #include <algorithm>
 #include <unordered_map>
 #include <cstring>
@@ -10,7 +12,6 @@
 namespace ui {
 
 // ========= 全局 timer 映射（Win32 SetTimer 要求静态回调，通过 id → this）=========
-static std::unordered_map<UINT_PTR, ImageViewPlusWidget*> g_loadingMap;
 static std::unordered_map<UINT_PTR, ImageViewPlusWidget*> g_animMap;
 
 // forward decl —— 声明在 controls.cpp 里（已有 DrawSpinner / ConstrainPan 通用实现可复用，
@@ -28,11 +29,6 @@ ImageViewPlusWidget::~ImageViewPlusWidget() {
     StopAnimation();
     if (checkerTileResourceKey_.IsValid()) {
         GlobalResourceStore().Remove(checkerTileResourceKey_);
-    }
-    if (loadingTimerId_) {
-        KillTimer(nullptr, loadingTimerId_);
-        g_loadingMap.erase(loadingTimerId_);
-        loadingTimerId_ = 0;
     }
 }
 
@@ -220,9 +216,8 @@ void ImageViewPlusWidget::OnDraw(Renderer& r) {
         float cx = (rect.left + rect.right) / 2;
         float cy = (rect.top + rect.bottom) / 2;
         auto col = theme::kAccent(); col.a = 0.8f;
-        DrawSpinner(r, cx, cy, 20.0f, loadingAngle_, col, 2.5f);
-        loadingAngle_ += 8.0f;
-        if (loadingAngle_ >= 360.0f) loadingAngle_ -= 360.0f;
+        DrawSpinner(r, cx, cy, 20.0f, SpinnerAngleDeg(AnimNowMs()), col, 2.5f);
+        HookLoadingFrames_();   // SetLoading 时还没挂进窗口: 这里补登记一次
         return;
     }
 
@@ -470,22 +465,54 @@ void ImageViewPlusWidget::DrawCropOverlay(Renderer& r) {
 
 // ========= 坐标映射 =========
 
+/* ix/iy 一律是**原图坐标** (不含旋转)。中间量 u/v 是旋转后坐标 —— dest rect
+ * 描述的是旋转后的图 (ComputeDestRect 用 ImageWidth/Height, 那两个在 90/270
+ * 时是交换过的)。早前这里直接拿 u/v 当原图坐标并除以未旋转的 source_->Width(),
+ * 90/270 下两条轴对不上, 是错的; 现在补齐四个角度并加空图守卫。 */
 void ImageViewPlusWidget::ImageToScreen(float ix, float iy,
                                          float& sx, float& sy) const {
-    auto d = ComputeDestRect();
-    float iw = (float)source_->Width();
-    float ih = (float)source_->Height();
-    // 简化：不考虑 rotation（Crop 基本都在 rotation=0 下用）
-    sx = d.left + ix / iw * (d.right - d.left);
-    sy = d.top  + iy / ih * (d.bottom - d.top);
+    sx = sy = 0.0f;
+    if (!source_) return;
+    const float w = (float)source_->Width();
+    const float h = (float)source_->Height();
+    const float rw = (float)ImageWidth();
+    const float rh = (float)ImageHeight();
+    if (w <= 0.0f || h <= 0.0f || rw <= 0.0f || rh <= 0.0f) return;
+
+    float u = ix, v = iy;
+    switch (rotation_) {
+        case 90:  u = h - iy; v = ix;     break;
+        case 180: u = w - ix; v = h - iy; break;
+        case 270: u = iy;     v = w - ix; break;
+        default: break;
+    }
+    const auto d = ComputeDestRect();
+    sx = d.left + u / rw * (d.right - d.left);
+    sy = d.top  + v / rh * (d.bottom - d.top);
 }
 void ImageViewPlusWidget::ScreenToImage(float sx, float sy,
                                          float& ix, float& iy) const {
-    auto d = ComputeDestRect();
-    float iw = (float)source_->Width();
-    float ih = (float)source_->Height();
-    ix = (sx - d.left) / (d.right - d.left) * iw;
-    iy = (sy - d.top)  / (d.bottom - d.top) * ih;
+    ix = iy = 0.0f;
+    if (!source_) return;
+    const float w = (float)source_->Width();
+    const float h = (float)source_->Height();
+    const float rw = (float)ImageWidth();
+    const float rh = (float)ImageHeight();
+    if (w <= 0.0f || h <= 0.0f || rw <= 0.0f || rh <= 0.0f) return;
+
+    const auto d = ComputeDestRect();
+    const float dw = d.right - d.left;
+    const float dh = d.bottom - d.top;
+    if (dw <= 0.0f || dh <= 0.0f) return;
+
+    const float u = (sx - d.left) / dw * rw;
+    const float v = (sy - d.top)  / dh * rh;
+    switch (rotation_) {
+        case 90:  ix = v;     iy = h - u; break;
+        case 180: ix = w - u; iy = h - v; break;
+        case 270: ix = w - v; iy = u;     break;
+        default:  ix = u;     iy = v;     break;
+    }
 }
 
 // ========= Loading spinner =========
@@ -493,22 +520,16 @@ void ImageViewPlusWidget::ScreenToImage(float sx, float sy,
 void ImageViewPlusWidget::SetLoading(bool on) {
     if (loading_ == on) return;
     loading_ = on;
-    if (on) {
-        loadingTimerId_ = SetTimer(nullptr, 0, 16, LoadingTimerProc);
-        if (loadingTimerId_) g_loadingMap[loadingTimerId_] = this;
-    } else {
-        if (loadingTimerId_) {
-            KillTimer(nullptr, loadingTimerId_);
-            g_loadingMap.erase(loadingTimerId_);
-            loadingTimerId_ = 0;
-        }
-    }
-    InvalidateAllWindows();
+    loadingHooked_ = false;
+    /* 转圈由所在窗口的动画心跳驱动, 跟 ImageViewWidget 同一套 (见 HookLoadingFrames_)。 */
+    if (on) HookLoadingFrames_();
+    else    InvalidateAllWindows();
 }
 
-void CALLBACK ImageViewPlusWidget::LoadingTimerProc(HWND, UINT, UINT_PTR id, DWORD) {
-    auto it = g_loadingMap.find(id);
-    if (it != g_loadingMap.end()) it->second->InvalidateAllWindows();
+void ImageViewPlusWidget::HookLoadingFrames_() {
+    if (loadingHooked_ || !GetContext().FindWindowByWidget(this)) return;
+    loadingHooked_ = true;
+    GetContext().RegisterAnimatingWidget(this);
 }
 
 // ========= 动画 =========

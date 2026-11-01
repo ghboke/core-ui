@@ -98,7 +98,7 @@ function getRelatedApiFunctions(controlName: string) {
     "RadioButton": ["ui_radio_button", "ui_radio_get_selected", "ui_radio_set_selected"],
     "Toggle": ["ui_toggle", "ui_toggle_get_on", "ui_toggle_set_on", "ui_toggle_on_changed"],
     "Slider": ["ui_slider", "ui_slider_get_value", "ui_slider_set_value", "ui_slider_on_changed"],
-    "TextInput": ["ui_text_input", "ui_text_input_get_text", "ui_text_input_set_text", "ui_text_input_set_read_only"],
+    "TextInput": ["ui_text_input", "ui_text_input_get_text", "ui_text_input_set_text", "ui_text_input_set_read_only", "ui_text_input_set_password", "ui_text_input_select_all"],
     "TextArea": ["ui_text_area", "ui_text_area_get_text", "ui_text_area_set_text", "ui_text_area_set_read_only"],
     "ComboBox": ["ui_combobox", "ui_combobox_get_selected", "ui_combobox_set_selected", "ui_combobox_on_changed"],
     "ProgressBar": ["ui_progress_bar", "ui_progress_get_value", "ui_progress_set_value"],

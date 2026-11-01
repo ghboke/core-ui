@@ -1,4 +1,5 @@
 #include "easing.h"
+#include "menu_open_motion.h"
 
 #include <algorithm>
 #include <cmath>
@@ -56,6 +57,8 @@ float ApplyEasing(EasingFunction func, float t) {
             t -= 2.625f/2.75f;
             return 7.5625f * t * t + 0.984375f;
         }
+        case EasingFunction::FluentFastOutSlowIn:
+            return static_cast<float>(menumotion::BezierProgress(0.0, 0.0, 0.0, 1.0, t));
         default:
             return t;
     }

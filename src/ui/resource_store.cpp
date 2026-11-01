@@ -46,35 +46,69 @@ ResourceKey ResourceStore::AddImage(ResourceKind kind,
     }
     if (stride <= 0) stride = width * bpp;
 
-    auto bytes = std::make_shared<std::vector<uint8_t>>(byteSize);
-    std::memcpy(bytes->data(), pixels, byteSize);
+    std::vector<uint8_t> copy(byteSize);
+    std::memcpy(copy.data(), pixels, byteSize);
+    auto bytes = std::make_shared<const PixelBytes>(std::move(copy));
+    return InsertImage_(kind, imageGeneration, width, height, stride, format,
+                        std::move(bytes), pinnedVisible, /*shared=*/false);
+}
 
-    auto resource = std::make_shared<CpuImageResource>();
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        resource->key = ResourceKey{imageGeneration, nextResourceId_++, kind};
-        resource->width = width;
-        resource->height = height;
-        resource->stride = stride;
-        resource->format = format;
-        resource->bytes = std::move(bytes);
-        resource->byte_size = byteSize;
-        resource->pinned_visible = pinnedVisible;
-
-        totalBytes_ += resource->byte_size;
-        resources_[resource->key] = resource;
-
-        TraceEvent("resource_store", "resource_store_add",
-                   {TraceU64("generation", resource->key.image_generation),
-                    TraceU64("resource_id", resource->key.resource_id),
-                    TraceI64("kind", static_cast<int64_t>(resource->key.kind)),
-                    TraceI64("bytes", static_cast<int64_t>(resource->byte_size)),
-                    TraceI64("total_bytes", static_cast<int64_t>(totalBytes_)),
-                    TraceBool("pinned_visible", resource->pinned_visible)});
-
-        EvictOverBudgetLocked();
-        return resource->key;
+ResourceKey ResourceStore::AddImageShared(ResourceKind kind,
+                                          uint64_t imageGeneration,
+                                          int width,
+                                          int height,
+                                          int stride,
+                                          PixelFormat format,
+                                          const void* pixels,
+                                          std::shared_ptr<const void> owner,
+                                          bool pinnedVisible) {
+    const int bpp = BytesPerPixel(format);
+    size_t byteSize = 0;
+    if (!pixels || !owner || !CheckedImageByteSize(width, height, stride, bpp, byteSize)) {
+        return {};   /* owner 随参数析构, 宿主缓冲立即归还 */
     }
+    if (stride <= 0) stride = width * bpp;
+
+    auto bytes = std::make_shared<const PixelBytes>(
+        static_cast<const uint8_t*>(pixels), byteSize, std::move(owner));
+    return InsertImage_(kind, imageGeneration, width, height, stride, format,
+                        std::move(bytes), pinnedVisible, /*shared=*/true);
+}
+
+ResourceKey ResourceStore::InsertImage_(ResourceKind kind,
+                                        uint64_t imageGeneration,
+                                        int width,
+                                        int height,
+                                        int stride,
+                                        PixelFormat format,
+                                        std::shared_ptr<const PixelBytes> bytes,
+                                        bool pinnedVisible,
+                                        bool shared) {
+    auto resource = std::make_shared<CpuImageResource>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    resource->key = ResourceKey{imageGeneration, nextResourceId_++, kind};
+    resource->width = width;
+    resource->height = height;
+    resource->stride = stride;
+    resource->format = format;
+    resource->byte_size = bytes->size();
+    resource->bytes = std::move(bytes);
+    resource->pinned_visible = pinnedVisible;
+
+    totalBytes_ += resource->byte_size;
+    resources_[resource->key] = resource;
+
+    TraceEvent("resource_store", "resource_store_add",
+               {TraceU64("generation", resource->key.image_generation),
+                TraceU64("resource_id", resource->key.resource_id),
+                TraceI64("kind", static_cast<int64_t>(resource->key.kind)),
+                TraceI64("bytes", static_cast<int64_t>(resource->byte_size)),
+                TraceI64("total_bytes", static_cast<int64_t>(totalBytes_)),
+                TraceBool("pinned_visible", resource->pinned_visible),
+                TraceBool("shared", shared)});
+
+    EvictOverBudgetLocked();
+    return resource->key;
 }
 
 bool ResourceStore::UpdateImage(const ResourceKey& key,
@@ -92,8 +126,9 @@ bool ResourceStore::UpdateImage(const ResourceKey& key,
     }
     if (stride <= 0) stride = width * bpp;
 
-    auto bytes = std::make_shared<std::vector<uint8_t>>(byteSize);
-    std::memcpy(bytes->data(), pixels, byteSize);
+    std::vector<uint8_t> copy(byteSize);
+    std::memcpy(copy.data(), pixels, byteSize);
+    auto bytes = std::make_shared<const PixelBytes>(std::move(copy));
 
     auto resource = std::make_shared<CpuImageResource>();
     resource->key = key;
@@ -247,9 +282,13 @@ void ResourceStore::EvictOverBudgetLocked() {
     }
 }
 
+/* 永不析构 (build 332): 控件析构会 Remove 自己的资源, 而控件树可能活到 DLL 卸载
+ * (宿主漏了 ui_page_destroy / 没调 ui_shutdown)。函数内静态对象按构造逆序析构,
+ * Store 比 PageRegistry 晚构造 → 先析构 → ~GhImgViewWidget 读空 bucket 崩
+ * (GuoheView 3.4.12 用户 dmp)。进程退出由系统回收内存即可。 */
 ResourceStore& GlobalResourceStore() {
-    static ResourceStore store;
-    return store;
+    static ResourceStore* store = new ResourceStore;
+    return *store;
 }
 
 } // namespace ui

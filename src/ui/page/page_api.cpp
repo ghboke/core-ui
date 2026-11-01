@@ -1,5 +1,6 @@
 #include "page_state.h"
 #include "compiler.h"
+#include "text_binding.h"
 #include "../asset.h"
 #include "../expression/json.h"
 #include "../uix/template_parser.h"
@@ -59,6 +60,13 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         entries_.erase(id);
     }
+    // 摘走全部页面 (锁内只交换, 析构在调用方锁外做 —— 控件析构可能回调进来)。
+    std::unordered_map<uint64_t, std::unique_ptr<PageEntry>> TakeAll() {
+        std::lock_guard<std::mutex> lk(m_);
+        std::unordered_map<uint64_t, std::unique_ptr<PageEntry>> out;
+        out.swap(entries_);
+        return out;
+    }
     // Visit every live page under the registry lock. The callback receives
     // the entry by reference and must not call back into the registry
     // (would deadlock).
@@ -76,9 +84,12 @@ private:
     uint64_t next_ = 1;
 };
 
+// 永不析构 (build 332): 没被 destroy 的页面不能拖到 DLL 卸载时析构 —— 那时控件
+// 依赖的 Store / 设备可能已先析构, 且加载器锁里释放 D3D 本身就危险。正常收尾由
+// ui_shutdown → DestroyAllPages 完成, 漏掉的交给系统回收。
 static PageRegistry& Registry() {
-    static PageRegistry r;
-    return r;
+    static PageRegistry* r = new PageRegistry;
+    return *r;
 }
 
 // ---- HTML <style> block extraction ----
@@ -129,7 +140,11 @@ WindowHints WindowHintsFromAttrs(const std::vector<ui::uix::SfcAttr>& attrs) {
     for (const auto& a : attrs) {
         if      (a.name == "title")      hints.title = Utf8ToWide(a.value);
         else if (a.name == "width")      { try { hints.width     = std::stoi(a.value); } catch (...) {} }
-        else if (a.name == "height")     { try { hints.height    = std::stoi(a.value); } catch (...) {} }
+        else if (a.name == "height") {
+            /* build 328: height="auto" = 窗口高度跟随内容, 见 ui_window_set_auto_height。 */
+            if (a.value == "auto") hints.autoHeight = true;
+            else { try { hints.height = std::stoi(a.value); } catch (...) {} }
+        }
         else if (a.name == "min-width")  { try { hints.minWidth  = std::stoi(a.value); } catch (...) {} }
         else if (a.name == "min-height") { try { hints.minHeight = std::stoi(a.value); } catch (...) {} }
         else if (a.name == "resizable")  hints.resizable = toBool(a.value);
@@ -395,6 +410,18 @@ void RefreshAllPageThemes() {
     });
 }
 
+void DestroyAllPages() {
+    auto leaked = Registry().TakeAll();
+    if (!leaked.empty()) {
+        char msg[96];
+        std::snprintf(msg, sizeof(msg),
+                      "[core-ui] ui_shutdown: %zu page(s) not destroyed by host\n",
+                      leaked.size());
+        OutputDebugStringA(msg);
+    }
+    leaked.clear();   // 锁外析构控件树
+}
+
 }  // namespace ui::page
 
 // ---- C API entry points ----
@@ -462,6 +489,19 @@ std::unordered_map<std::string, std::string> ParseLangContent(const std::string&
         if (!key.empty()) pairs.emplace(std::move(key), std::move(val));
     }
     return pairs;
+}
+}  // namespace
+
+namespace {
+ui::page::PageState::KeyText MakeKeyText(const char* key, const wchar_t* const* args, int argc) {
+    ui::page::PageState::KeyText t;
+    t.key = key ? key : "";
+    for (int i = 0; args && i < argc; ++i) t.args.emplace_back(args[i] ? args[i] : L"");
+    return t;
+}
+ui::page::PageState* StateOf(UiPage p) {
+    auto* e = ui::page::Registry().Get(p);
+    return (e && e->state) ? e->state.get() : nullptr;
 }
 }  // namespace
 
@@ -579,6 +619,8 @@ static UiWindow page_open_or_prepare_(UiPage p,
         ui_window_set_root(win, h);
     }
     e->state->AttachWindow(win);
+    /* 挂好根节点再开: 开启时立即按内容定一次高, prepare 之后宿主读到的就是终值。 */
+    if (hints.autoHeight) ui_window_set_auto_height(win, 1);
 
     if (show) {
         ui_window_show(win);
@@ -634,6 +676,7 @@ UI_API void ui_page_set_text(UiPage p, const char* name, const wchar_t* value) {
             else { utf8 += static_cast<char>(0xE0 | (c >> 12)); utf8 += static_cast<char>(0x80 | ((c >> 6) & 0x3F)); utf8 += static_cast<char>(0x80 | (c & 0x3F)); }
         }
     }
+    e->state->UnbindTextVar(name);   /* build 316: 字面值覆盖 key 绑定 */
     e->state->SetString(name, utf8);
 }
 
@@ -742,6 +785,57 @@ UI_API void ui_page_set_locale(UiPage p, const char* locale) {
     e->state->SetLocale(locale);
 }
 
+// ---- build 316: 宿主按 key 设的文字 ---------------------------------------
+
+UI_API void ui_page_bind_text(UiPage p, UiWidget w, const char* key,
+                              const wchar_t* const* args, int argc) {
+    auto* s = StateOf(p);
+    auto wp = ui::GetContext().handles.Lookup(w);
+    if (!s || !wp || !key) return;
+    s->BindWidgetText(wp, ui::page::PageState::TextSlot::Text, MakeKeyText(key, args, argc));
+}
+
+UI_API void ui_page_bind_tooltip(UiPage p, UiWidget w, const char* key,
+                                 const wchar_t* const* args, int argc) {
+    auto* s = StateOf(p);
+    auto wp = ui::GetContext().handles.Lookup(w);
+    if (!s || !wp || !key) return;
+    s->BindWidgetText(wp, ui::page::PageState::TextSlot::Tooltip, MakeKeyText(key, args, argc));
+}
+
+UI_API void ui_page_bind_titlebar_title(UiPage p, UiWidget titlebar, const char* key,
+                                        const wchar_t* const* args, int argc) {
+    auto* s = StateOf(p);
+    auto wp = ui::GetContext().handles.Lookup(titlebar);
+    if (!s || !wp || !key) return;
+    s->BindWidgetText(wp, ui::page::PageState::TextSlot::TitlebarTitle,
+                      MakeKeyText(key, args, argc));
+}
+
+UI_API void ui_page_bind_window_title(UiPage p, UiWindow win, const char* key,
+                                      const wchar_t* const* args, int argc) {
+    auto* s = StateOf(p);
+    if (!s || !win || !key) return;
+    s->BindWindowTitle(win, MakeKeyText(key, args, argc));
+}
+
+UI_API void ui_page_bind_combobox_items(UiPage p, UiWidget w, const char* const* keys, int count) {
+    auto* s = StateOf(p);
+    auto wp = ui::GetContext().handles.Lookup(w);
+    if (!s || !wp || (!keys && count > 0)) return;
+    std::vector<std::string> ks;
+    for (int i = 0; i < count; ++i) ks.emplace_back(keys[i] ? keys[i] : "");
+    s->BindComboItems(wp, std::move(ks));
+}
+
+UI_API void ui_page_set_text_key(UiPage p, const char* name, const char* key,
+                                 const wchar_t* const* args, int argc) {
+    auto* s = StateOf(p);
+    if (!s || !name || !key) return;
+    s->SetTextKey(name, MakeKeyText(key, args, argc));
+}
+
+
 UI_API const char* ui_page_last_error(UiPage p) {
     auto* e = ui::page::Registry().Get(p);
     if (!e) return "invalid page handle";
@@ -764,6 +858,19 @@ UI_API void ui_page_on_widget_mount(UiPage p, const char* widget_id,
         uint64_t h = ui::GetContext().handles.FindHandle(w);
         if (!h && w) h = ui::GetContext().handles.Insert(w->shared_from_this());
         cb(pageHandle, h, userdata);
+    });
+}
+
+UI_API void ui_page_watch(UiPage p, const char* name, UiPageWatchCallback cb, void* userdata) {
+    auto* e = ui::page::Registry().Get(p);
+    if (!e || !e->state || !name || !*name) return;
+    if (!cb) {
+        e->state->Watch(name, nullptr);
+        return;
+    }
+    UiPage pageHandle = p;
+    e->state->Watch(name, [cb, userdata, pageHandle](const std::string& n, const std::string& json) {
+        cb(pageHandle, n.c_str(), json.c_str(), userdata);
     });
 }
 
@@ -791,3 +898,17 @@ UI_API void ui_page_set_quickjs_enabled(int v) {
 }
 
 }  // extern "C"
+
+namespace ui::page {
+void UnbindHostText(Widget* w, HostTextSlot slot) {
+    if (!w) return;
+    Registry().ForEach([&](PageEntry& e) {
+        if (e.state) e.state->UnbindWidgetText(w, static_cast<PageState::TextSlot>(slot));
+    });
+}
+void UnbindHostWindowTitle(uint64_t win) {
+    Registry().ForEach([&](PageEntry& e) {
+        if (e.state) e.state->UnbindWindowTitle(win);
+    });
+}
+}  // namespace ui::page

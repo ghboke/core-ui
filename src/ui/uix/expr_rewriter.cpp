@@ -319,6 +319,10 @@ std::string Rewrite(const std::string& src, const std::vector<Tok>& toks,
             // 5. Caller-supplied locals (e.g. v-for loop var / index var)
             else if (locals.count(t.text))
                 prefix = false;
+            // 6. `$event` — implicit param of every handler closure (Vue
+            //    semantics), never a state member.
+            else if (t.text == "$event")
+                prefix = false;
 
             if (prefix) out += "this.";
             out += t.text;

@@ -91,6 +91,9 @@ public:
     // ---- Loading spinner ----
     void SetLoading(bool on);
     bool IsLoading() const { return loading_; }
+    // 加载转圈靠 OnDraw 按时间画, 只要帧不推状态。
+    bool AnimationActive() const override { return loading_; }
+    AnimTick TickAnimation() override { return {false, loading_}; }
 
     // ---- 动画 ----
     bool IsAnimated() const;
@@ -100,6 +103,11 @@ public:
     void StartAnimation();
 
     // ---- Crop 模式 ----
+    /* 屏幕 (窗口 DIP) ↔ 图像像素。图像坐标是**原图坐标** (不含旋转),
+     * 与 SetCropRect 同口径。宿主做标注 / 命中测试 / 浮层定位用。 */
+    void  ScreenToImage(float sx, float sy, float& ix, float& iy) const;
+    void  ImageToScreen(float ix, float iy, float& sx, float& sy) const;
+
     void  SetCropMode(bool on);
     bool  IsCropMode() const { return cropMode_; }
     void  SetCropRect(float x, float y, float w, float h);
@@ -154,9 +162,8 @@ private:
 
     // Loading spinner
     bool       loading_ = false;
-    float      loadingAngle_ = 0.0f;
-    UINT_PTR   loadingTimerId_ = 0;
-    static constexpr UINT_PTR kLoadingTimerId = 9988;
+    bool       loadingHooked_ = false;   // 已登记到所在窗口的心跳 (只登记一次)
+    void       HookLoadingFrames_();
 
     // 动画 timer（source->Tick 驱动）
     UINT_PTR   animTimerId_ = 0;
@@ -174,8 +181,6 @@ private:
 
     // 几何/坐标
     D2D1_RECT_F ComputeDestRect() const;
-    void ScreenToImage(float sx, float sy, float& ix, float& iy) const;
-    void ImageToScreen(float ix, float iy, float& sx, float& sy) const;
     void ConstrainPan();
     void NotifyViewport();
 
@@ -186,7 +191,6 @@ private:
     void        ClampCrop();
 
     // Timer
-    static void CALLBACK LoadingTimerProc(HWND, UINT, UINT_PTR, DWORD);
     static void CALLBACK AnimTimerProc   (HWND, UINT, UINT_PTR, DWORD);
     void OnAnimTick();
     void InvalidateAllWindows();

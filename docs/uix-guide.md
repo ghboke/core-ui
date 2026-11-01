@@ -284,6 +284,24 @@ methods: {
 - `:hover path { ... }` / `.parent.active .icon path { ... }` 等 descendant selector
   在 hover / 类切换时实时重算
 
+**SVG sprite（自 build 304）**：图标库写成一组 `<symbol>`，用处按代号引用，同 HTML：
+
+```html
+<!-- 页内定义 (放在任意 <svg> 里, 自身不绘制) -->
+<svg width="0" height="0">
+  <symbol id="ic_copy" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="..."/></symbol>
+</svg>
+<svg width="18" height="18"><use href="#ic_copy"/></svg>
+<!-- 外部 sprite 文件 (走资源解析器 ui_asset_*), 多个页面共用一份 -->
+<svg width="18" height="18"><use href="icons.svg#ic_copy"/></svg>
+<!-- 按数据换图标, v-for 行 / 菜单项里同样可用 -->
+<svg width="18" height="18"><use :href="'icons.svg#' + item.icon"/></svg>
+```
+
+图形与 viewBox 取自 symbol，`<symbol>` / `<g>` 上的呈现属性逐层继承，颜色用
+`currentColor` 跟随 `<svg>` 的 `color`。与浏览器的差异：页内 symbol 的 id 是进程级的
+（不按文档隔离，多页面共用的图标库请用外部文件）；`<use>` 实例不参与页面 CSS 选择器。
+
 **值类型**：
 - 长度：`px`、`%`、`em`、`rem`、`vw`、`vh`、`auto`
 - 颜色：`#RGB` / `#RRGGBB` / `#RRGGBBAA` / `rgb()` / `rgba()` / `hsl()` / `hsla()` /
@@ -323,6 +341,32 @@ SVG `<g>` 分组、SVG `<filter>`/`<mask>`/`<clipPath>`、SMIL animate。
 用 `{{ "Hello, " + $t('user.name') }}`）。属性值的 i18n 用显式 binding：
 `:title="$t('window.title')"`。`@click` / `@change` 等事件 attr **不受影响**。
 
+#### `$t` 带参数（build 316+）
+
+`$t(key, a0, a1, …)` 把译文里的 `{0}` `{1}` … 换成参数（数字也行）：
+
+```html
+<label>{{ $t('cache.size', sizeText, fileCount) }}</label>   <!-- "Cache: {0} ({1} files)" -->
+```
+
+#### 宿主 C++ 设的文字也按 key 绑定（build 316+）
+
+宿主不要把翻译好的字符串推给界面（换语言后会停在旧语言）。改用 `ui_page_bind_*`
+传 key + 参数，页面立即翻译，之后每次 `ui_page_set_locale` 自动重译：
+
+| 用途 | 接口 |
+|---|---|
+| label / button 文字 | `ui_page_bind_text(page, w, key, args, argc)` |
+| tooltip | `ui_page_bind_tooltip(page, w, key, args, argc)` |
+| 标题栏标题 | `ui_page_bind_titlebar_title(page, tb, key, args, argc)` |
+| 窗口标题 | `ui_page_bind_window_title(page, win, key, args, argc)` |
+| 下拉框选项 | `ui_page_bind_combobox_items(page, w, keys, count)` |
+| 页面变量 (`{{ name }}`) | `ui_page_set_text_key(page, name, key, args, argc)` |
+
+参数以 `@` 开头时本身也按 key 翻译（`L"@win.settings"`），`@@` 开头表示字面的 `@`。
+之后对同一处调普通设置接口（`ui_label_set_text` / `ui_widget_set_tooltip` /
+`ui_titlebar_set_title` / `ui_window_set_title` / `ui_page_set_text`）会解除绑定。
+
 ### 5.2 属性绑定 `:attr="expr"`
 
 ```html
@@ -344,7 +388,12 @@ SVG `<g>` 分组、SVG `<filter>`/`<mask>`/`<clipPath>`、SMIL animate。
 
 支持的事件：`@click`、`@mousedown`、`@mousemove`、`@mouseup`、`@mouseenter`、
 `@mouseleave`、`@contextmenu`、`@wheel`、`@dblclick`、`@submit`、`@focus`、
-`@blur`、`@change`、`@input`。
+`@blur`、`@change`、`@input`，以及下文的拖放事件。**写在 `v-for` 行上与写在普通
+元素上完全一致**（build 303 起；此前行内只接 click/change/input/dblclick）。
+
+需要同时传参和事件对象时，跟 Vue 一样显式写 `$event`：
+`@drop="onDrop(item, $event)"`（build 303 起；此前 `$event` 被当成 state 成员，
+恒为 undefined，只有裸方法名 `@drop="onDrop"` 能拿到）。
 
 鼠标事件的 handler 收到对标 DOM MouseEvent 的 `$event` 对象：
 `offsetX/offsetY`（控件局部 DIP 坐标）、`clientX/clientY`（窗口坐标）、
@@ -354,6 +403,9 @@ SVG `<g>` 分组、SVG `<filter>`/`<mask>`/`<clipPath>`、SMIL animate。
 （光标已不在控件上，无有意义坐标）。`@mousemove` 与 DOM 一致悬停即触发；按住
 拖动期间事件持续发给按下的控件（等价 pointer capture）。`@contextmenu` 在右键
 释放时沿父链冒泡到最近的监听者，不影响宿主窗口的原生右键菜单回调。
+`@wheel` 同样沿父链冒泡到最近的监听者（build 310 起，只触发一次）；途中自带
+滚动的控件（ScrollView / TextArea 等）真的滚了就到此为止，内容没溢出的不挡。
+所以叠加在画布上的小控件不用各自挂 `@wheel`，挂在公共父容器上即可。
 `change/input` 收到控件标量值。
 
 **拖放（HTML5 风格）**：任意元素设 `draggable="true"`（或直接给
@@ -363,7 +415,9 @@ HTML 的 dragover-preventDefault）；拖动悬停时目标进入 CSS `:drag-ove
 事件：源侧 `@dragstart`（`$event.data` 为载荷，可改写——等价
 dataTransfer.setData）、`@dragend`（`$event` 为 bool，是否成功投放）；目标侧
 `@dragenter`、`@dragover`、`@dragleave`、`@drop`（`$event.data` + 鼠标坐标字段）。
-拖动结束不触发 `@click`。C++ 宿主对应 `ui_widget_set_draggable /
+拖动结束不触发 `@click`。拖动中光标停在 `ScrollView` 上/下边缘约 32 DIP 的带里时，
+列表会持续自动滚动（越贴边越快，光标不动也滚，期间持续派发 `@dragover`），跟浏览器
+一致（build 303 起）。C++ 宿主对应 `ui_widget_set_draggable /
 set_drag_data / set_drop_target / on_drop / on_drag_end`。
 
 ### 5.4 `v-if="cond"`
@@ -570,7 +624,7 @@ obj.unknown          # 返回 null（不报错）
 | `<input type="range"/>` | `SliderWidget` | 解析 `min`/`max`/`value` 静态属性（自 build 9 起，之前硬编码 0..100） |
 | `<input type="number"/>` | `NumberBoxWidget` | 解析 `min`/`max`/`value`/`step`；按 `step` 自动推导显示小数位（0.1→1, 0.01→2）|
 | `<textarea/>` | `TextAreaWidget` | 多行 |
-| `<select>` | `ComboBoxWidget` | `<option>Label</option>` 子节点自动填充；`value` 属性目前不参与选择值，`v-model` 使用索引 |
+| `<select>` | `ComboBoxWidget` | `<option>Label</option>` 子节点自动填充；`value` 属性目前不参与选择值，`v-model` 使用索引。`<option v-for="(x, i) in list">{{ x.name }}</option>` / `{{ }}` 插值 (build 313+) 可与静态、`@key` 选项混写，按书写顺序拼接，数据变了选项跟着变；选中索引暂时越界时会记住，列表补够后再落上 |
 | `<ul>` / `<ol>` | `VBoxWidget` | |
 | `<li>` | `HBoxWidget` | |
 | `<hr/>` | `SeparatorWidget` | |
@@ -738,6 +792,16 @@ export default {
   <option value="1">User</option>
 </select>
 <label v-if="agree">{{ `Thanks, ${name}!` }}</label>
+```
+
+按数据生成选项 (build 313+)，静态项 / `@key` / `v-for` 可混写：
+
+```html
+<select v-model="langIndex">
+  <option>@settings.lang_auto</option>
+  <option>English</option>
+  <option v-for="l in extLangs">{{ l.name }}</option>
+</select>
 ```
 
 ### 10.3 带过滤的列表
@@ -1235,6 +1299,34 @@ export default {
 </template>
 ```
 
+### 数据驱动的菜单树（自 1.8.0 build 303）
+
+循环出来的每一项都像 HTML/Vue 一样各是各的，一份数据就能描述整棵菜单：
+
+- `<menuitem v-for>` 上的 `:id` / `:data-*` 等任意 `:attr` 按每一项求值；宿主
+  `ui_menu_item_id` / `ui_menu_item_attr` 读到的就是该项自己的值。求值为
+  `null` / `undefined` 的属性不出现。
+- `@click` 是表达式，能用本行迭代变量：`@click="run(x.cmd, i)"`。
+- `<menu v-for="g in groups" :title="g.name">` 每次迭代一个子菜单，子菜单里拿得到 `g`。
+- `<template v-for / v-if>` 不产生行，只把一组子项（menuitem / separator /
+  嵌套 menu / 再嵌 template）展开到所在菜单。
+- `:enabled` / `:disabled` 只作用于当前这一行（也适用于子菜单那一行）。
+
+```vue
+<menu trigger="#canvas" event="rclick">
+  <template v-for="n in tree">
+    <menuitem v-if="n.kind == 'cmd'" :id="n.cmd"><label>{{ n.label }}</label></menuitem>
+    <separator v-if="n.kind == 'sep'"/>
+    <menu v-if="n.kind == 'group'" :title="n.name">
+      <menuitem v-for="c in n.items" :id="c.cmd"><label>{{ c.label }}</label></menuitem>
+    </menu>
+  </template>
+</menu>
+```
+
+`tree` 由宿主 `ui_page_set_json` 推入（如用户在设置页拖动排序后的结果），下次弹出
+即按新数据重建；宿主在 `ui_window_on_menu` 里按 `ui_menu_item_id` 路由命令。
+
 **重要的破坏性变动 (从 1.5.0 公开版本升级时注意):**
 
 - **`menuitem` 改成 widget 模板** (BREAKING, build 75)：必须包子 widget，不能
@@ -1278,6 +1370,7 @@ export default {
 | `text="..."` | 仅嵌套 `<menu>` 当 submenu 时用，作为父项的显示文字 |
 | `row-class="..."` | 追加到自动生成的 `.menuitem-row` wrapper；子菜单默认继承，用于只调整某棵菜单树的行宽/样式 |
 | `share-width="false"` | 关闭默认的父子菜单同宽传播，让子菜单按自身内容宽度收缩 |
+| `min-width="222"` / `style="min-width: 222px"` | 本级菜单最小宽度 (DIP, 自 build 307)，内容更宽照常撑开，子菜单不继承 |
 
 `<menu>` 在 `<template>` 单根元素约束下必须放在根 `<div>` 里。
 
@@ -1285,9 +1378,11 @@ export default {
 
 | 属性 | 说明 |
 |---|---|
-| `id="N"` | 数字 id（必须能 `stoi`），C 端 `ui_window_on_menu` 回调按 id 派发；不写自动从 1 自增 |
-| `shortcut="Ctrl+S"` | 右侧灰色快捷键文本（**只显示，不绑实际快捷键**，要绑请走 `ui_window_on_key`）|
-| `onclick="methodName"` | 触发时调 `<script>.methods[methodName]`（C 端 handler 在 1.5.0 已删，全走 `methods{}`）|
+| `id="key"` / `:id="expr"` | 字符串 key 或数字串，宿主 `ui_menu_item_id` 读它；`:id` 在 `v-for` 里按每一项求值 |
+| `data-*="..."` / `:data-*="expr"` | 任意属性，宿主 `ui_menu_item_attr` 读它 |
+| `shortcut="Ctrl+S"` / `:shortcut` | 右侧灰色快捷键文本（**只显示，不绑实际快捷键**，要绑请走 `ui_window_on_key`）|
+| `:enabled="expr"` / `:disabled="expr"` | 置灰这一行 |
+| `@click="expr"` / `onclick="expr"` | 页面 JS 处理；裸方法名自动调用，调用形式可用迭代变量。写了它的项**不再**回调宿主 `ui_window_on_menu` |
 | `icon="logo.png"` | 走资源解析器（同 `<img src>`）；PNG/JPG 不变色 |
 | `style="color: #d63a26"` | per-item 文字色覆盖；SVG icon 跟着变色（currentColor），PNG 不跟 |
 
@@ -1312,7 +1407,8 @@ export default {
 UiMenu m = ui_page_menu(page, "ctx");
 ui_menu_show(win, m, x, y);
 
-// 收 menu 点击（onclick 派发完之后还会调这个，可以 chain 处理 id）
+// 收 menu 点击：没写 @click / onclick 的项才会到这里（写了的由页面 JS 消费）。
+// 回调里用 ui_menu_item_id(item) / ui_menu_item_attr(item, "data-x") 路由。
 ui_window_on_menu(win, on_item, NULL);
 ```
 
@@ -1462,6 +1558,22 @@ void on_mount(UiPage p, UiWidget w, void* ud) {
 }
 ui_page_on_widget_mount(page, "btn_x", on_mount, NULL);
 ```
+
+### C. 监听页面状态 `ui_page_watch`（Vue `watch`，自 build 304）
+
+页面 JS 改了状态、宿主要跟着处理（如设置页拖放排序后写配置）时用：
+
+```c
+void on_tree(UiPage p, const char* name, const char* json, void* ud) {
+    /* json = 新值的 UTF-8 JSON, 仅回调期间有效。可在这里校验后 ui_page_set_json 写回。 */
+}
+ui_page_watch(page, "menuTree", on_tree, NULL);   // cb=NULL 取消
+```
+
+- 注册时不回调；值没变（含宿主写回同一个值）不回调；不分来源（JS 或宿主改的都算）。
+- 宿主在回调里规范化后写回是允许的：会再通知一次规范化后的值，值稳定后停下。
+- 比较整个值的 JSON；推荐页面整体替换（`this.menuTree = newTree`）。
+- 同一 name 只留一个回调；热重载后自动保留；不要在回调里取消同一个监听。
 
 每次 v-if remount，`on_mount` 都会重新触发，跟 Vue 3 `watch(ref, ...)` 等价。
 

@@ -159,7 +159,7 @@ static const char* kKnownAttrs[] = {
     // Controls
     "text", "fontSize", "bold", "textColor", "textAlign", "align", "wrap", "maxLines",
     "type", "icon", "checked", "on", "selected", "group", "min", "max", "value",
-    "step", "decimals", "items", "placeholder", "maxLength", "indeterminate",
+    "step", "decimals", "items", "placeholder", "maxLength", "indeterminate", "password",
     "svg", "glyph", "ghost",
     // Layout
     "gap", "colGap", "rowGap", "cols", "vertical", "ratio", "active",
@@ -914,6 +914,7 @@ void ApplySpecificAttrs(Widget* w, const std::string& tag,
             }
         }
         if (auto* v = getAttr("maxLength")) ti->maxLength = ParseInt(*v);
+        if (auto* v = getAttr("password")) ti->password = ParseBool(*v);
     }
 
     // TextArea

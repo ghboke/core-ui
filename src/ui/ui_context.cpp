@@ -1,5 +1,6 @@
 #include "ui_context.h"
 #include "debug_trace.h"
+#include "frame_ticker.h"
 #include "overlay_service.h"
 #include "render_thread.h"
 #include "ui_window.h"
@@ -33,9 +34,12 @@ static inline BOOL SetProcessDpiAwarenessContextFallback(DPI_AWARENESS_CONTEXT c
 
 namespace ui {
 
+/* 永不析构 (build 332): 宿主没调 ui_shutdown 就退出时, 静态析构销毁窗口会碰到
+ * 已先析构的其它单例, 且在 DLL 卸载 (加载器锁) 里 Release D3D 本身危险 (bug-209)。
+ * 正常收尾走 ui_shutdown → Shutdown(); 没走的交给系统回收。 */
 Context& GetContext() {
-    static Context ctx;
-    return ctx;
+    static Context* ctx = new Context;
+    return *ctx;
 }
 
 // 与 ui_context.h 注释对应：把 ctor/dtor 落到这个 TU 里，因为这里
@@ -43,9 +47,9 @@ Context& GetContext() {
 // std::unique_ptr<UiWindowImpl>::~unique_ptr() 才能展开。
 Context::Context() = default;
 Context::~Context() {
-    // Mark shutting down so any Widget destructors that run during
-    // global teardown (process exits without calling ui_shutdown) skip
-    // the NotifyWidgetDestroyed → window lookup, which would otherwise
+    // GetContext() 的实例永不析构 (build 332), 这里只对独立构造的 Context 生效。
+    // Mark shutting down so any Widget destructors that run during teardown
+    // skip the NotifyWidgetDestroyed → window lookup, which would otherwise
     // touch already-destroyed map entries.
     shuttingDown_ = true;
 }
@@ -115,6 +119,7 @@ void Context::Shutdown() {
 
     menus_.clear();
     windows_.clear();
+    FrameTicker::Instance().Stop();
     OverlayService::Instance().Stop();
     RenderThread::Instance().Stop();
     handles.Clear();
@@ -181,6 +186,13 @@ void Context::InvalidateAllWindows() {
                    {TraceI64("invalidated", invalidated),
                     TraceI64("skipped_hidden", skippedHidden)});
     }
+}
+
+void Context::RefreshTextAllWindows() {
+    for (auto& [id, win] : windows_) {
+        if (win) win->GetRenderer().RefreshTextResources();
+    }
+    RelayoutAllWindows();
 }
 
 void Context::RelayoutAllWindows() {

@@ -39,4 +39,8 @@ void RebuildThemeVars(std::vector<std::pair<std::string, std::string>>& vars);
 // `ui_theme_set_mode`.
 void RefreshAllPageThemes();
 
+// 销毁宿主没 destroy 的全部页面。ui_shutdown 在销毁窗口之前调用, 让这些控件树
+// 在 Store / 设备 / COM 都还活着时按正常顺序析构 (等同宿主自己 ui_page_destroy)。
+void DestroyAllPages();
+
 }  // namespace ui::page

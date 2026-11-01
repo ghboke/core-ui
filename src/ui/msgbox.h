@@ -50,5 +50,6 @@ struct MsgBoxDebugInfo {
 };
 MsgBoxDebugInfo MsgBoxDebugSnapshot();   /* 当前活动 msgbox 快照 (active=false=无)。 */
 bool MsgBoxDebugFinish(int idx);          /* 触发 idx 按钮 (等价点击); 无活动返 false。 */
+bool MsgBoxDebugCancel();                 /* build 339: 等价 Esc (cancelled=1); 不可取消 / 无活动返 false。 */
 
 }  // namespace ui

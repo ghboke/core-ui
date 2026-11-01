@@ -7,19 +7,26 @@
 #include "draw_api_context.h"
 #include "display_list.h"
 #include "ui_context.h"
+#include "page/text_binding.h"
 #include "ui_window.h"
+#include "overlay_service.h"   // ui_debug_toast_info / screenshot_toast
 #include "ui.h"        // pulls in all widget/control/builder headers
 #include "image_view_gdi.h"  // GDI-based image view (for images > D2D texture limit)
 #include "image_view_plus.h" // forward decl needed for GhImgView 临近的 ImageViewPlus 引用
 #include "gh_img_view.h"     // 通用瓦块画布
 #include "ocr_img_view.h"    // 图片划词 (OCR 文本选择画布)
+#include "test_isolation.h"  // 模拟投递鼠标消息的标记
 #include "css/value.h"       // ParseColor for ui_theme_set_accent_hex
 #include "page/compiler.h"   // ui::page::RefreshAllPageThemes — runtime theme push
 #include "../../include/ui_core.h"
 
 #include <windows.h>
 #include <atomic>
+#include <memory>
+#include <mutex>
+#include <set>
 #include <string>
+#include <unordered_map>
 
 // ---- Conversion helpers ----
 
@@ -82,7 +89,16 @@ UI_API int ui_init_with_theme(UiThemeMode mode) {
 }
 
 UI_API void ui_shutdown(void) {
+    /* 宿主漏 destroy 的页面先收掉 (build 332), 不然控件树留到 DLL 卸载才析构。 */
+    ui::page::DestroyAllPages();
     Ctx().Shutdown();
+    /* 离屏设备、popup 菜单设备、窗口共享的主设备都是进程内复用的懒建对象,
+     * 收尾时一并放掉。主设备以前漏放, 拖到 DLL 卸载时才 Release, 部分机器上
+     * DXGI 抛 0x87A → 宿主"关闭即已停止工作"。窗口已在 Shutdown 里全部销毁,
+     * 这里没有渲染器还持着它。 */
+    ui::Renderer::ReleaseOffscreenDevice();
+    ui::ContextMenu::ReleaseSharedGpu();
+    ui::Renderer::ReleaseSharedDevice();
 }
 
 UI_API int ui_run(void) {
@@ -113,6 +129,8 @@ UI_API UiWindow ui_window_create(const UiWindowConfig* config) {
     auto win = std::make_unique<ui::UiWindowImpl>();
     win->skipOpenAnimation_ = (config->skip_animation != 0);
     win->startMaximizedPending_ = (config->start_maximized != 0);
+    win->copySwapChain_ = (config->copy_swap_chain != 0);
+    win->layeredCanvas_ = (config->layered_canvas != 0);
     int initX = (config->x != 0 || config->y != 0) ? config->x : CW_USEDEFAULT;
     int initY = (config->x != 0 || config->y != 0) ? config->y : CW_USEDEFAULT;
     /* Build 65+ (L14): 把 owner UiWindow handle 解析成 HWND 传给 Create.
@@ -197,7 +215,10 @@ UI_API void ui_window_set_root(UiWindow win, UiWidget root) {
 
 UI_API void ui_window_set_title(UiWindow win, const wchar_t* title) {
     auto* w = Win(win);
-    if (w && title) w->SetTitle(title);
+    if (w && title) {
+        ui::page::UnbindHostWindowTitle(win);   /* build 316: 字面标题覆盖 key 绑定 */
+        w->SetTitle(title);
+    }
 }
 
 UI_API void ui_window_set_resizable(UiWindow win, int resizable) {
@@ -326,6 +347,14 @@ UI_API void ui_menu_set_frosted_material(UiMenu menu, int enabled) {
     if (m) m->SetFrostedMaterial(enabled != 0);
 }
 
+UI_API void ui_menu_set_open_animation(int enabled) {
+    ui::ContextMenu::SetOpenAnimationEnabled(enabled != 0);
+}
+
+UI_API int ui_menu_get_open_animation(void) {
+    return ui::ContextMenu::OpenAnimationEnabled() ? 1 : 0;
+}
+
 UI_API void ui_menu_set_backdrop_blur(UiMenu menu, float radius) {
     auto m = Ctx().GetMenu(menu);
     if (m) m->SetBackdropBlur(radius);
@@ -384,6 +413,17 @@ UI_API void ui_window_on_right_click(UiWindow win, UiRightClickCallback cb, void
     if (!cb) { w->onRightClick = nullptr; return; }
     uint64_t id = win;
     w->onRightClick = [cb, userdata, id](float x, float y) { cb(id, x, y, userdata); };
+}
+
+UI_API void ui_window_on_mouse_button(UiWindow win, UiWindowMouseButtonCallback cb,
+                                      void* userdata) {
+    auto* w = Win(win);
+    if (!w) return;
+    if (!cb) { w->onMouseButton = nullptr; return; }
+    uint64_t id = win;
+    w->onMouseButton = [cb, userdata, id](int vk, float x, float y) {
+        cb(id, vk, x, y, userdata);
+    };
 }
 
 UI_API void ui_window_on_titlebar_drag(UiWindow win, UiTitleBarDragCallback cb, void* userdata) {
@@ -976,6 +1016,22 @@ UI_API int ui_image_view_plus_is_crop_mode(UiWidget w) {
     auto* iv = As<ui::ImageViewPlusWidget>(w);
     return iv ? (iv->IsCropMode() ? 1 : 0) : 0;
 }
+UI_API void ui_image_view_plus_screen_to_image(UiWidget w, float sx, float sy,
+                                                float* ix, float* iy) {
+    float xx = 0.0f, yy = 0.0f;
+    if (auto* iv = As<ui::ImageViewPlusWidget>(w)) iv->ScreenToImage(sx, sy, xx, yy);
+    if (ix) *ix = xx;
+    if (iy) *iy = yy;
+}
+
+UI_API void ui_image_view_plus_image_to_screen(UiWidget w, float ix, float iy,
+                                                float* sx, float* sy) {
+    float xx = 0.0f, yy = 0.0f;
+    if (auto* iv = As<ui::ImageViewPlusWidget>(w)) iv->ImageToScreen(ix, iy, xx, yy);
+    if (sx) *sx = xx;
+    if (sy) *sy = yy;
+}
+
 UI_API void ui_image_view_plus_set_crop_rect(UiWidget w, float x, float y, float cw, float ch) {
     auto* iv = As<ui::ImageViewPlusWidget>(w);
     if (iv) iv->SetCropRect(x, y, cw, ch);
@@ -1092,6 +1148,34 @@ UI_API void ui_gh_img_view_set_preview(UiWidget w, UiWindow win,
     gv->SetPreview(bgra, pw, ph, stride, wn->GetRenderer());
 }
 
+UI_API void ui_gh_img_view_set_preview_shared(UiWidget w, UiWindow win,
+                                               const void* bgra, uint32_t pw, uint32_t ph,
+                                               uint32_t stride, int premultiplied,
+                                               UiPixelReleaseCallback release,
+                                               void* userdata) {
+    if (!release) {   /* 没有归还回调 = 不能借用, 退回拷贝版 */
+        ui_gh_img_view_set_preview(w, win, bgra, pw, ph, stride);
+        return;
+    }
+    /* 先包成 owner: 之后任何一条路径 (含提前返回) 都恰好回调一次。包一层非空
+     * 对象, userdata 允许为 NULL。 */
+    struct ReleaseHook {
+        ReleaseHook(UiPixelReleaseCallback f, void* u) : fn(f), ud(u) {}
+        ReleaseHook(const ReleaseHook&) = delete;
+        ReleaseHook& operator=(const ReleaseHook&) = delete;
+        ~ReleaseHook() { fn(ud); }
+        UiPixelReleaseCallback fn;
+        void*                  ud;
+    };
+    std::shared_ptr<const void> owner =
+        std::make_shared<const ReleaseHook>(release, userdata);
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    auto* wn = Win(win);
+    if (!gv || !wn || !bgra) return;
+    gv->SetPreviewShared(bgra, pw, ph, stride, premultiplied != 0, std::move(owner),
+                         wn->GetRenderer());
+}
+
 UI_API void ui_gh_img_view_set_tile(UiWidget w, UiWindow win,
                                      uint32_t level, uint32_t tx, uint32_t ty,
                                      const void* bgra, uint32_t tw, uint32_t th,
@@ -1204,6 +1288,26 @@ UI_API int ui_gh_img_view_get_shadow(UiWidget w) {
     auto* gv = As<ui::GhImgViewWidget>(w);
     return (gv && gv->Shadow()) ? 1 : 0;
 }
+UI_API void ui_gh_img_view_set_shadow_style(UiWidget w, int style) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetShadowStyle(ui::imgshadow::StyleFromInt(style));
+}
+UI_API int ui_gh_img_view_get_shadow_style(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return gv ? static_cast<int>(gv->ShadowStyle()) : 0;
+}
+UI_API float ui_gh_img_view_shadow_fit_padding(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return gv ? gv->ShadowFitPadding() : 0.0f;
+}
+UI_API void ui_gh_img_view_set_shadow_outset(UiWidget w, float dip) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetShadowOutset(dip);
+}
+UI_API float ui_gh_img_view_get_shadow_outset(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return gv ? gv->ShadowOutset() : 0.0f;
+}
 UI_API void ui_gh_img_view_set_fit_padding(UiWidget w, float dip) {
     auto* gv = As<ui::GhImgViewWidget>(w);
     if (gv) gv->SetFitPadding(dip);
@@ -1246,6 +1350,32 @@ UI_API void ui_gh_img_view_set_zoom_around(UiWidget w, float zoom,
                                             float anchor_x, float anchor_y) {
     auto* gv = As<ui::GhImgViewWidget>(w);
     if (gv) gv->SetZoomAround(zoom, anchor_x, anchor_y);
+}
+UI_API void ui_gh_img_view_zoom_around_smooth(UiWidget w, float zoom,
+                                              float anchor_x, float anchor_y,
+                                              float duration_ms) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->AnimateZoomAround(zoom, anchor_x, anchor_y, duration_ms);
+}
+UI_API float ui_gh_img_view_get_target_zoom(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return gv ? gv->TargetZoom() : 1.0f;
+}
+UI_API float ui_gh_img_view_get_zoom_step_base(UiWidget w, int zoom_in) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return gv ? gv->ZoomStepBase(zoom_in != 0) : 1.0f;
+}
+UI_API int ui_gh_img_view_is_zoom_animating(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    return (gv && gv->ZoomAnimating()) ? 1 : 0;
+}
+UI_API void ui_gh_img_view_finish_zoom_animation(UiWidget w) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->FinishZoomAnimation();
+}
+UI_API void ui_gh_img_view_set_wheel_zoom_smooth_ms(UiWidget w, float ms) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (gv) gv->SetWheelZoomSmoothMs(ms);
 }
 UI_API void ui_gh_img_view_set_zoom_range(UiWidget w, float lo, float hi) {
     auto* gv = As<ui::GhImgViewWidget>(w);
@@ -1296,6 +1426,25 @@ UI_API void ui_gh_img_view_on_viewport(UiWidget w,
         out.visible_ty0  = vp.visibleTy0;
         out.visible_tx1  = vp.visibleTx1;
         out.visible_ty1  = vp.visibleTy1;
+        cb(apiHandle, &out, userdata);
+    };
+}
+
+// build 309: 视图变换回调 (拖动每次移动 / 动画每帧 / 落定), 见 ui_core.h。
+UI_API void ui_gh_img_view_on_transform(UiWidget w,
+                                         UiGhImgViewTransformCallback cb,
+                                         void* userdata) {
+    auto* gv = As<ui::GhImgViewWidget>(w);
+    if (!gv) return;
+    if (!cb) { gv->onTransformChanged = nullptr; return; }
+    UiWidget apiHandle = w;
+    gv->onTransformChanged = [cb, userdata, apiHandle](const ui::GhImgViewWidget::Transform& t) {
+        UiGhImgViewTransform out;
+        out.zoom        = t.zoom;
+        out.pan_x       = t.panX;
+        out.pan_y       = t.panY;
+        out.rotation    = t.rotation;
+        out.interacting = t.interacting ? 1 : 0;
         cb(apiHandle, &out, userdata);
     };
 }
@@ -1642,13 +1791,37 @@ UI_API UiWidget ui_titlebar(const wchar_t* title) {
 
 UI_API void ui_titlebar_set_title(UiWidget w, const wchar_t* title) {
     auto* tb = As<ui::TitleBarWidget>(w);
-    if (tb && title) tb->SetTitle(title);
+    if (tb && title) {
+        ui::page::UnbindHostText(tb, ui::page::HostTextSlot::TitlebarTitle);
+        tb->SetTitle(title);
+    }
 }
 
 UI_API void ui_titlebar_add_widget(UiWidget titlebar, UiWidget custom_widget) {
     auto* tb = As<ui::TitleBarWidget>(titlebar);
     auto cw = Ctx().handles.Lookup(custom_widget);
     if (tb && cw) tb->AddCustomWidget(cw);
+}
+
+UI_API UiWidget ui_titlebar_add_caption_button(UiWidget titlebar, const wchar_t* glyph) {
+    auto* tb = As<ui::TitleBarWidget>(titlebar);
+    if (!tb) return 0;
+    return Reg(tb->AddCaptionButton(glyph ? glyph : L""));
+}
+
+UI_API void ui_titlebar_caption_button_set_glyph(UiWidget button, const wchar_t* glyph) {
+    auto* b = As<ui::CaptionButtonWidget>(button);
+    if (b && glyph) b->icon = glyph;
+}
+
+UI_API void ui_titlebar_caption_button_set_svg(UiWidget button, const char* svg) {
+    auto* b = As<ui::CaptionButtonWidget>(button);
+    if (b) b->SetSvg(svg ? svg : "");
+}
+
+UI_API void ui_titlebar_caption_button_set_badge(UiWidget button, int on) {
+    auto* b = As<ui::CaptionButtonWidget>(button);
+    if (b) b->badge = (on != 0);
 }
 
 UI_API void ui_titlebar_show_buttons(UiWidget titlebar, int showMin, int showMax, int showClose) {
@@ -1813,11 +1986,44 @@ UI_API void ui_widget_set_enabled(UiWidget w, int enabled) {
 }
 
 UI_API void ui_widget_set_bg_color(UiWidget w, UiColor color) {
-    auto* p = W(w); if (p) p->bgColor = ToD2D(color);
+    auto* p = W(w);
+    if (p) {
+        p->bgColor = ToD2D(color);
+        /* 同 :background 绑定: 不记覆盖的话, .uix 路径下随便一次样式重算就把
+         * 它清成透明 (历史上表现为"色板全白")。 */
+        p->dynamicBgSet = true;
+        p->dynamicBg = p->bgColor;
+    }
+}
+
+UI_API void ui_widget_set_font_size(UiWidget w, float size) {
+    auto* p = W(w);
+    if (!p) return;
+    /* 同时记进 hostFontSize —— CSS 状态重算 (hover/focus/pressed) 会整片重写
+     * css.*, 只写 css.fontSize 的话, widget 一获得焦点就被冲回默认字号。 */
+    p->hostFontSize = (size > 0.0f) ? size : -1.0f;
+    p->css.fontSize = p->hostFontSize;
+}
+
+UI_API void ui_widget_set_text_color(UiWidget w, UiColor color) {
+    auto* p = W(w);
+    if (!p) return;
+    if (color.a <= 0.0f) {                    /* 透明 → 交还给 CSS */
+        p->hasHostFg = false;
+        p->css.hasFg = false;
+        return;
+    }
+    p->hostFg = ToD2D(color);
+    p->hasHostFg = true;
+    p->css.fg = p->hostFg;
+    p->css.hasFg = true;
 }
 
 UI_API void ui_widget_set_tooltip(UiWidget w, const wchar_t* text) {
-    auto* p = W(w); if (p) p->tooltip = text ? text : L"";
+    auto* p = W(w);
+    if (!p) return;
+    ui::page::UnbindHostText(p, ui::page::HostTextSlot::Tooltip);
+    p->tooltip = text ? text : L"";
 }
 
 UI_API void ui_widget_set_cursor(UiWidget w, int cursor) {
@@ -1954,9 +2160,9 @@ UI_API void ui_widget_on_submit(UiWidget w,
 }
 
 /* Build 66+ (L16): 通用 widget 滚轮回调. 接 Widget::onMouseWheelHook
- * (跟 .uix @wheel 同路径). UiWindowImpl::OnMouseWheel 开头会无条件 fire
- * 这个 hook, 跟 widget 子类的 OnMouseWheel dispatch loop 无关 — 所以
- * <custom> 等不在 dispatch list 里的 widget 也能收到. cb=NULL 解绑. */
+ * (跟 .uix @wheel 同路径). UiWindowImpl::OnMouseWheel 沿父链找最近的 hook
+ * (build 310), 不挑 widget 类型 — <custom> 等没有内置滚动的 widget 也能收到.
+ * cb=NULL 解绑. */
 UI_API void ui_widget_on_mouse_wheel(UiWidget w,
                                        UiWidgetWheelCallback cb,
                                        void* userdata) {
@@ -2015,7 +2221,10 @@ UI_API void ui_widget_set_rect(UiWidget w, UiRect rect) {
 
 UI_API void ui_label_set_text(UiWidget w, const wchar_t* text) {
     auto* lbl = As<ui::LabelWidget>(w);
-    if (lbl && text) lbl->SetText(text);
+    if (lbl && text) {
+        ui::page::UnbindHostText(lbl, ui::page::HostTextSlot::Text);
+        lbl->SetText(text);
+    }
 }
 
 UI_API void ui_label_set_font_size(UiWidget w, float size) {
@@ -2120,6 +2329,18 @@ UI_API void ui_text_input_set_text(UiWidget w, const wchar_t* text) {
 UI_API void ui_text_input_set_read_only(UiWidget w, int read_only) {
     auto* ti = As<ui::TextInputWidget>(w);
     if (ti) ti->readOnly = (read_only != 0);
+}
+
+/* build 340: 密码模式, 对标 <input type="password">。 */
+UI_API void ui_text_input_set_password(UiWidget w, int on) {
+    auto* ti = As<ui::TextInputWidget>(w);
+    if (ti) ti->password = (on != 0);
+}
+
+/* build 311: 对标 input.select()。 */
+UI_API void ui_text_input_select_all(UiWidget w) {
+    auto* ti = As<ui::TextInputWidget>(w);
+    if (ti) ti->SelectAll();
 }
 
 // ================================================================
@@ -2490,6 +2711,20 @@ UI_API void ui_draw_rect(UiDrawCtx ctx, UiRect rect, UiColor color, float width)
     if (auto* r = R(ctx)) r->DrawRect(d2dRect, d2dColor, width);
 }
 
+UI_API void ui_draw_fill_ellipse(UiDrawCtx ctx, UiRect rect, UiColor color) {
+    const auto d2dRect = ToD2DRect(rect);
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx)) rec->FillEllipse(d2dRect, d2dColor);
+    if (auto* r = R(ctx)) r->FillEllipse(d2dRect, d2dColor);
+}
+
+UI_API void ui_draw_ellipse(UiDrawCtx ctx, UiRect rect, UiColor color, float width) {
+    const auto d2dRect = ToD2DRect(rect);
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx)) rec->DrawEllipse(d2dRect, d2dColor, width);
+    if (auto* r = R(ctx)) r->DrawEllipse(d2dRect, d2dColor, width);
+}
+
 UI_API void ui_draw_fill_rounded_rect(UiDrawCtx ctx, UiRect rect, float rx, float ry, UiColor color) {
     const auto d2dRect = ToD2DRect(rect);
     const auto d2dColor = ToD2D(color);
@@ -2510,6 +2745,128 @@ UI_API void ui_draw_line(UiDrawCtx ctx, float x1, float y1, float x2, float y2, 
         rec->DrawLine({x1, y1}, {x2, y2}, d2dColor, width);
     }
     if (auto* r = R(ctx)) r->DrawLine(x1, y1, x2, y2, d2dColor, width);
+}
+
+/* ---- 离屏绘制 ----
+ * DrawApiContext 必须是**第一个成员**: 对外交出去的 UiDrawCtx 就是它的地址,
+ * 于是既能直接喂给所有 ui_draw_*, 又能在 end 时还原回整个结构。 */
+namespace {
+
+struct OffscreenCtx {
+    ui::DrawApiContext api;
+    std::unique_ptr<ui::Renderer> renderer;
+    explicit OffscreenCtx(ui::Renderer* r) : api(r, nullptr) {}
+};
+
+/* 活着的离屏 ctx 名单。存在的唯一理由是防止调用方把 widget draw 回调里的
+ * ctx 传给 ui_offscreen_end —— 那会把一个栈上的 DrawApiContext 当成
+ * OffscreenCtx 解释, 后果是访问野指针。宁可查一次表也不赌调用方不出错。 */
+std::mutex g_offscreenMu;
+std::set<const void*> g_offscreenLive;
+
+bool IsLiveOffscreen(const void* p) {
+    std::lock_guard<std::mutex> lk(g_offscreenMu);
+    return g_offscreenLive.count(p) != 0;
+}
+
+} /* namespace */
+
+UI_API UiDrawCtx ui_offscreen_begin(int width, int height) {
+    if (width <= 0 || height <= 0) return nullptr;
+    auto renderer = std::make_unique<ui::Renderer>();
+    if (!renderer->BeginOffscreen((uint32_t)width, (uint32_t)height)) return nullptr;
+
+    auto* t = new OffscreenCtx(renderer.get());
+    t->renderer = std::move(renderer);
+    {
+        std::lock_guard<std::mutex> lk(g_offscreenMu);
+        g_offscreenLive.insert(&t->api);
+    }
+    return &t->api;
+}
+
+UI_API int ui_offscreen_end(UiDrawCtx ctx, uint8_t* out_bgra, int stride) {
+    auto* d = D(ctx);
+    if (!d || !IsLiveOffscreen(d)) return 0;
+    {
+        std::lock_guard<std::mutex> lk(g_offscreenMu);
+        g_offscreenLive.erase(d);
+    }
+    /* api 是第一个成员, 地址即整个结构的地址 */
+    auto* t = reinterpret_cast<OffscreenCtx*>(d);
+    bool ok = false;
+    if (out_bgra && stride >= 0 && t->renderer) {
+        ok = t->renderer->EndOffscreen(out_bgra, (uint32_t)stride);
+    } else if (t->renderer) {
+        /* 调用方不要像素也得让 renderer 收尾, 否则设备泄漏 */
+        t->renderer->EndOffscreen(nullptr, 0);
+    }
+    delete t;   /* ~DrawApiContext 顺带清掉 transientResources */
+    return ok ? 1 : 0;
+}
+
+static void DrawPolylineCommon(UiDrawCtx ctx, const UiPoint* pts, int count,
+                               UiColor color, float width, int closed, int dash) {
+    if (!pts || count < 2) return;
+    /* UiPoint 与 D2D1_POINT_2F 都是 {float x, float y}, 但不赌布局巧合 —
+     * 老实转一遍。栈上先放 64 个点, 超了才走堆 (铅笔笔迹通常几百点,
+     * 但绝大多数图元是 2~5 点)。 */
+    D2D1_POINT_2F stackBuf[64];
+    std::vector<D2D1_POINT_2F> heapBuf;
+    D2D1_POINT_2F* p = stackBuf;
+    if (count > (int)(sizeof(stackBuf) / sizeof(stackBuf[0]))) {
+        heapBuf.resize((size_t)count);
+        p = heapBuf.data();
+    }
+    for (int i = 0; i < count; ++i) { p[i].x = pts[i].x; p[i].y = pts[i].y; }
+
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx))
+        rec->DrawPolyline(p, (size_t)count, d2dColor, width, closed != 0, dash);
+    if (auto* r = R(ctx))
+        r->DrawPolyline(p, (size_t)count, d2dColor, width, closed != 0, dash);
+}
+
+UI_API void ui_draw_polyline(UiDrawCtx ctx, const UiPoint* pts, int count,
+                               UiColor color, float width, int closed) {
+    DrawPolylineCommon(ctx, pts, count, color, width, closed, UI_DASH_SOLID);
+}
+
+UI_API void ui_draw_polyline_ex(UiDrawCtx ctx, const UiPoint* pts, int count,
+                                  UiColor color, float width, int closed, int dash) {
+    DrawPolylineCommon(ctx, pts, count, color, width, closed, dash);
+}
+
+UI_API void ui_draw_line_ex(UiDrawCtx ctx, float x1, float y1, float x2, float y2,
+                              UiColor color, float width, int dash) {
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx)) rec->DrawLine({x1, y1}, {x2, y2}, d2dColor, width, dash);
+    if (auto* r = R(ctx)) r->DrawLine(x1, y1, x2, y2, d2dColor, width, dash);
+}
+
+UI_API void ui_draw_rect_ex(UiDrawCtx ctx, UiRect rect, UiColor color, float width, int dash) {
+    const auto d2dRect = ToD2DRect(rect);
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx)) rec->DrawRect(d2dRect, d2dColor, width, dash);
+    if (auto* r = R(ctx)) r->DrawRect(d2dRect, d2dColor, width, dash);
+}
+
+UI_API void ui_draw_ellipse_ex(UiDrawCtx ctx, UiRect rect, UiColor color, float width, int dash) {
+    const auto d2dRect = ToD2DRect(rect);
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx)) rec->DrawEllipse(d2dRect, d2dColor, width, dash);
+    if (auto* r = R(ctx)) r->DrawEllipse(d2dRect, d2dColor, width, dash);
+}
+
+UI_API void ui_draw_fill_quad(UiDrawCtx ctx, const UiPoint pts[4], UiColor color) {
+    if (!pts) return;
+    const D2D1_POINT_2F p[4] = {
+        {pts[0].x, pts[0].y}, {pts[1].x, pts[1].y},
+        {pts[2].x, pts[2].y}, {pts[3].x, pts[3].y},
+    };
+    const auto d2dColor = ToD2D(color);
+    if (auto* rec = Rec(ctx)) rec->FillQuad(p, d2dColor);
+    if (auto* r = R(ctx)) r->FillQuad(p, d2dColor);
 }
 
 UI_API void ui_draw_text(UiDrawCtx ctx, const wchar_t* text, UiRect rect, UiColor color, float fontSize) {
@@ -2557,8 +2914,19 @@ UI_API float ui_draw_measure_text(UiDrawCtx ctx, const wchar_t* text, float font
     return r->MeasureTextWidth(text, fontSize);
 }
 
-UI_API void ui_draw_bitmap(UiDrawCtx ctx, const uint8_t* pixels,
-                             int width, int height, int stride, UiRect dest) {
+/* UI_IMAGE_SAMPLING_* → 内部枚举。认不得的值按 LINEAR 处理 (跟
+ * ui_draw_bitmap 的历史行为一致), 不因为传错常量就整块不画。 */
+static ui::ImageSampling ToImageSampling(int sampling) {
+    switch (sampling) {
+        case UI_IMAGE_SAMPLING_NEAREST: return ui::ImageSampling::Nearest;
+        case UI_IMAGE_SAMPLING_CUBIC:   return ui::ImageSampling::HighQualityCubic;
+        default:                        return ui::ImageSampling::Linear;
+    }
+}
+
+static void DrawBitmapCommon(UiDrawCtx ctx, const uint8_t* pixels,
+                             int width, int height, int stride, UiRect dest,
+                             ui::ImageSampling sampling, float opacity) {
     auto* d = D(ctx);
     auto* r = d ? d->renderer : nullptr;
     auto* rec = d ? d->recorder : nullptr;
@@ -2574,7 +2942,7 @@ UI_API void ui_draw_bitmap(UiDrawCtx ctx, const uint8_t* pixels,
     const auto d2dDest = ToD2DRect(dest);
     if (rec) {
         rec->DrawImage({resourceKey, res->width, res->height, res->stride, res->format},
-                       d2dDest, ui::ImageSampling::Linear, 1.0f);
+                       d2dDest, sampling, opacity);
         rec->OwnResource(resourceKey);
         ownedByDisplayList = true;
     }
@@ -2583,13 +2951,114 @@ UI_API void ui_draw_bitmap(UiDrawCtx ctx, const uint8_t* pixels,
         auto bitmap = r->CreateBitmapFromPixels(res->bytes->data(), res->width, res->height, res->stride);
         if (bitmap) {
             if (!ownedByDisplayList) d->transientResources.push_back(resourceKey);
-            r->DrawBitmap(bitmap.Get(), d2dDest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            /* 即时路径: NEAREST/LINEAR 走老式 DrawBitmap 的插值模式,
+             * CUBIC 只有 DrawBitmapHQ 那条路有 (老接口枚举里没有立方)。 */
+            if (sampling == ui::ImageSampling::HighQualityCubic) {
+                r->DrawBitmapHQ(bitmap.Get(), d2dDest, opacity,
+                                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+            } else {
+                r->DrawBitmap(bitmap.Get(), d2dDest, opacity,
+                              sampling == ui::ImageSampling::Nearest
+                                  ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                                  : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            }
             return;
         }
     }
 
     if (!ownedByDisplayList) {
         ui::GlobalResourceStore().Remove(resourceKey);
+    }
+}
+
+UI_API void ui_draw_bitmap(UiDrawCtx ctx, const uint8_t* pixels,
+                             int width, int height, int stride, UiRect dest) {
+    DrawBitmapCommon(ctx, pixels, width, height, stride, dest,
+                     ui::ImageSampling::Linear, 1.0f);
+}
+
+UI_API void ui_draw_bitmap_ex(UiDrawCtx ctx, const uint8_t* pixels,
+                                int width, int height, int stride, UiRect dest,
+                                int sampling, float opacity) {
+    DrawBitmapCommon(ctx, pixels, width, height, stride, dest,
+                     ToImageSampling(sampling), opacity);
+}
+
+// ---- 宿主持有的位图 (build 338) ----
+// 句柄 → 资源库里的固定资源编号。每帧引用同一个编号, 渲染器按编号缓存的显卡位图就一直
+// 命中 (它只清掉当前帧没用到的), 不再每帧上传。资源常驻, 不进内存预算的驱逐。
+
+namespace {
+std::mutex g_bitmapHandlesMu;
+std::unordered_map<UiBitmap, ui::ResourceKey> g_bitmapHandles;
+UiBitmap g_nextBitmapHandle = 1;
+
+bool LookupBitmapHandle(UiBitmap bmp, ui::ResourceKey& key) {
+    std::lock_guard<std::mutex> lock(g_bitmapHandlesMu);
+    auto it = g_bitmapHandles.find(bmp);
+    if (it == g_bitmapHandles.end()) return false;
+    key = it->second;
+    return true;
+}
+}  // namespace
+
+UI_API UiBitmap ui_bitmap_create(const uint8_t* pixels, int width, int height, int stride) {
+    if (!pixels || width <= 0 || height <= 0 || stride < width * 4) return 0;
+    const ui::ResourceKey key = ui::GlobalResourceStore().AddImage(
+        ui::ResourceKind::Bitmap, NextDrawBitmapGeneration(), width, height, stride,
+        ui::PixelFormat::BgraPremul, pixels, true);
+    if (!key.IsValid()) return 0;
+    std::lock_guard<std::mutex> lock(g_bitmapHandlesMu);
+    const UiBitmap bmp = g_nextBitmapHandle++;
+    g_bitmapHandles.emplace(bmp, key);
+    return bmp;
+}
+
+UI_API void ui_bitmap_destroy(UiBitmap bmp) {
+    if (!bmp) return;
+    ui::ResourceKey key;
+    {
+        std::lock_guard<std::mutex> lock(g_bitmapHandlesMu);
+        auto it = g_bitmapHandles.find(bmp);
+        if (it == g_bitmapHandles.end()) return;
+        key = it->second;
+        g_bitmapHandles.erase(it);
+    }
+    ui::GlobalResourceStore().Remove(key);
+}
+
+UI_API void ui_draw_bitmap_handle(UiDrawCtx ctx, UiBitmap bmp, UiRect dest,
+                                  int sampling, float opacity) {
+    auto* d = D(ctx);
+    auto* r = d ? d->renderer : nullptr;
+    auto* rec = d ? d->recorder : nullptr;
+    if ((!r && !rec) || !bmp) return;
+    ui::ResourceKey key;
+    if (!LookupBitmapHandle(bmp, key)) return;
+    auto res = ui::GlobalResourceStore().Acquire(key);
+    if (!res || !res->bytes) return;
+
+    const auto d2dDest = ToD2DRect(dest);
+    const ui::ImageSampling mode = ToImageSampling(sampling);
+    if (rec) {
+        // 不 OwnResource: 资源归句柄, 帧画完不能删
+        rec->DrawImage({key, res->width, res->height, res->stride, res->format},
+                       d2dDest, mode, opacity);
+    }
+    if (r) {
+        /* 即时路径 (不经渲染线程的老式绘制) 没有按编号的缓存, 照旧每次建位图。 */
+        auto bitmap = r->CreateBitmapFromPixels(res->bytes->data(), res->width, res->height,
+                                                res->stride);
+        if (!bitmap) return;
+        if (mode == ui::ImageSampling::HighQualityCubic) {
+            r->DrawBitmapHQ(bitmap.Get(), d2dDest, opacity,
+                            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+        } else {
+            r->DrawBitmap(bitmap.Get(), d2dDest, opacity,
+                          mode == ui::ImageSampling::Nearest
+                              ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                              : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
     }
 }
 
@@ -2602,6 +3071,72 @@ UI_API void ui_draw_push_clip(UiDrawCtx ctx, UiRect rect) {
 UI_API void ui_draw_pop_clip(UiDrawCtx ctx) {
     if (auto* rec = Rec(ctx)) rec->PopClip();
     if (auto* r = R(ctx)) r->PopClip();
+}
+
+UI_API void ui_draw_push_transform(UiDrawCtx ctx, const float m[6]) {
+    if (!m) return;
+    /* D2D1_MATRIX_3X2_F 的字段顺序就是 {_11,_12,_21,_22,_31,_32}, 与入参
+     * 约定一致, 逐个写而不 memcpy —— 别指望布局巧合。 */
+    D2D1_MATRIX_3X2_F xf;
+    xf._11 = m[0]; xf._12 = m[1];
+    xf._21 = m[2]; xf._22 = m[3];
+    xf._31 = m[4]; xf._32 = m[5];
+    if (auto* rec = Rec(ctx)) rec->PushTransform(xf);
+    if (auto* r = R(ctx)) r->PushTransform(xf);
+}
+
+UI_API void ui_draw_pop_transform(UiDrawCtx ctx) {
+    if (auto* rec = Rec(ctx)) rec->PopTransform();
+    if (auto* r = R(ctx)) r->PopTransform();
+}
+
+UI_API void ui_draw_push_layer(UiDrawCtx ctx) {
+    if (auto* rec = Rec(ctx)) rec->PushLayer();
+    if (auto* r = R(ctx)) r->PushLayer();
+}
+
+UI_API void ui_draw_pop_layer(UiDrawCtx ctx) {
+    if (auto* rec = Rec(ctx)) rec->PopLayer();
+    if (auto* r = R(ctx)) r->PopLayer();
+}
+
+UI_API void ui_draw_bitmap_composite(UiDrawCtx ctx, const uint8_t* pixels,
+                                     int width, int height, int stride, UiRect dest,
+                                     int sampling, int composite) {
+    if (composite != UI_COMPOSITE_DEST_OUT) {
+        DrawBitmapCommon(ctx, pixels, width, height, stride, dest,
+                         ToImageSampling(sampling), 1.0f);
+        return;
+    }
+    auto* d = D(ctx);
+    auto* r = d ? d->renderer : nullptr;
+    auto* rec = d ? d->recorder : nullptr;
+    if ((!r && !rec) || !pixels || width <= 0 || height <= 0 || stride < width * 4) return;
+
+    /* 资源生命周期同 DrawBitmapCommon: 录制路径归 DisplayList, 即时路径挂到
+     * transientResources 等 ctx 结束时清。 */
+    const ui::ResourceKey key = ui::GlobalResourceStore().AddImage(
+        ui::ResourceKind::Bitmap, NextDrawBitmapGeneration(), width, height, stride,
+        ui::PixelFormat::BgraPremul, pixels, true);
+    auto res = ui::GlobalResourceStore().Acquire(key);
+    if (!res || !res->bytes) return;
+
+    const auto d2dDest = ToD2DRect(dest);
+    const ui::ImageSampling mode = ToImageSampling(sampling);
+    if (rec) {
+        rec->DrawImage({key, res->width, res->height, res->stride, res->format},
+                       d2dDest, mode, 1.0f, ui::CompositeMode::DestinationOut);
+        rec->OwnResource(key);
+    }
+    if (r) {
+        auto bitmap = r->CreateBitmapFromPixels(res->bytes->data(), res->width, res->height,
+                                                res->stride);
+        if (bitmap) {
+            r->DrawBitmapComposite(bitmap.Get(), d2dDest, mode,
+                                   ui::CompositeMode::DestinationOut);
+        }
+        if (!rec) d->transientResources.push_back(key);
+    }
 }
 
 // ================================================================
@@ -2677,6 +3212,18 @@ UI_API int ui_debug_screenshot_menu(UiWindow win, const wchar_t* outPath) {
     auto menu = w->ActiveMenu();
     if (!menu || !menu->IsVisible()) return -1;
     return menu->Screenshot(outPath);
+}
+
+UI_API char* ui_debug_toast_info(UiWindow win) {
+    auto* w = Win(win);
+    if (!w || !w->Handle()) return dupStr("{\"visible\":false}");
+    return dupStr(ui::OverlayService::Instance().DebugToastInfoJson(w->Handle()));
+}
+
+UI_API int ui_debug_screenshot_toast(UiWindow win, const wchar_t* outPath) {
+    auto* w = Win(win);
+    if (!w || !w->Handle() || !outPath) return -1;
+    return ui::OverlayService::Instance().DebugScreenshotToast(w->Handle(), outPath);
 }
 
 UI_API int ui_debug_screenshot_widget(UiWindow win, UiWidget widget,
@@ -2775,8 +3322,9 @@ UI_API int ui_debug_hover(UiWindow win, UiWidget w) {
 
 UI_API int ui_debug_mouse_move(UiWindow win, float x, float y) {
     auto* wi = Win(win); if (!wi) return -1;
+    /* 不再额外 Invalidate: 窗口的移动处理自己会请求 (并合并) 重绘, 模拟要跟真实
+     * WM_MOUSEMOVE 一致。截图会强制补画, 自动化不受影响。 */
     wi->SimMouseMove(x, y);
-    wi->Invalidate();
     return 0;
 }
 UI_API int ui_debug_mouse_down(UiWindow win, float x, float y) {
@@ -3112,6 +3660,14 @@ UI_API void ui_debug_set_menu_autoclose(int enabled) {
     ui::ContextMenu::g_debugSuppressAutoClose = (enabled == 0);
 }
 
+UI_API void ui_debug_set_menu_anim_slowmo(float factor) {
+    ui::ContextMenu::SetOpenAnimationTimeScale(factor);
+}
+
+UI_API void ui_debug_set_widget_anim_slowmo(float factor) {
+    ui::AnimatedFloat::SetGlobalTimeScale(factor);
+}
+
 UI_API void ui_window_invoke_sync(UiWindow win, void (*fn)(void* ud), void* ud) {
     auto* wi = Win(win); if (!wi || !fn) return;
     wi->InvokeSync(fn, ud);
@@ -3123,6 +3679,11 @@ UI_API void ui_window_set_min_size(UiWindow win, int w_dip, int h_dip) {
     auto* wi = Win(win); if (!wi) return;
     /* 负值当 0 处理（= 恢复默认） */
     wi->SetMinSize(w_dip < 0 ? 0 : w_dip, h_dip < 0 ? 0 : h_dip);
+}
+
+UI_API void ui_window_set_auto_height(UiWindow win, int enable) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->SetAutoHeight(enable != 0);
 }
 
 UI_API void ui_window_set_frameless(UiWindow win, int frameless) {
@@ -3152,6 +3713,12 @@ UI_API void ui_window_set_rect(UiWindow win, int x_screen, int y_screen,
                                 int w_dip, int h_dip) {
     auto* wi = Win(win); if (!wi) return;
     wi->SetWindowRect(x_screen, y_screen, w_dip, h_dip);
+}
+
+UI_API void ui_window_set_rect_px(UiWindow win, int x_screen, int y_screen,
+                                   int w_px, int h_px) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->SetWindowRectPx(x_screen, y_screen, w_px, h_px);
 }
 
 UI_API void ui_window_set_size(UiWindow win, int w_dip, int h_dip) {
@@ -3194,6 +3761,16 @@ UI_API void ui_window_set_aspect_lock(UiWindow win, int ratio_w, int ratio_h) {
     wi->SetAspectLock(ratio_w, ratio_h);
 }
 
+UI_API void ui_window_set_layered_transparent(UiWindow win, int on) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->SetLayeredTransparent(on != 0);
+}
+
+UI_API void ui_window_set_resize_inset(UiWindow win, float dip) {
+    auto* wi = Win(win); if (!wi) return;
+    wi->SetResizeInset(dip);
+}
+
 // ---- Font / Text rendering (since 1.3.0) ----
 
 static theme::TextRenderMode ToThemeMode(UiTextRenderMode m) {
@@ -3219,11 +3796,9 @@ static UiTextRenderMode FromThemeMode(theme::TextRenderMode m) {
 
 // 全局默认设完之后，刷新所有已存在窗口（让新字体 / 新模式立刻生效）
 static void RefreshAllWindowsAfterGlobalChange() {
-    /* 轻量刷新：flush 每个 Renderer 的 TextFormat 缓存 + 重建 fallback +
-     * 应用新 TextRenderMode。 */
-    auto& ctx = Ctx();
-    if (auto* w = ctx.FirstWindow()) (void)w;  /* anchor to suppress unused-func warn */
-    ctx.InvalidateAllWindows();
+    /* build 314: 以前这里只重绘, 各 Renderer 仍拿旧 TextFormat / 旧回退链,
+     * 运行时换字体不生效。现在每个窗口清缓存 + 重建回退链 + 重排。 */
+    Ctx().RefreshTextAllWindows();
 }
 
 UI_API void ui_theme_set_default_font(const wchar_t* family) {
@@ -3237,6 +3812,14 @@ UI_API const wchar_t* ui_theme_get_default_font(void) {
 UI_API void ui_theme_set_cjk_font(const wchar_t* latin, const wchar_t* cjk) {
     theme::SetCjkFonts(latin, cjk);
     RefreshAllWindowsAfterGlobalChange();
+}
+UI_API void ui_theme_set_text_locale(const wchar_t* locale) {
+    theme::SetTextLocale(locale);
+    RefreshAllWindowsAfterGlobalChange();
+}
+UI_API const wchar_t* ui_theme_get_text_locale(void) {
+    const wchar_t* l = theme::TextLocale();
+    return l ? l : L"";
 }
 UI_API const wchar_t* ui_theme_get_cjk_latin_font(void) { return theme::LatinFontFamily(); }
 UI_API const wchar_t* ui_theme_get_cjk_cjk_font(void)   { return theme::CjkFontFamily(); }
@@ -3281,6 +3864,7 @@ static HWND WinHwnd(UiWindow win) {
     return wi ? wi->Handle() : nullptr;
 }
 
+/* ui_debug_post_*: 走真实消息队列, wParam 带模拟输入标记 (测试隔离下不被当成用户的鼠标丢掉)。 */
 static LPARAM PackXY(float x, float y, float dpiScale) {
     int px = (int)(x * dpiScale);
     int py = (int)(y * dpiScale);
@@ -3290,21 +3874,21 @@ static LPARAM PackXY(float x, float y, float dpiScale) {
 UI_API int ui_debug_post_click(UiWindow win, float x, float y) {
     auto* wi = Win(win); if (!wi || !wi->Handle()) return -1;
     LPARAM lp = PackXY(x, y, wi->DpiScale());
-    PostMessageW(wi->Handle(), WM_LBUTTONDOWN, MK_LBUTTON, lp);
-    PostMessageW(wi->Handle(), WM_LBUTTONUP,   0,          lp);
+    PostMessageW(wi->Handle(), WM_LBUTTONDOWN, MK_LBUTTON | ui::kSimInputMark, lp);
+    PostMessageW(wi->Handle(), WM_LBUTTONUP,   ui::kSimInputMark,              lp);
     return 0;
 }
 UI_API int ui_debug_post_right_click(UiWindow win, float x, float y) {
     auto* wi = Win(win); if (!wi || !wi->Handle()) return -1;
     LPARAM lp = PackXY(x, y, wi->DpiScale());
-    PostMessageW(wi->Handle(), WM_RBUTTONDOWN, MK_RBUTTON, lp);
-    PostMessageW(wi->Handle(), WM_RBUTTONUP,   0,          lp);
+    PostMessageW(wi->Handle(), WM_RBUTTONDOWN, MK_RBUTTON | ui::kSimInputMark, lp);
+    PostMessageW(wi->Handle(), WM_RBUTTONUP,   ui::kSimInputMark,              lp);
     return 0;
 }
 UI_API int ui_debug_post_mouse_move(UiWindow win, float x, float y) {
     auto* wi = Win(win); if (!wi || !wi->Handle()) return -1;
     LPARAM lp = PackXY(x, y, wi->DpiScale());
-    PostMessageW(wi->Handle(), WM_MOUSEMOVE, 0, lp);
+    PostMessageW(wi->Handle(), WM_MOUSEMOVE, ui::kSimInputMark, lp);
     return 0;
 }
 UI_API int ui_debug_post_key(UiWindow win, int vk) {

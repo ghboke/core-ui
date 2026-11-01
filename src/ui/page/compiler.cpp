@@ -1,6 +1,7 @@
 #include "compiler.h"
 #include "widget_factory.h"
 #include "svg_widget.h"
+#include "svg_symbols.h"
 #include "../css/selector.h"
 #include "../css/cascade.h"
 #include "../css/css_parser.h"
@@ -102,6 +103,13 @@ void ApplyMenuMaterialDecl(CompiledMenu& menu, const std::string& name, const st
             menu.backdropBlur = blur;
             menu.hasBackdropBlur = true;
         }
+        return;
+    }
+    /* build 307: <menu min-width="222"> / style="min-width: 222px" (DIP)。 */
+    if (name == "min-width" || name == "minWidth") {
+        std::string v = value;
+        if (v.size() > 2 && v.compare(v.size() - 2, 2, "px") == 0) v.resize(v.size() - 2);
+        try { menu.minWidth = std::max(0.0f, std::stof(v)); } catch (...) {}
     }
 }
 
@@ -295,6 +303,51 @@ bool ParseVFor(const std::string& expr, std::string& loopVar, std::string& index
     return !loopVar.empty() && !listName.empty();
 }
 
+// build 313: <select> 的选项拼成一条 JS 数组表达式 (尚未 this. 前缀, 走普通
+// binding 的 RewriteTemplateExpr; v-for 变量是箭头函数参数, 改写器不会前缀)。
+// 只有存在 <option v-for> 或 {{ }} 时返回 true —— 纯静态 select 留给老路径,
+// 行为 (含 @key 的 RetranslateItems) 一字不变。
+bool BuildSelectItemsSourceJs(const ui::uix::Node& select, std::string& outJs,
+                              std::vector<std::string>& errors) {
+    bool dynamic = false;
+    std::vector<std::string> parts;
+    for (const auto& c : select.children) {
+        if (c->kind != ui::uix::NodeKind::Element || c->tag != "option") continue;
+        const std::string text = "\"\" + (" + BuildTextSourceJs(*c) + ")";
+
+        const ui::uix::Attr* vFor = nullptr;
+        for (const auto& a : c->attrs) {
+            if (a.kind == ui::uix::AttrKind::Directive && a.name == "for") vFor = &a;
+        }
+        if (vFor) {
+            std::string loopVar, indexVar, listName;
+            if (!ParseVFor(vFor->rawValue, loopVar, indexVar, listName)) {
+                errors.push_back("malformed v-for value on <option>: '" + vFor->rawValue + "'");
+                continue;
+            }
+            dynamic = true;
+            const std::string params = indexVar.empty() ? loopVar : loopVar + ", " + indexVar;
+            parts.push_back("((" + listName + ") || []).map((" + params + ") => " + text + ")");
+        } else {
+            // 只有 {{ }} 才算动态; 纯 @key 文本老路径处理得了。
+            bool realInterp = false;
+            for (const auto& oc : c->children) {
+                if (oc->kind == ui::uix::NodeKind::Interpolation) realInterp = true;
+            }
+            if (realInterp) dynamic = true;
+            parts.push_back("[" + text + "]");
+        }
+    }
+    if (!dynamic) return false;
+    outJs = "[].concat(";
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i) outJs += ", ";
+        outJs += parts[i];
+    }
+    outJs += ")";
+    return true;
+}
+
 void CompileElement(CompilerCtx& ctx,
                     const ui::uix::Node& node,
                     const ui::css::MatchNode* parentMatch,
@@ -471,7 +524,8 @@ void CompileElement(CompilerCtx& ctx,
             auto isStructuralMenuChild = [](const ui::uix::Node& n) -> bool {
                 return n.kind == ui::uix::NodeKind::Element &&
                        (n.tag == "menu" || n.tag == "menuitem" ||
-                        n.tag == "separator" || n.tag == "hr");
+                        n.tag == "separator" || n.tag == "hr" ||
+                        n.tag == "template");
             };
             /* 把 node 的子节点克隆进一个 <div class="menuitem-row"> wrapper.
              * Text / Interpolation 自动包 <label> (方便 <menuitem>文字</menuitem>);
@@ -532,155 +586,212 @@ void CompileElement(CompilerCtx& ctx,
                 return wrapper;
             };
 
-            for (const auto& cptr : mNode.children) {
-                if (!cptr) continue;
-                const auto& c = *cptr;
-                if (c.kind != ui::uix::NodeKind::Element) continue;
+            /* build 303: 子项编译抽成可递归的 lambda —— <template v-for / v-if>
+             * 把它的子节点编进一个分组项, 结构跟菜单本身的子项完全一样。 */
+            std::function<void(const ui::uix::Node&, std::vector<CompiledMenuItem>&)> compileItems;
+            compileItems = [&](const ui::uix::Node& parentNode,
+                               std::vector<CompiledMenuItem>& out) {
+                for (const auto& cptr : parentNode.children) {
+                    if (!cptr) continue;
+                    const auto& c = *cptr;
+                    if (c.kind != ui::uix::NodeKind::Element) continue;
 
-                /* BREAKING (build 75): 嵌套 <menu title="..." v-if="..."> 当
-                 * submenu. submenu 的 "parent 入口" 视觉跟 menuitem 同款
-                 * widget-template 渲染.
-                 * L172 (build 164): 父行外观现在跟 <menuitem> 一样自由 —— 可写
-                 * <menu><svg/><label>title</label>...<menuitem/></menu> 富内容
-                 * (buildRowWrapper skip 掉 menuitem/menu/separator 子节点当外观);
-                 * 不写内容子节点时回落到 title (静态或 :title 反应式) 合成 <label>,
-                 * 跟 <menuitem><label>title</label></menuitem> 等价 (老用法不破). */
-                if (c.tag == "menu") {
-                    CompiledMenuItem mi;
-                    std::string titleStatic;
-                    std::string titleBound;
-                    for (const auto& a : c.attrs) {
-                        if (a.kind == ui::uix::AttrKind::Static) {
-                            if (a.name == "title" || a.name == "text")
-                                titleStatic = a.rawValue;
-                        } else if (a.kind == ui::uix::AttrKind::Bind) {
-                            if (a.name == "title" || a.name == "text")
-                                titleBound = a.rawValue;
-                        } else if (a.kind == ui::uix::AttrKind::Directive) {
-                            if (a.name == "if" || a.name == "show")
-                                mi.vIfExpr = a.rawValue;
-                        }
-                    }
-                    /* L172: 父行外观 — 优先用 <menu> 的"非结构性"子节点 (svg /
-                     * label / img / 文字, 即除 menuitem/menu/separator 外的) 当富
-                     * 内容, 跟 <menuitem><svg/><label/></menuitem> 同款; 没写这类
-                     * 子节点时回落到 :title/text 合成 <label> (老用法不破). */
-                    bool gotContent = false;
-                    auto wrapper = buildRowWrapper(c, /*skipStructural=*/true, gotContent);
-                    if (!gotContent) {
-                        auto labelNode = std::make_unique<ui::uix::Node>();
-                        labelNode->kind = ui::uix::NodeKind::Element;
-                        labelNode->tag = "label";
-                        if (!titleBound.empty()) {
-                            auto interp = std::make_unique<ui::uix::Node>();
-                            interp->kind = ui::uix::NodeKind::Interpolation;
-                            interp->text = titleBound;
-                            labelNode->children.push_back(std::move(interp));
-                        } else {
-                            auto textNode = std::make_unique<ui::uix::Node>();
-                            textNode->kind = ui::uix::NodeKind::Text;
-                            textNode->text = titleStatic;
-                            labelNode->children.push_back(std::move(textNode));
-                        }
-                        wrapper->children.push_back(std::move(labelNode));
-                    }
-                    mi.contentRoot = std::move(wrapper);
-
-                    mi.submenu = compileMenu(c, 1, false /*not top*/,
-                                             cm->rowClass,
-                                             cm->shareWidthWithSubmenus);
-                    if (mi.itemId == 0) mi.itemId = autoId++;
-                    cm->items.push_back(std::move(mi));
-                    continue;
-                }
-
-                CompiledMenuItem mi;
-                if (c.tag == "separator" || c.tag == "hr") {
-                    mi.separator = true;
-                    /* separator 支持 v-if / v-show. */
-                    for (const auto& a : c.attrs) {
-                        if (a.kind == ui::uix::AttrKind::Directive &&
-                            (a.name == "if" || a.name == "show")) {
-                            mi.vIfExpr = a.rawValue;
-                        }
-                    }
-                    cm->items.push_back(std::move(mi));
-                    continue;
-                }
-                if (c.tag != "menuitem") {
-                    /* L172: 非 menuitem/menu/separator 的元素子节点 —
-                     *   top-level 菜单 (无父行): 笔误, 报错 (保持原行为继续拦);
-                     *   submenu 体 (top==false): 这是本 <menu> 自己的父行 entry
-                     *   content (svg/label/...), 已被上层 buildRowWrapper 消费,
-                     *   这里静默跳过, 不当 item, 不报错. */
-                    if (top) {
-                        ctx.out->errors.push_back(
-                            "<menu> child must be <menuitem>, <separator>, or nested <menu>, got <"
-                            + c.tag + ">.");
-                    }
-                    continue;
-                }
-
-                /* BREAKING (build 75): 老的 icon/style/text 静态属性 + :text/
-                 * :icon/:style 反应式属性 全 deprecated 砍掉. menuitem body
-                 * 直接当 widget content slot. 保留:
-                 *   id (静态 int) — 派发 callback
-                 *   shortcut (静态 / :shortcut 反应式) — 右对齐显示, 不可点
-                 *   onclick / @click — JS method 名 (跟 id callback 等价)
-                 *   :enabled — 反应式 disable
-                 *   v-if / v-show / v-for — 同 widget 标准 */
-                for (const auto& a : c.attrs) {
-                    if (a.kind == ui::uix::AttrKind::Static) {
-                        mi.attrs.push_back({a.name, a.rawValue});  // 捕获全部静态属性 → callback 可读
-                        if (a.name == "id") {
-                            mi.strId = a.rawValue;                 // 字符串 id (key 如 "cmd_delete" 或数字串)
-                            /* 数字 id 时也填 int (内部 hit-test/debug); 非数字 key
-                             * 留 itemId=0, 下面 autoId 兜底。不再报错。 */
-                            try { mi.itemId = std::stoi(a.rawValue); }
-                            catch (...) {}
-                        }
-                        else if (a.name == "shortcut") mi.shortcut = a.rawValue;
-                        else if (a.name == "onclick")  mi.onClick  = a.rawValue;
-                    }
-                    else if (a.kind == ui::uix::AttrKind::Bind) {
-                        if      (a.name == "shortcut") mi.boundShortcutExpr = a.rawValue;
-                        else if (a.name == "enabled")  mi.boundEnabledExpr  = a.rawValue;
-                        /* 注: :text / :icon / :style 不再支持, 改写 menuitem
-                         * body 内放 <svg :style="..."/> 或 <label>{{ x }}</label>
-                         * 等任意 widget. */
-                    }
-                    else if (a.kind == ui::uix::AttrKind::Directive) {
-                        if (a.name == "if" || a.name == "show") mi.vIfExpr = a.rawValue;
-                        else if (a.name == "for") {
-                            std::string lv, iv, ln;
-                            if (ParseVFor(a.rawValue, lv, iv, ln)) {
-                                mi.vForIterVar   = lv;
-                                mi.vForIndexVar  = iv;
-                                mi.vForArrayExpr = ln;
-                            } else {
-                                ctx.out->errors.push_back(
-                                    "<menuitem v-for='" + a.rawValue +
-                                    "'>: expected \"x in items\" or \"(x, i) in items\"");
+                    /* build 303: <template v-for / v-if> 不产生行, 只把一组子项
+                     * 按条件 / 迭代展开 (Vue 语义), 可混放 menuitem / separator
+                     * / 嵌套 menu, 也可再嵌 template。 */
+                    if (c.tag == "template") {
+                        CompiledMenuItem grp;
+                        grp.group = true;
+                        for (const auto& a : c.attrs) {
+                            if (a.kind != ui::uix::AttrKind::Directive) continue;
+                            if (a.name == "if" || a.name == "show") {
+                                grp.vIfExpr = a.rawValue;
+                            } else if (a.name == "for") {
+                                std::string lv, iv, ln;
+                                if (ParseVFor(a.rawValue, lv, iv, ln)) {
+                                    grp.vForIterVar   = lv;
+                                    grp.vForIndexVar  = iv;
+                                    grp.vForArrayExpr = ln;
+                                } else {
+                                    ctx.out->errors.push_back(
+                                        "<template v-for='" + a.rawValue +
+                                        "'> in <menu>: expected \"x in items\" or \"(x, i) in items\"");
+                                }
                             }
                         }
+                        compileItems(c, grp.groupItems);
+                        out.push_back(std::move(grp));
+                        continue;
                     }
-                    else if (a.kind == ui::uix::AttrKind::Event && a.name == "click" &&
-                             !a.rawValue.empty()) {
-                        mi.onClick = a.rawValue;
+
+                    /* BREAKING (build 75): 嵌套 <menu title="..." v-if="..."> 当
+                     * submenu. submenu 的 "parent 入口" 视觉跟 menuitem 同款
+                     * widget-template 渲染.
+                     * L172 (build 164): 父行外观现在跟 <menuitem> 一样自由 —— 可写
+                     * <menu><svg/><label>title</label>...<menuitem/></menu> 富内容
+                     * (buildRowWrapper skip 掉 menuitem/menu/separator 子节点当外观);
+                     * 不写内容子节点时回落到 title (静态或 :title 反应式) 合成 <label>,
+                     * 跟 <menuitem><label>title</label></menuitem> 等价 (老用法不破). */
+                    if (c.tag == "menu") {
+                        CompiledMenuItem mi;
+                        std::string titleStatic;
+                        std::string titleBound;
+                        for (const auto& a : c.attrs) {
+                            if (a.kind == ui::uix::AttrKind::Static) {
+                                if (a.name == "title" || a.name == "text")
+                                    titleStatic = a.rawValue;
+                            } else if (a.kind == ui::uix::AttrKind::Bind) {
+                                if (a.name == "title" || a.name == "text")
+                                    titleBound = a.rawValue;
+                                else if (a.name == "enabled")
+                                    mi.boundEnabledExpr = a.rawValue;
+                            } else if (a.kind == ui::uix::AttrKind::Directive) {
+                                if (a.name == "if" || a.name == "show")
+                                    mi.vIfExpr = a.rawValue;
+                                else if (a.name == "for") {
+                                    /* build 303: <menu v-for> — 每次迭代一个子菜单实例,
+                                     * 迭代变量一路传进子菜单 (PopulateMenuItem)。 */
+                                    std::string lv, iv, ln;
+                                    if (ParseVFor(a.rawValue, lv, iv, ln)) {
+                                        mi.vForIterVar   = lv;
+                                        mi.vForIndexVar  = iv;
+                                        mi.vForArrayExpr = ln;
+                                    } else {
+                                        ctx.out->errors.push_back(
+                                            "<menu v-for='" + a.rawValue +
+                                            "'>: expected \"x in items\" or \"(x, i) in items\"");
+                                    }
+                                }
+                            }
+                        }
+                        /* L172: 父行外观 — 优先用 <menu> 的"非结构性"子节点 (svg /
+                         * label / img / 文字, 即除 menuitem/menu/separator 外的) 当富
+                         * 内容, 跟 <menuitem><svg/><label/></menuitem> 同款; 没写这类
+                         * 子节点时回落到 :title/text 合成 <label> (老用法不破). */
+                        bool gotContent = false;
+                        auto wrapper = buildRowWrapper(c, /*skipStructural=*/true, gotContent);
+                        if (!gotContent) {
+                            auto labelNode = std::make_unique<ui::uix::Node>();
+                            labelNode->kind = ui::uix::NodeKind::Element;
+                            labelNode->tag = "label";
+                            if (!titleBound.empty()) {
+                                auto interp = std::make_unique<ui::uix::Node>();
+                                interp->kind = ui::uix::NodeKind::Interpolation;
+                                interp->text = titleBound;
+                                labelNode->children.push_back(std::move(interp));
+                            } else {
+                                auto textNode = std::make_unique<ui::uix::Node>();
+                                textNode->kind = ui::uix::NodeKind::Text;
+                                textNode->text = titleStatic;
+                                labelNode->children.push_back(std::move(textNode));
+                            }
+                            wrapper->children.push_back(std::move(labelNode));
+                        }
+                        mi.contentRoot = std::move(wrapper);
+
+                        mi.submenu = compileMenu(c, 1, false /*not top*/,
+                                                 cm->rowClass,
+                                                 cm->shareWidthWithSubmenus);
+                        if (mi.itemId == 0) mi.itemId = autoId++;
+                        out.push_back(std::move(mi));
+                        continue;
                     }
+
+                    CompiledMenuItem mi;
+                    if (c.tag == "separator" || c.tag == "hr") {
+                        mi.separator = true;
+                        /* separator 支持 v-if / v-show. */
+                        for (const auto& a : c.attrs) {
+                            if (a.kind == ui::uix::AttrKind::Directive &&
+                                (a.name == "if" || a.name == "show")) {
+                                mi.vIfExpr = a.rawValue;
+                            }
+                        }
+                        out.push_back(std::move(mi));
+                        continue;
+                    }
+                    if (c.tag != "menuitem") {
+                        /* L172: 非 menuitem/menu/separator 的元素子节点 —
+                         *   top-level 菜单 (无父行): 笔误, 报错 (保持原行为继续拦);
+                         *   submenu 体 (top==false): 这是本 <menu> 自己的父行 entry
+                         *   content (svg/label/...), 已被上层 buildRowWrapper 消费,
+                         *   这里静默跳过, 不当 item, 不报错.
+                         *   <template> 里没有父行外观一说, 同样报错。 */
+                        if (top || &parentNode != &mNode) {
+                            ctx.out->errors.push_back(
+                                "<menu> child must be <menuitem>, <separator>, <template>, "
+                                "or nested <menu>, got <" + c.tag + ">.");
+                        }
+                        continue;
+                    }
+
+                    /* BREAKING (build 75): 老的 icon/style/text 静态属性 + :text/
+                     * :icon/:style 反应式属性 全 deprecated 砍掉. menuitem body
+                     * 直接当 widget content slot. 保留:
+                     *   id (静态 int) — 派发 callback
+                     *   shortcut (静态 / :shortcut 反应式) — 右对齐显示, 不可点
+                     *   onclick / @click — JS method 名 (跟 id callback 等价)
+                     *   :enabled — 反应式 disable
+                     *   v-if / v-show / v-for — 同 widget 标准 */
+                    for (const auto& a : c.attrs) {
+                        if (a.kind == ui::uix::AttrKind::Static) {
+                            mi.attrs.push_back({a.name, a.rawValue});  // 捕获全部静态属性 → callback 可读
+                            if (a.name == "id") {
+                                mi.strId = a.rawValue;                 // 字符串 id (key 如 "cmd_delete" 或数字串)
+                                /* 数字 id 时也填 int (内部 hit-test/debug); 非数字 key
+                                 * 留 itemId=0, 下面 autoId 兜底。不再报错。 */
+                                try { mi.itemId = std::stoi(a.rawValue); }
+                                catch (...) {}
+                            }
+                            else if (a.name == "shortcut") mi.shortcut = a.rawValue;
+                            else if (a.name == "onclick")  mi.onClick  = a.rawValue;
+                        }
+                        else if (a.kind == ui::uix::AttrKind::Bind) {
+                            if      (a.name == "shortcut") mi.boundShortcutExpr = a.rawValue;
+                            else if (a.name == "enabled")  mi.boundEnabledExpr  = a.rawValue;
+                            else if (a.name == "disabled")  // HTML 写法, :enabled 取反
+                                mi.boundEnabledExpr = "!(" + a.rawValue + ")";
+                            /* 注: :text / :icon / :style 不再支持, 改写 menuitem
+                             * body 内放 <svg :style="..."/> 或 <label>{{ x }}</label>
+                             * 等任意 widget. */
+                            else if (a.name != "text" && a.name != "icon" && a.name != "style" &&
+                                     a.name != "key")
+                                mi.boundAttrs.push_back({a.name, a.rawValue});  // :id / :data-* ...
+                        }
+                        else if (a.kind == ui::uix::AttrKind::Directive) {
+                            if (a.name == "if" || a.name == "show") mi.vIfExpr = a.rawValue;
+                            else if (a.name == "for") {
+                                std::string lv, iv, ln;
+                                if (ParseVFor(a.rawValue, lv, iv, ln)) {
+                                    mi.vForIterVar   = lv;
+                                    mi.vForIndexVar  = iv;
+                                    mi.vForArrayExpr = ln;
+                                } else {
+                                    ctx.out->errors.push_back(
+                                        "<menuitem v-for='" + a.rawValue +
+                                        "'>: expected \"x in items\" or \"(x, i) in items\"");
+                                }
+                            }
+                        }
+                        else if (a.kind == ui::uix::AttrKind::Event && a.name == "click" &&
+                                 !a.rawValue.empty()) {
+                            mi.onClick = a.rawValue;
+                        }
+                    }
+
+                    /* L172: menuitem 行内容 — 复用上提的 buildRowWrapper
+                     * (skipStructural=false, 克隆全部子节点). Text/Interpolation 自动
+                     * 包 <label>, 元素原样 clone. 跟 submenu 父行共用同一份逻辑,
+                     * 不再内联重复 cloneNode + 克隆循环. */
+                    bool miGotContent = false;
+                    auto wrapper = buildRowWrapper(c, /*skipStructural=*/false, miGotContent);
+                    mi.contentRoot = std::move(wrapper);
+
+                    if (mi.itemId == 0) mi.itemId = autoId++;
+                    out.push_back(std::move(mi));
                 }
-
-                /* L172: menuitem 行内容 — 复用上提的 buildRowWrapper
-                 * (skipStructural=false, 克隆全部子节点). Text/Interpolation 自动
-                 * 包 <label>, 元素原样 clone. 跟 submenu 父行共用同一份逻辑,
-                 * 不再内联重复 cloneNode + 克隆循环. */
-                bool miGotContent = false;
-                auto wrapper = buildRowWrapper(c, /*skipStructural=*/false, miGotContent);
-                mi.contentRoot = std::move(wrapper);
-
-                if (mi.itemId == 0) mi.itemId = autoId++;
-                cm->items.push_back(std::move(mi));
-            }
+            };
+            compileItems(mNode, cm->items);
             return cm;
         };
 
@@ -807,7 +918,7 @@ void CompileElement(CompilerCtx& ctx,
             rawW->expanding = false;
             rawW->flex = 1.0f;
             ApplyCommonStyle(*rawW, s);
-            rawW->ApplyDynamicPositionOverrides();
+            rawW->ApplyDynamicOverrides();
             ApplyFlexContainerStyle(*rawW, s);
             ApplyFlexItemStyle(*rawW, s);
             // SVG-specific reactive hook: re-run the CSS-to-shape pipeline
@@ -821,7 +932,28 @@ void CompileElement(CompilerCtx& ctx,
     // ---- <select>: collect <option> children into ComboBox items ----
     // Also prevents options from being compiled as separate child widgets.
     bool isSelect = (node.tag == "select");
+    // build 313: 任一 <option> 带 v-for 或 {{ }} → 整组选项编成一条 "items"
+    // 反应式绑定 (JS 数组), 按书写顺序拼: 静态 option → [文字], @key →
+    // [$t('key')] (随 locale 刷新), v-for → list.map((x, i) => 文字)。
+    // 纯静态 select 保持下面的老路径不变。
+    // build 314 修正: 只跳过静态收集, isSelect 必须保持 true —— 下方 "不把子节点
+    // 编译成子控件" 的判断也看它, 置 false 会让 <option> 长成 ComboBox 的子控件、
+    // <option v-for> 还会起一个 CompiledLoop。
+    bool dynamicSelect = false;
     if (isSelect) {
+        if (auto* cb = dynamic_cast<ComboBoxWidget*>(w.get())) {
+            if (std::string itemsJs; BuildSelectItemsSourceJs(node, itemsJs, ctx.out->errors)) {
+                cb->SetItems({});
+                CompiledBinding binding;
+                binding.target = w.get();
+                binding.property = "items";
+                binding.sourceJs = std::move(itemsJs);
+                ctx.out->bindings.push_back(std::move(binding));
+                dynamicSelect = true;
+            }
+        }
+    }
+    if (isSelect && !dynamicSelect) {
         if (auto* cb = dynamic_cast<ComboBoxWidget*>(w.get())) {
             std::vector<std::wstring> items;
             std::vector<std::string>  i18nKeys;   // L83: per-option i18n key ("" = literal)
@@ -1076,6 +1208,30 @@ void CompileElement(CompilerCtx& ctx,
                     }
                     if (c->tag == "linearGradient") { parseGradient(*c, SvgGradient::Kind::Linear); continue; }
                     if (c->tag == "radialGradient") { parseGradient(*c, SvgGradient::Kind::Radial); continue; }
+                    /* build 304: SVG sprite. <symbol> 只登记不绘制; <use> 记下
+                     * href (静态或 :href 绑定), 绘制前解析 (见 svg_symbols.h)。 */
+                    if (c->tag == "symbol") {
+                        for (const auto& a : c->attrs) {
+                            if (a.kind == ui::uix::AttrKind::Static && a.name == "id")
+                                RegisterSvgSymbol(a.rawValue, BuildSvgSymbol(*c));
+                        }
+                        continue;
+                    }
+                    if (c->tag == "use") {
+                        for (const auto& a : c->attrs) {
+                            if (a.name != "href" && a.name != "xlink:href") continue;
+                            if (a.kind == ui::uix::AttrKind::Static) {
+                                svg->SetUseHref(a.rawValue);
+                            } else if (a.kind == ui::uix::AttrKind::Bind && !a.rawValue.empty()) {
+                                CompiledBinding cb;
+                                cb.target = w.get();
+                                cb.property = "use.href";
+                                cb.sourceJs = a.rawValue;
+                                ctx.out->bindings.push_back(std::move(cb));
+                            }
+                        }
+                        continue;
+                    }
                     int k = kindOf(c->tag);
                     if (k < 0) continue;
                     SvgShape shape;

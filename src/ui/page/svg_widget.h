@@ -113,6 +113,14 @@ public:
         return it == gradients_.end() ? nullptr : &it->second;
     }
 
+    /* build 304: <use href="#id"> / <use href="file.svg#id"> —— 图形与 viewBox 取自
+     * 引用的 <symbol> (见 svg_symbols.h)。href 记下后在绘制前才解析, 因为 sprite
+     * 可能写在文档后面; :href 绑定变化时重新解析。 */
+    void SetUseHref(const std::string& href);
+    const std::string& UseHref() const { return useHref_; }
+    // 解析 href 并装入图形。true = 已拿到 symbol (无 <use> 时恒 true)。
+    bool ResolveUse();
+
     void OnDraw(Renderer& r) override;
     D2D1_SIZE_F SizeHint() const override { return {vpWidth, vpHeight}; }
 
@@ -126,6 +134,8 @@ private:
 
     std::vector<SvgShape> shapes_;
     std::unordered_map<std::string, SvgGradient> gradients_;
+    std::string useHref_;
+    bool useResolved_ = true;   // 没有 <use>, 或当前 href 已装入
 
     // shapeIdx → (attr name → 最后由 SetShapeProperty 应用的值). 反应式 :attr
     // binding 设值时同步缓存; recomputeShapes 重建 shape 后用 ReapplyBoundAttrs

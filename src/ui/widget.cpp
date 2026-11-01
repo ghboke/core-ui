@@ -7,10 +7,12 @@
 namespace ui {
 void RequestLayout() {
     LayoutDirtyFlag() = true;
+    ++LayoutGeneration();
     GetContext().InvalidateAllWindows();
 }
 
-void Widget::ApplyDynamicPositionOverrides() {
+/* 把命令式写过的字段补回 —— 必须在 CSS 级联**之后**调, 见 widget.h 的说明。 */
+void Widget::ApplyDynamicOverrides() {
     if (dynamicPosLeftSet) {
         posLeft = dynamicPosLeft;
         posLeftRaw = dynamicPosLeftRaw;
@@ -27,9 +29,13 @@ void Widget::ApplyDynamicPositionOverrides() {
         posBottom = dynamicPosBottom;
         posBottomRaw = dynamicPosBottomRaw;
     }
+    if (dynamicBgSet) {
+        bgColor = dynamicBg;
+    }
 }
 }  // namespace ui
 #include "css/value.h"
+#include "debug_trace.h"
 
 #include <d2d1_1.h>
 #include <wrl/client.h>
@@ -58,6 +64,30 @@ float ResolveAbsSide(const std::string& raw, float fallback, float parentSize) {
         }
     }
     return fallback;
+}
+
+/* build 328: 排版挤压警告。子项分到的高度比它自己需要的小 = 内容被压扁或
+ * 被别的东西盖住 (弹窗底部按钮被压成 0 高就是这样, 当时毫无提示)。只在 trace
+ * 开着时检查 —— 要多问一次 HeightForWidth。need<=0 的 (ScrollView 等不报自然
+ * 高度的容器) 不算, 免得滚动区误报。 */
+const char* NearestId(const Widget* w) {
+    for (; w; w = w->Parent())
+        if (!w->id.empty()) return w->id.c_str();
+    return "";
+}
+
+void TraceIfSqueezed(const Widget* container, const Widget* child,
+                     float width, float got) {
+    float need = child->fixedH > 0 ? child->fixedH : child->HeightForWidth(width);
+    if (need <= 0) return;
+    need = std::clamp(need, child->minH, child->maxH);
+    if (got + 0.5f >= need) return;
+    TraceEvent("core_layout", "layout_squeezed",
+               {TraceStr("child", child->id.c_str()),
+                TraceStr("near", NearestId(child)),
+                TraceStr("container", NearestId(container)),
+                TraceF64("need_h", need),
+                TraceF64("got_h", got)});
 }
 
 void ResolvePercentSizing(Widget* child, float parentW, float parentH) {
@@ -354,7 +384,7 @@ static void RecomputeSubtreeStyles(Widget* w) {
     for (auto& child : w->Children()) {
         if (child->recomputeStyle) {
             child->lastStateBits = child->CurrentStateBits();
-            child->recomputeStyle(child->lastStateBits);
+            child->RecomputeStyleNow(child->lastStateBits);
         }
         RecomputeSubtreeStyles(child.get());
     }
@@ -365,7 +395,7 @@ void Widget::RefreshCssState() {
     uint32_t bits = CurrentStateBits();
     if (bits == lastStateBits) return;
     lastStateBits = bits;
-    recomputeStyle(bits);
+    RecomputeStyleNow(bits);
     RecomputeSubtreeStyles(this);
 }
 
@@ -640,15 +670,22 @@ void VBoxWidget::DoLayout() {
         ResolvePercentSizing(child, cw, totalH);
     }
 
+    // Cross-axis widths first (build 323): a wrapping child's height depends on
+    // the width it gets, so heights below ask HeightForWidth(width).
+    std::vector<float> widths(vis.size());
+    for (size_t i = 0; i < vis.size(); i++)
+        widths[i] = ChildCrossWidth(vis[i], cw);
+
     // First pass: measure fixed children, sum flex weights
     float usedH = 0;
     float totalFlex = 0;
-    for (auto* child : vis) {
+    for (size_t i = 0; i < vis.size(); i++) {
+        auto* child = vis[i];
         usedH += child->marginT + child->marginB;
         if (child->expanding && child->fixedH <= 0) {
             totalFlex += child->flex;
         } else {
-            float h = child->fixedH > 0 ? child->fixedH : child->SizeHint().height;
+            float h = child->fixedH > 0 ? child->fixedH : child->HeightForWidth(widths[i]);
             if (h <= 0) h = 24.0f;
             h = std::clamp(h, child->minH, child->maxH);
             usedH += h;
@@ -665,10 +702,14 @@ void VBoxWidget::DoLayout() {
         if (child->expanding && child->fixedH <= 0) {
             h = totalFlex > 0 ? remaining * (child->flex / totalFlex) : 0;
         } else {
-            h = child->fixedH > 0 ? child->fixedH : child->SizeHint().height;
+            h = child->fixedH > 0 ? child->fixedH : child->HeightForWidth(widths[i]);
             if (h <= 0) h = 24.0f;
         }
         heights[i] = std::clamp(h, child->minH, child->maxH);
+    }
+    if (IsTraceEnabled()) {
+        for (size_t i = 0; i < vis.size(); i++)
+            TraceIfSqueezed(this, vis[i], widths[i], heights[i]);
     }
 
     // Compute total content height (for justify)
@@ -703,28 +744,13 @@ void VBoxWidget::DoLayout() {
 
         y += child->marginT;
 
-        // Cross-axis (width + horizontal position). align-self overrides
-        // container's align-items per-child when set.
+        // Cross-axis position (width already in widths[i]). align-self
+        // overrides container's align-items per-child when set.
         LayoutAlign effAlign = (child->alignSelfOverride < 0)
             ? crossAlign_
             : static_cast<LayoutAlign>(child->alignSelfOverride);
-        // CSS display: inline / inline-block items have intrinsic cross-size
-        // and don't honor align-items: stretch (use SizeHint instead). User
-        // explicit align-self: stretch opt-in still wins.
-        bool intrinsic = (child->display == Display::Inline ||
-                          child->display == Display::InlineBlock) &&
-                         child->alignSelfOverride < 0;
         float availW = cw - child->marginL - child->marginR;
-        float childW;
-        if (child->fixedW > 0) {
-            childW = std::clamp(child->fixedW, child->minW, child->maxW);
-        } else if (effAlign == LayoutAlign::Stretch && !intrinsic) {
-            childW = std::clamp(availW, child->minW, child->maxW);
-        } else {
-            float hintW = child->SizeHint().width;
-            if (hintW <= 0) hintW = availW;
-            childW = std::clamp(hintW, child->minW, child->maxW);
-        }
+        float childW = widths[i];
 
         float childX = cx + child->marginL;
         switch (effAlign) {
@@ -762,6 +788,52 @@ void VBoxWidget::DoLayout() {
         child->rect = {x, y2, x + w, y2 + h};
         child->DoLayout();
     }
+}
+
+/* 子项在内容宽 cw 下分到的交叉轴宽度。percent 按 cw 现算 (不读上次布局换算
+ * 进 fixedW 的旧值), 这样 HeightForWidth 问任意宽度都对; DoLayout 里 percent
+ * 已按同一 cw 换算过, 结果一致。 */
+float VBoxWidget::ChildCrossWidth(const Widget* child, float cw) const {
+    LayoutAlign effAlign = (child->alignSelfOverride < 0)
+        ? crossAlign_
+        : static_cast<LayoutAlign>(child->alignSelfOverride);
+    // CSS display: inline / inline-block items have intrinsic cross-size
+    // and don't honor align-items: stretch (use SizeHint instead). User
+    // explicit align-self: stretch opt-in still wins.
+    bool intrinsic = (child->display == Display::Inline ||
+                      child->display == Display::InlineBlock) &&
+                     child->alignSelfOverride < 0;
+    float fixW = child->percentW    >= 0 ? cw * child->percentW    / 100.0f : child->fixedW;
+    float mnW  = child->percentMinW >= 0 ? cw * child->percentMinW / 100.0f : child->minW;
+    float mxW  = child->percentMaxW >= 0 ? cw * child->percentMaxW / 100.0f : child->maxW;
+    float availW = cw - child->marginL - child->marginR;
+    if (fixW > 0) return std::clamp(fixW, mnW, mxW);
+    if (effAlign == LayoutAlign::Stretch && !intrinsic) return std::clamp(availW, mnW, mxW);
+    float hintW = child->SizeHint().width;
+    if (hintW <= 0) hintW = availW;
+    return std::clamp(hintW, mnW, mxW);
+}
+
+/* 子项集合与 SizeHint 相同 (含 absolute 子项), 只是在流内子项上把
+ * SizeHint().height 换成按分到宽度算的 HeightForWidth —— 不折行的子树结果与
+ * SizeHint 完全一致。 */
+float VBoxWidget::HeightForWidth(float w) const {
+    if (fixedH > 0) return fixedH;
+    float cw = std::max(0.0f, w - padL - padR);
+    float h = 0;
+    int count = 0;
+    for (auto& child : children_) {
+        if (!child->visible) continue;
+        float ch = child->positionAbsolute
+            ? child->SizeHint().height
+            : child->HeightForWidth(ChildCrossWidth(child.get(), cw));
+        if (ch <= 0) ch = 24.0f;
+        ch = std::clamp(ch, child->minH, child->maxH);
+        h += ch + child->marginT + child->marginB;
+        count++;
+    }
+    if (count > 1) h += gap_ * (count - 1);
+    return h + padT + padB;
 }
 
 D2D1_SIZE_F VBoxWidget::SizeHint() const {
@@ -816,75 +888,9 @@ void HBoxWidget::DoLayout() {
         ResolvePercentSizing(child, totalW, ch);
     }
 
-    // First pass: measure fixed children, sum flex weights
-    float usedW = 0;
+    std::vector<float> widths;
     float totalFlex = 0;
-    for (auto* child : vis) {
-        usedW += child->marginL + child->marginR;
-        if (child->expanding && child->fixedW <= 0) {
-            totalFlex += child->flex;
-        } else {
-            float w = child->fixedW > 0 ? child->fixedW : child->SizeHint().width;
-            if (w <= 0) w = 60.0f;
-            w = std::clamp(w, child->minW, child->maxW);
-            usedW += w;
-        }
-    }
-    float gapTotal = (int)vis.size() > 1 ? gap_ * ((int)vis.size() - 1) : 0;
-    float remaining = std::max(0.0f, totalW - usedW - gapTotal);
-
-    // Compute each child's main-axis size (width)
-    std::vector<float> widths(vis.size());
-    for (size_t i = 0; i < vis.size(); i++) {
-        auto* child = vis[i];
-        float w;
-        if (child->expanding && child->fixedW <= 0) {
-            w = totalFlex > 0 ? remaining * (child->flex / totalFlex) : 0;
-        } else {
-            w = child->fixedW > 0 ? child->fixedW : child->SizeHint().width;
-            if (w <= 0) w = 60.0f;
-        }
-        widths[i] = std::clamp(w, child->minW, child->maxW);
-    }
-
-    // Compute total content width (for justify)
-    float contentW = 0;
-    for (size_t i = 0; i < vis.size(); i++)
-        contentW += widths[i] + vis[i]->marginL + vis[i]->marginR;
-    contentW += gapTotal;
-
-    // CSS flex-shrink: when natural content exceeds the row, shrink shrinkable
-    // children (flexShrink > 0) proportionally to flexShrink × width, down to
-    // minW (default 0). Lets a fixed-width row (e.g. a menu item) ellipsis its
-    // label instead of overflowing the card; icons opt out via flex-shrink:0 /
-    // flex:none. Iterate a few passes so children that bottom out at minW hand
-    // their remaining shrink demand to the others (matches CSS distribution).
-    float overflow = contentW - totalW;
-    if (overflow > 0.5f) {
-        for (int pass = 0; pass < 4 && overflow > 0.5f; pass++) {
-            float weightSum = 0;
-            for (size_t i = 0; i < vis.size(); i++)
-                if (vis[i]->flexShrink > 0 && widths[i] > vis[i]->minW)
-                    weightSum += vis[i]->flexShrink * widths[i];
-            if (weightSum <= 0) break;
-            float shrunk = 0;
-            for (size_t i = 0; i < vis.size(); i++) {
-                auto* child = vis[i];
-                if (child->flexShrink <= 0 || widths[i] <= child->minW) continue;
-                float want = overflow * (child->flexShrink * widths[i]) / weightSum;
-                float neww = std::max(child->minW, widths[i] - want);
-                shrunk += widths[i] - neww;
-                widths[i] = neww;
-            }
-            overflow -= shrunk;
-            if (shrunk < 0.5f) break;
-        }
-        // Recompute so justify below works off the shrunk total.
-        contentW = 0;
-        for (size_t i = 0; i < vis.size(); i++)
-            contentW += widths[i] + vis[i]->marginL + vis[i]->marginR;
-        contentW += gapTotal;
-    }
+    float contentW = MainWidths(vis, totalW, widths, &totalFlex);
 
     // Main-axis start position + gap override for justify
     float x = cx;
@@ -930,10 +936,14 @@ void HBoxWidget::DoLayout() {
         } else if (effAlign == LayoutAlign::Stretch && !intrinsic) {
             childH = std::clamp(availH, child->minH, child->maxH);
         } else {
-            float hintH = child->SizeHint().height;
+            /* build 323: 按本行分到的宽度问高度 —— 折行的竖排列 (标题 + 说明)
+             * 在窄宽度下要更高, SizeHint 只会报单行。 */
+            float hintH = child->HeightForWidth(w);
             if (hintH <= 0) hintH = availH;
             childH = std::clamp(hintH, child->minH, child->maxH);
         }
+        if (IsTraceEnabled() && child->fixedH <= 0)
+            TraceIfSqueezed(this, child, w, std::min(childH, availH));
 
         float childY = cy + child->marginT;
         switch (effAlign) {
@@ -1135,6 +1145,119 @@ void HBoxWidget::DoLayoutWrap() {
         child->rect = {x2, y2, x2 + w, y2 + h};
         child->DoLayout();
     }
+}
+
+float HBoxWidget::MainWidths(const std::vector<Widget*>& vis, float totalW,
+                             std::vector<float>& widths, float* totalFlexOut) const {
+    /* percent 按 totalW 现算, 理由同 VBoxWidget::ChildCrossWidth。 */
+    auto fixW = [&](const Widget* c) {
+        return c->percentW >= 0 ? totalW * c->percentW / 100.0f : c->fixedW;
+    };
+    auto mnW = [&](const Widget* c) {
+        return c->percentMinW >= 0 ? totalW * c->percentMinW / 100.0f : c->minW;
+    };
+    auto mxW = [&](const Widget* c) {
+        return c->percentMaxW >= 0 ? totalW * c->percentMaxW / 100.0f : c->maxW;
+    };
+
+    // First pass: measure fixed children, sum flex weights
+    float usedW = 0;
+    float totalFlex = 0;
+    for (auto* child : vis) {
+        usedW += child->marginL + child->marginR;
+        if (child->expanding && fixW(child) <= 0) {
+            totalFlex += child->flex;
+        } else {
+            float w = fixW(child) > 0 ? fixW(child) : child->SizeHint().width;
+            if (w <= 0) w = 60.0f;
+            w = std::clamp(w, mnW(child), mxW(child));
+            usedW += w;
+        }
+    }
+    float gapTotal = (int)vis.size() > 1 ? gap_ * ((int)vis.size() - 1) : 0;
+    float remaining = std::max(0.0f, totalW - usedW - gapTotal);
+
+    // Compute each child's main-axis size (width)
+    widths.assign(vis.size(), 0.0f);
+    for (size_t i = 0; i < vis.size(); i++) {
+        auto* child = vis[i];
+        float w;
+        if (child->expanding && fixW(child) <= 0) {
+            w = totalFlex > 0 ? remaining * (child->flex / totalFlex) : 0;
+        } else {
+            w = fixW(child) > 0 ? fixW(child) : child->SizeHint().width;
+            if (w <= 0) w = 60.0f;
+        }
+        widths[i] = std::clamp(w, mnW(child), mxW(child));
+    }
+
+    // Compute total content width (for justify)
+    float contentW = 0;
+    for (size_t i = 0; i < vis.size(); i++)
+        contentW += widths[i] + vis[i]->marginL + vis[i]->marginR;
+    contentW += gapTotal;
+
+    // CSS flex-shrink: when natural content exceeds the row, shrink shrinkable
+    // children (flexShrink > 0) proportionally to flexShrink × width, down to
+    // minW (default 0). Lets a fixed-width row (e.g. a menu item) ellipsis its
+    // label instead of overflowing the card; icons opt out via flex-shrink:0 /
+    // flex:none. Iterate a few passes so children that bottom out at minW hand
+    // their remaining shrink demand to the others (matches CSS distribution).
+    float overflow = contentW - totalW;
+    if (overflow > 0.5f) {
+        for (int pass = 0; pass < 4 && overflow > 0.5f; pass++) {
+            float weightSum = 0;
+            for (size_t i = 0; i < vis.size(); i++)
+                if (vis[i]->flexShrink > 0 && widths[i] > mnW(vis[i]))
+                    weightSum += vis[i]->flexShrink * widths[i];
+            if (weightSum <= 0) break;
+            float shrunk = 0;
+            for (size_t i = 0; i < vis.size(); i++) {
+                auto* child = vis[i];
+                if (child->flexShrink <= 0 || widths[i] <= mnW(child)) continue;
+                float want = overflow * (child->flexShrink * widths[i]) / weightSum;
+                float neww = std::max(mnW(child), widths[i] - want);
+                shrunk += widths[i] - neww;
+                widths[i] = neww;
+            }
+            overflow -= shrunk;
+            if (shrunk < 0.5f) break;
+        }
+        // Recompute so justify works off the shrunk total.
+        contentW = 0;
+        for (size_t i = 0; i < vis.size(); i++)
+            contentW += widths[i] + vis[i]->marginL + vis[i]->marginR;
+        contentW += gapTotal;
+    }
+    if (totalFlexOut) *totalFlexOut = totalFlex;
+    return contentW;
+}
+
+/* 子项集合与 SizeHint 相同 (含 absolute 子项); 流内子项按 MainWidths 分到的
+ * 宽度问 HeightForWidth。flex-wrap 走多行装箱, 仍用 SizeHint 的估算。 */
+float HBoxWidget::HeightForWidth(float w) const {
+    if (fixedH > 0) return fixedH;
+    if (flexWrap_) return SizeHint().height;
+    float totalW = std::max(0.0f, w - padL - padR);
+    std::vector<Widget*> vis;
+    float h = 0;
+    for (auto& child : children_) {
+        if (!child->visible) continue;
+        if (child->positionAbsolute) {
+            float ch = std::max(0.0f, child->SizeHint().height) + child->marginT + child->marginB;
+            if (ch > h) h = ch;
+        } else {
+            vis.push_back(child.get());
+        }
+    }
+    std::vector<float> widths;
+    MainWidths(vis, totalW, widths, nullptr);
+    for (size_t i = 0; i < vis.size(); i++) {
+        float ch = std::max(0.0f, vis[i]->HeightForWidth(widths[i])) +
+                   vis[i]->marginT + vis[i]->marginB;
+        if (ch > h) h = ch;
+    }
+    return h + padT + padB;
 }
 
 D2D1_SIZE_F HBoxWidget::SizeHint() const {

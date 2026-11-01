@@ -2,7 +2,10 @@
 
 #include "debug_trace.h"
 #include "display_list.h"
+#include "dwm_probe.h"
+#include "layered_frame.h"
 #include "resource_store.h"
+#include "svg_font.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -32,8 +35,8 @@
 #pragma comment(lib, "windowscodecs.lib")
 
 namespace ui {
-ComPtr<ID3D11Device> Renderer::s_d3dDevice;
-ComPtr<ID2D1Device>  Renderer::s_d2dDevice;
+ExitLeakComPtr<ID3D11Device> Renderer::s_d3dDevice;
+ExitLeakComPtr<ID2D1Device>  Renderer::s_d2dDevice;
 int                  Renderer::s_deviceRefCount = 0;
 } // namespace ui
 
@@ -70,7 +73,9 @@ static uint32_t FloatBits(float v) {
     return bits;
 }
 
-static const wchar_t* ResolveLocaleName() {
+/* 系统区域 (缓存)。build 314 起实际排版区域走 Renderer::TextLocaleName —— 宿主
+ * 用 ui_theme_set_text_locale 设了就用它, 没设才回到这里。 */
+static const wchar_t* SystemLocaleName() {
     static wchar_t locale[LOCALE_NAME_MAX_LENGTH] = {};
     static bool initialized = false;
     if (!initialized) {
@@ -253,6 +258,10 @@ bool Renderer::Init(ID2D1Factory1* factory, IDWriteFactory* dwFactory, IWICImagi
     wicFactory_ = wicFactory;
     brushCache_.clear();
     textFormatCache_.clear();
+    /* build 314: UI 线程的 Renderer 只排版测量不建 RT, 以前回退字体链永远是空的
+     * (测量和渲染线程实际绘制用的字体不一致)。这里就按全局设置建好。 */
+    textSettingsGen_ = 0;
+    EnsureTextSettingsCurrent();
     return true;
 }
 
@@ -284,7 +293,7 @@ Microsoft::WRL::ComPtr<ID3D11Device> CreateSharedD3DDevice() {
  * 结果 (cv), 不能与预热线程并发重复创建。 */
 std::mutex                            g_prewarmMu;
 std::condition_variable               g_prewarmCv;
-Microsoft::WRL::ComPtr<ID3D11Device>  g_prewarmDevice;
+ui::ExitLeakComPtr<ID3D11Device>      g_prewarmDevice;
 bool                                  g_prewarmStarted = false;
 bool                                  g_prewarmDone    = false;
 
@@ -361,7 +370,10 @@ void Renderer::BindFactoryFromSharedDevice() {
     }
     sharedDeviceFactory_ = factory1;
     factory_ = sharedDeviceFactory_.Get();
-    roundStrokeStyle_.Reset();
+    /* 线型对象归旧 factory 所有, 换了 factory 必须整片丢掉重建 (跟 brush
+     * 缓存同理) —— 只清其中一个会留下跨 factory 的野对象。 */
+    for (auto& row : strokeStyles_)
+        for (auto& s : row) s.Reset();
     brushCache_.clear();
 }
 
@@ -377,6 +389,23 @@ void Renderer::ReleaseSharedDeviceRef() {
     }
 }
 
+void Renderer::ReleaseSharedDevice() {
+    /* 锁顺序与 AcquireSharedDeviceRef → EnsureSharedDevice 一致: 先设备锁
+     * 后预热锁。预热线程还在建设备时先等它交付再一起释放 —— 否则它稍后
+     * 写进 g_prewarmDevice 的设备就没人放了。 */
+    std::lock_guard<std::mutex> deviceLock(g_sharedDeviceMu);
+    {
+        std::unique_lock<std::mutex> lk(g_prewarmMu);
+        if (g_prewarmStarted) g_prewarmCv.wait(lk, [] { return g_prewarmDone; });
+        g_prewarmDevice.Reset();
+        g_prewarmStarted = false;
+        g_prewarmDone    = false;
+    }
+    s_d2dDevice.Reset();
+    s_d3dDevice.Reset();
+    s_deviceRefCount = 0;
+}
+
 void Renderer::ResetSharedDeviceForDeviceLost() {
     std::lock_guard<std::mutex> deviceLock(g_sharedDeviceMu);
     s_d2dDevice.Reset();
@@ -384,7 +413,7 @@ void Renderer::ResetSharedDeviceForDeviceLost() {
     s_deviceRefCount = 0;
 }
 
-bool Renderer::CreateRenderTarget(HWND hwnd) {
+bool Renderer::CreateRenderTarget(HWND hwnd, bool copyModel) {
     ReleaseRenderTarget();
     hwnd_ = hwnd;
     targetThreadId_ = GetCurrentThreadId();
@@ -429,10 +458,41 @@ bool Renderer::CreateRenderTarget(HWND hwnd) {
     desc.BufferCount = 2;
     desc.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     desc.Scaling     = DXGI_SCALING_NONE;
+    if (copyModel) {
+        /* 复制模式 (bitblt): Present 把画面复制进窗口重定向表面, 该表面由 DWM 随
+         * 窗口一起改尺寸, 程序自己频繁 SetWindowPos 时尺寸与内容同帧到达。flip
+         * model 的翻转与窗口尺寸无同步, 缩小时会合成"新矩形 + 旧画面" (实测
+         * frame-probe: flip 13~24 坏帧 / copy 0)。代价: 每次 Present 多一次拷贝
+         * (~1ms)。bitblt 模型不支持 DXGI_SCALING_NONE。 */
+        desc.SwapEffect  = DXGI_SWAP_EFFECT_SEQUENTIAL;
+        desc.BufferCount = 1;
+        desc.Scaling     = DXGI_SCALING_STRETCH;
+    } else {
+        /* 交帧限速: 帧都以 sync_interval=0 交 (改尺寸要及时), 不设帧延迟时系统默认
+         * 排 3 帧, 动画中再有连续的立即重绘就一直塞满, 每次 Present 都卡一个刷新、
+         * 画面整体晚 2~3 帧, 交得更密时一卡 30~50ms。见 TryAcquireFrameSlot。 */
+        desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
 
     hr = dxgiFactory->CreateSwapChainForHwnd(s_d3dDevice.Get(), hwnd, &desc,
                                               nullptr, nullptr, swapChain_.GetAddressOf());
+    if (FAILED(hr) && desc.Flags != 0) {
+        desc.Flags = 0;   // 驱动不认可等待对象: 退回不限速
+        hr = dxgiFactory->CreateSwapChainForHwnd(s_d3dDevice.Get(), hwnd, &desc,
+                                                  nullptr, nullptr, swapChain_.GetAddressOf());
+    }
     if (FAILED(hr)) return fail();
+    copyModel_ = copyModel;
+    swapChainFlags_ = desc.Flags;
+    if (desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+        ComPtr<IDXGISwapChain2> chain2;
+        if (SUCCEEDED(swapChain_.As(&chain2)) && SUCCEEDED(chain2->SetMaximumFrameLatency(1))) {
+            frameLatencyWaitable_ = chain2->GetFrameLatencyWaitableObject();
+        }
+    }
+    TraceEvent("core_renderer", "swap_chain_created",
+               {TraceBool("copy_model", copyModel),
+                TraceBool("frame_latency_waitable", frameLatencyWaitable_ != nullptr)});
     SetSwapChainBackgroundColor(theme::kWindowBg());
 
     /* 4. 从 SwapChain 获取 back buffer，创建 target bitmap */
@@ -461,9 +521,9 @@ bool Renderer::CreateRenderTarget(HWND hwnd) {
        SetTextRenderingParams。 */
     ApplyTextRenderMode();
 
-    /* 如果已经有中英分离设置，重建一次 fallback（theme::SetCjkFonts 可能在
-       窗口创建之前就设了） */
-    RebuildFontFallback();
+    /* 按当前全局字体设置取快照 + 重建 fallback（theme::SetCjkFonts 可能在
+       窗口创建之前就设了）。build 314: 走 RefreshTextResources 一并拿快照。 */
+    RefreshTextResources();
 
     return true;
 }
@@ -553,10 +613,86 @@ bool Renderer::CreateRenderTargetForLayered(HWND hwnd) {
     ctx_->SetTarget(targetBitmap_.Get());
     ctx_->SetDpi((float)dpi, (float)dpi);
     ctx_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    ApplyTextRenderMode();
-    RebuildFontFallback();
+    RefreshTextResources();   // build 314: 快照 + 回退链 + 渲染模式
 
     return true;
+}
+
+bool Renderer::CreateUlwBitmaps(UINT width, UINT height, UINT dpi) {
+    if (ctx_) ctx_->SetTarget(nullptr);
+    targetBitmap_.Reset();
+    ulwReadback_.Reset();
+    const D2D1_SIZE_U size = D2D1::SizeU((std::max)(1u, width), (std::max)(1u, height));
+    D2D1_BITMAP_PROPERTIES1 props = {};
+    props.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                          D2D1_ALPHA_MODE_PREMULTIPLIED);
+    props.dpiX = (float)dpi;
+    props.dpiY = (float)dpi;
+    props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+    HRESULT hr = ctx_->CreateBitmap(size, nullptr, 0, props, targetBitmap_.GetAddressOf());
+    if (FAILED(hr)) return false;
+    props.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+    hr = ctx_->CreateBitmap(size, nullptr, 0, props, ulwReadback_.GetAddressOf());
+    if (FAILED(hr)) return false;
+    ctx_->SetTarget(targetBitmap_.Get());
+    ctx_->SetDpi((float)dpi, (float)dpi);
+    return true;
+}
+
+bool Renderer::CreateRenderTargetUlw(HWND hwnd, std::shared_ptr<LayeredFrameBuffer> buffer) {
+    ReleaseRenderTarget();
+    if (!buffer) return false;
+    hwnd_ = hwnd;
+    targetThreadId_ = GetCurrentThreadId();
+    auto fail = [&]() {
+        ReleaseRenderTarget();
+        return false;
+    };
+    if (!AcquireSharedDeviceRef()) return false;
+    HRESULT hr = s_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                                                   ctx_.GetAddressOf());
+    if (FAILED(hr)) return fail();
+    ctx_.As(&ctx5_);
+
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    const UINT dpi = GetDpiForWindow(hwnd);
+    if (!CreateUlwBitmaps(static_cast<UINT>(rc.right - rc.left),
+                          static_cast<UINT>(rc.bottom - rc.top), dpi)) {
+        return fail();
+    }
+    ulwBuffer_ = std::move(buffer);
+    ctx_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    ApplyTextRenderMode();
+    RefreshTextResources();
+    return true;
+}
+
+HRESULT Renderer::PublishUlwFrame() {
+    if (!ulwBuffer_ || !targetBitmap_ || !ulwReadback_) return S_FALSE;
+    TraceScope scope("core_renderer", "ulw_readback_duration");
+    const D2D1_SIZE_U size = targetBitmap_->GetPixelSize();
+    const D2D1_POINT_2U origin = {0, 0};
+    const D2D1_RECT_U src = {0, 0, size.width, size.height};
+    HRESULT hr = ulwReadback_->CopyFromBitmap(&origin, targetBitmap_.Get(), &src);
+    if (FAILED(hr)) return hr;
+    D2D1_MAPPED_RECT mapped = {};
+    hr = ulwReadback_->Map(D2D1_MAP_OPTIONS_READ, &mapped);
+    if (FAILED(hr)) return hr;
+    const int w = static_cast<int>(size.width);
+    const int h = static_cast<int>(size.height);
+    uint8_t* out = ulwBuffer_->BeginWrite(w, h);
+    if (out) {
+        const size_t rowBytes = static_cast<size_t>(w) * 4;
+        for (int y = 0; y < h; ++y) {
+            std::memcpy(out + rowBytes * y, mapped.bits + static_cast<size_t>(mapped.pitch) * y,
+                        rowBytes);
+        }
+    }
+    ulwReadback_->Unmap();
+    if (!out) return E_OUTOFMEMORY;
+    ulwBuffer_->Publish(frameGeneration);
+    return S_OK;
 }
 
 void Renderer::ReleaseRenderTarget() {
@@ -564,9 +700,16 @@ void Renderer::ReleaseRenderTarget() {
         ctx_->SetTarget(nullptr);
     }
     transformStack_.clear();
+    layerTextAaStack_.clear();
     brushCache_.clear();
     imageBitmapCache_.clear();
+    ulwReadback_.Reset();
+    ulwBuffer_.reset();
     targetBitmap_.Reset();
+    if (frameLatencyWaitable_) CloseHandle(frameLatencyWaitable_);
+    frameLatencyWaitable_ = nullptr;
+    frameSlotHeld_ = false;
+    swapChainFlags_ = 0;
     swapChain_.Reset();
     ctx5_.Reset();
     ctx_.Reset();
@@ -580,6 +723,14 @@ void Renderer::ReleaseRenderTarget() {
 
 void Renderer::Resize(UINT width, UINT height) {
     DebugAssertTargetThread("Resize");
+    if (ctx_ && ulwBuffer_) {
+        brushCache_.clear();
+        if (!CreateUlwBitmaps(width, height, GetDpiForWindow(hwnd_))) {
+            TraceEvent("core_renderer", "ulw_resize_failed",
+                       {TraceU64("w_px", width), TraceU64("h_px", height)});
+        }
+        return;
+    }
     if (!ctx_ || !swapChain_) return;
     TraceScope resizeScope("core_renderer", "renderer_resize_duration");
     TraceEvent("core_renderer", "renderer_resize_begin",
@@ -595,7 +746,7 @@ void Renderer::Resize(UINT width, UINT height) {
     HRESULT hr = S_OK;
     {
         TraceScope scope("core_renderer", "resize_buffers_duration");
-        hr = swapChain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+        hr = swapChain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, swapChainFlags_);
     }
     if (FAILED(hr)) {
         TraceEvent("core_renderer", "resize_buffers_failed",
@@ -642,7 +793,9 @@ void Renderer::Resize(UINT width, UINT height) {
 
 void Renderer::BeginDraw() {
     DebugAssertTargetThread("BeginDraw");
+    EnsureTextSettingsCurrent();   // build 314: 渲染线程在自己线程上跟进全局字体变化
     transformStack_.clear();
+    layerTextAaStack_.clear();
     ctx_->BeginDraw();
     ctx_->SetTransform(D2D1::Matrix3x2F::Identity());
 }
@@ -655,6 +808,16 @@ HRESULT Renderer::EndDraw() {
         TraceScope flushScope("core_renderer", "d2d_end_draw_duration");
         hr = ctx_->EndDraw();
     }
+    /* ULW 目标: 画完就读回发布 (隐藏窗口也要, 显示前得先有一帧可提交);
+     * 交给窗口 (Commit) 是 UI 线程的事。 */
+    if (ulwBuffer_ && SUCCEEDED(hr)) {
+        const HRESULT publishHr = PublishUlwFrame();
+        if (FAILED(publishHr)) {
+            TraceEvent("core_renderer", "ulw_publish_failed",
+                       {TraceI64("hr", static_cast<int64_t>(publishHr))});
+            if (publishHr == D2DERR_RECREATE_TARGET) hr = publishHr;
+        }
+    }
     /* L177: skipPresent → 只 flush D2D 绘制 (上面 ctx_->EndDraw 已做), 不 flip 到
      * DWM。给"绘制隐藏窗但不上屏"用 (避免 DWM 未合成窗的 Present 在 AMD 死锁)。 */
     if (swapChain_ && !skipPresent) {
@@ -663,10 +826,13 @@ HRESULT Renderer::EndDraw() {
         TraceEvent("core_renderer", "present_begin",
                    {TraceU64("sync_interval", syncInterval),
                     TraceBool("skip_vsync", skipVSync)});
+        HRESULT presentHr = S_OK;
         {
             TraceScope presentScope("core_renderer", "present_duration");
-            swapChain_->Present1(syncInterval, 0, &params);
+            presentHr = swapChain_->Present1(syncInterval, 0, &params);
         }
+        frameSlotHeld_ = false;   // 名额随这一帧交出, 系统取走后可等待对象再亮
+        TraceDwmProbePresent(presentHr, false);
     }
     skipVSync = false;
     skipPresent = false;
@@ -675,19 +841,57 @@ HRESULT Renderer::EndDraw() {
 
 HRESULT Renderer::PresentPrepared(bool skipVsync) {
     DebugAssertTargetThread("PresentPrepared");
-    if (!swapChain_) return S_FALSE;
+    if (!swapChain_) return S_FALSE;   /* ULW 目标没有交换链: 已在 EndDraw 发布, 提交归 UI 线程 */
     DXGI_PRESENT_PARAMETERS params = {};
     const UINT syncInterval = skipVsync ? 0 : 1;
     TraceEvent("core_renderer", "present_prepared_begin",
                {TraceU64("sync_interval", syncInterval),
                 TraceBool("skip_vsync", skipVsync)});
-    TraceScope presentScope("core_renderer", "present_prepared_duration");
-    return swapChain_->Present1(syncInterval, 0, &params);
+    /* 改尺寸事务的预备帧: 画的时候没要名额 (见 RenderThread::JobNeedsFrameSlot),
+     * 交之前补拿, 不然这一帧会多占一格队列。最多等一个多刷新, 等不到照交。 */
+    if (frameLatencyWaitable_ && !frameSlotHeld_) {
+        WaitForSingleObject(frameLatencyWaitable_, kFrameSlotWaitMs);
+    }
+    HRESULT hr = S_OK;
+    {
+        TraceScope presentScope("core_renderer", "present_prepared_duration");
+        hr = swapChain_->Present1(syncInterval, 0, &params);
+    }
+    frameSlotHeld_ = false;
+    TraceDwmProbePresent(hr, true);
+    return hr;
+}
+
+bool Renderer::TryAcquireFrameSlot() {
+    if (!frameLatencyWaitable_ || frameSlotHeld_) return true;
+    if (WaitForSingleObject(frameLatencyWaitable_, 0) != WAIT_OBJECT_0) return false;
+    frameSlotHeld_ = true;
+    return true;
+}
+
+void Renderer::TraceDwmProbePresent(HRESULT hr, bool prepared) {
+    /* 闪屏探针 (dwm_probe.h): Present 之后记 DWM 合成计数 + 后备缓冲尺寸,
+     * 宿主据此与 dwm_probe_rect 配对。 */
+    if (!IsTraceEnabled() || !swapChain_) return;
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    swapChain_->GetDesc1(&desc);
+    const DwmFrameStamp stamp = QueryDwmFrameStamp();
+    TraceEvent("core_renderer", "dwm_probe_present",
+               {TraceU64("hwnd", reinterpret_cast<uintptr_t>(hwnd_)),
+                TraceI64("hr", static_cast<int64_t>(hr)),
+                TraceBool("prepared", prepared),
+                TraceU64("buf_w_px", desc.Width),
+                TraceU64("buf_h_px", desc.Height),
+                TraceU64("swap_effect", static_cast<uint64_t>(desc.SwapEffect)),
+                TraceU64("refresh", stamp.refresh),
+                TraceU64("frame", stamp.frame),
+                TraceBool("stamp_ok", stamp.ok)});
 }
 
 HRESULT Renderer::SetSwapChainBackgroundColor(const D2D1_COLOR_F& color) {
     DebugAssertTargetThread("SetSwapChainBackgroundColor");
-    if (!swapChain_) return S_FALSE;
+    /* 背景色只作用于 flip model 的 DXGI_SCALING_NONE 空白区; 复制模式不适用。 */
+    if (!swapChain_ || copyModel_) return S_FALSE;
     DXGI_RGBA bg = {color.r, color.g, color.b, color.a};
     return swapChain_->SetBackgroundColor(&bg);
 }
@@ -729,6 +933,174 @@ void Renderer::Clear(const D2D1_COLOR_F& color) {
 
 void Renderer::SetDisplayListRecorder(DisplayListRecorder* recorder) {
     displayListRecorder_ = recorder;
+}
+
+/* 离屏专用设备 —— 进程内复用。
+ *
+ * 早先每次 BeginOffscreen 都新建一整套 D3D11+D2D, 实测 **48ms/次**。烧录保存
+ * 那种低频操作无所谓, 但"图片标注的马赛克画笔"每落一笔都要合成一次采样源,
+ * 40 多毫秒直接变成看得见的顿挫。所以建一次留着。
+ *
+ * 仍然不复用窗口渲染那套共享设备: 那套由全局互斥保护, 跨 begin/end 持锁会挡住
+ * 整个 UI 渲染, 宿主若在绘制回调里发起离屏还会死锁 (非递归 mutex)。这里是**另
+ * 一套**设备, 与 UI 渲染互不相干。
+ *
+ * 工厂用 MULTI_THREADED: 离屏可能从 worker 线程发起, 让 D2D 自己做内部同步。 */
+namespace {
+std::mutex g_offscreenDevMu;
+/* 退出阶段不 Release, 见 exit_safe_com.h; 正常释放走 ReleaseOffscreenDevice。 */
+ui::ExitLeakComPtr<ID3D11Device>  g_offscreenD3D;
+ui::ExitLeakComPtr<ID2D1Factory1> g_offscreenFactory;
+ui::ExitLeakComPtr<ID2D1Device>   g_offscreenDevice;
+
+bool EnsureOffscreenDevice() {
+    if (g_offscreenDevice) return true;
+    auto d3d = CreateSharedD3DDevice();
+    if (!d3d) return false;
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgi;
+    if (FAILED(d3d.As(&dxgi)) || !dxgi) return false;
+
+    D2D1_FACTORY_OPTIONS opts = {};
+    opts.debugLevel = D2D1_DEBUG_LEVEL_NONE;
+    Microsoft::WRL::ComPtr<ID2D1Factory1> factory;
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED,
+                                 __uuidof(ID2D1Factory1), &opts,
+                                 reinterpret_cast<void**>(factory.GetAddressOf()))) ||
+        !factory) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<ID2D1Device> device;
+    if (FAILED(factory->CreateDevice(dxgi.Get(), device.GetAddressOf())) || !device) return false;
+
+    g_offscreenD3D = d3d;
+    g_offscreenFactory = factory;
+    g_offscreenDevice = device;
+    return true;
+}
+} /* namespace */
+
+void Renderer::ReleaseOffscreenDevice() {
+    std::lock_guard<std::mutex> lk(g_offscreenDevMu);
+    g_offscreenDevice.Reset();
+    g_offscreenFactory.Reset();
+    g_offscreenD3D.Reset();
+}
+
+bool Renderer::BeginOffscreen(uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0) return false;
+    if (offscreenTarget_) return false;   /* 不允许嵌套 */
+
+    ComPtr<ID2D1Factory1> factory;
+    ComPtr<ID2D1DeviceContext> ctx;
+    {
+        std::lock_guard<std::mutex> lk(g_offscreenDevMu);
+        if (!EnsureOffscreenDevice()) return false;
+        factory = g_offscreenFactory;
+        /* device context 是每次现建的 (便宜), 设备本身复用 */
+        if (FAILED(g_offscreenDevice->CreateDeviceContext(
+                D2D1_DEVICE_CONTEXT_OPTIONS_NONE, ctx.GetAddressOf())) || !ctx) {
+            return false;
+        }
+    }
+
+    /* 超过设备的单张纹理上限就明确失败, 不要交给 CreateBitmap 出一个语焉不详
+     * 的 E_INVALIDARG —— 调用方 (烧录大图) 需要据此决定降分辨率。 */
+    const UINT32 maxSide = ctx->GetMaximumBitmapSize();
+    if (width > maxSide || height > maxSide) return false;
+
+    constexpr float kDpi = 96.0f;   /* 绘制坐标 = 像素 */
+    ctx->SetDpi(kDpi, kDpi);
+
+    D2D1_BITMAP_PROPERTIES1 props = {};
+    props.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                          D2D1_ALPHA_MODE_PREMULTIPLIED);
+    props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+    props.dpiX = kDpi;
+    props.dpiY = kDpi;
+    ComPtr<ID2D1Bitmap1> target;
+    if (FAILED(ctx->CreateBitmap(D2D1::SizeU(width, height), nullptr, 0, props,
+                                 target.GetAddressOf())) || !target) {
+        return false;
+    }
+
+    /* DWrite 是进程级 SHARED 单例, WIC 走 COM —— 都与 D2D 工厂无关, 可以复用
+     * 本 renderer 已有的 (通常为空, 离屏 renderer 是新建的)。 */
+    if (!ownedDwFactory_) {
+        DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                            reinterpret_cast<IUnknown**>(ownedDwFactory_.GetAddressOf()));
+    }
+    if (!ownedWicFactory_) {
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                         IID_PPV_ARGS(ownedWicFactory_.GetAddressOf()));
+    }
+    if (!ownedDwFactory_ || !ownedWicFactory_) return false;
+
+    ownedFactory_ = factory;
+    factory_      = ownedFactory_.Get();
+    dwFactory_    = ownedDwFactory_.Get();
+    wicFactory_   = ownedWicFactory_.Get();
+    /* 缓存里的 brush / 线型都属于别的工厂, 换工厂必须清空 */
+    brushCache_.clear();
+    textFormatCache_.clear();
+    for (auto& row : strokeStyles_)
+        for (auto& s : row) s.Reset();
+
+    offscreenTarget_ = target;
+    offscreenW_      = width;
+    offscreenH_      = height;
+
+    ctx->SetTarget(target.Get());
+    SetTarget(ctx.Get());          /* 填 ctx_ / ctx5_ / targetThreadId_ */
+    ApplyTextRenderMode();
+    BeginDraw();
+    Clear(D2D1::ColorF(0, 0, 0, 0));   /* 初始全透明 */
+    return true;
+}
+
+bool Renderer::ReadbackOffscreen(uint8_t* outBgra, uint32_t stride) {
+    if (!ctx_ || !offscreenTarget_ || !outBgra) return false;
+
+    constexpr float kDpi = 96.0f;
+    D2D1_BITMAP_PROPERTIES1 cpuProps = {};
+    cpuProps.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                             D2D1_ALPHA_MODE_PREMULTIPLIED);
+    cpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ |
+                             D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+    cpuProps.dpiX = kDpi;
+    cpuProps.dpiY = kDpi;
+
+    ComPtr<ID2D1Bitmap1> cpu;
+    if (FAILED(ctx_->CreateBitmap(D2D1::SizeU(offscreenW_, offscreenH_), nullptr, 0,
+                                  cpuProps, cpu.GetAddressOf())) || !cpu) {
+        return false;
+    }
+    D2D1_POINT_2U dst = {0, 0};
+    D2D1_RECT_U src = {0, 0, offscreenW_, offscreenH_};
+    if (FAILED(cpu->CopyFromBitmap(&dst, offscreenTarget_.Get(), &src))) return false;
+
+    D2D1_MAPPED_RECT mapped = {};
+    if (FAILED(cpu->Map(D2D1_MAP_OPTIONS_READ, &mapped))) return false;
+    const size_t copyRow = std::min((size_t)stride, (size_t)mapped.pitch);
+    for (uint32_t y = 0; y < offscreenH_; ++y) {
+        std::memcpy(outBgra + (size_t)y * stride,
+                    mapped.bits + (size_t)y * mapped.pitch, copyRow);
+    }
+    cpu->Unmap();
+    return true;
+}
+
+bool Renderer::EndOffscreen(uint8_t* outBgra, uint32_t stride) {
+    if (!offscreenTarget_ || !ctx_) return false;
+    if (stride == 0) stride = offscreenW_ * 4;
+
+    bool ok = SUCCEEDED(EndDraw());
+    if (ok) ok = ReadbackOffscreen(outBgra, stride);
+
+    /* 无论成败都拆干净 —— 失败还留着设备只会让下一次 Begin 撞"不许嵌套" */
+    offscreenTarget_.Reset();
+    offscreenW_ = offscreenH_ = 0;
+    ReleaseRenderTarget();
+    return ok;
 }
 
 bool Renderer::CreateSvgDocumentFromXml(const std::string& xml,
@@ -956,6 +1328,9 @@ ComPtr<ID2D1SolidColorBrush> Renderer::GetBrush(const D2D1_COLOR_F& color) {
 ComPtr<IDWriteTextFormat> Renderer::GetTextFormat(float fontSize, const wchar_t* family,
                                                    DWRITE_FONT_WEIGHT weight) {
     if (!dwFactory_) return nullptr;
+    /* build 314: 全局字体 / 排版区域变了就在本线程刷新 (缓存整体清空, 所以 key
+     * 不必带 locale / 回退链)。必须在取 DefaultFontFamily 之前。 */
+    EnsureTextSettingsCurrent();
     /* family == nullptr → 用本 Renderer 的 default font（per-window > theme > "Segoe UI"） */
     const wchar_t* resolvedFamily = family ? family : DefaultFontFamily();
     if (!resolvedFamily) resolvedFamily = L"Segoe UI";
@@ -973,7 +1348,7 @@ ComPtr<IDWriteTextFormat> Renderer::GetTextFormat(float fontSize, const wchar_t*
     ComPtr<IDWriteTextFormat> fmt;
     HRESULT hr = dwFactory_->CreateTextFormat(
         resolvedFamily, nullptr, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-        fontSize, ResolveLocaleName(), fmt.GetAddressOf());
+        fontSize, TextLocaleName(), fmt.GetAddressOf());
     if (SUCCEEDED(hr) && fmt) {
         /* 如果有中英分离字体回退，attach 到 TextFormat3 上 */
         if (fontFallback_) {
@@ -989,23 +1364,40 @@ ComPtr<IDWriteTextFormat> Renderer::GetTextFormat(float fontSize, const wchar_t*
 
 /* ---- Per-window font / render mode 状态 (since 1.3.0) ---- */
 
+/* build 314: 全局值一律读本 Renderer 的快照 textSettings_ (EnsureTextSettingsCurrent
+ * 在本线程取), 不直接读 theme:: —— 渲染线程读、UI 线程写会撕裂。 */
 const wchar_t* Renderer::DefaultFontFamily() const {
     if (!defaultFontOverride_.empty()) return defaultFontOverride_.c_str();
-    return theme::DefaultFontFamily();  /* 全局默认 "Segoe UI" */
+    return textSettings_.defaultFont.empty() ? L"Segoe UI" : textSettings_.defaultFont.c_str();
 }
 
 const wchar_t* Renderer::LatinFontFamily() const {
     if (!latinFontOverride_.empty()) return latinFontOverride_.c_str();
-    return theme::LatinFontFamily();  /* 可能返回 nullptr */
+    return textSettings_.latinFont.empty() ? nullptr : textSettings_.latinFont.c_str();
 }
 
 const wchar_t* Renderer::CjkFontFamily() const {
     if (!cjkFontOverride_.empty()) return cjkFontOverride_.c_str();
-    return theme::CjkFontFamily();    /* 可能返回 nullptr */
+    return textSettings_.cjkFont.empty() ? nullptr : textSettings_.cjkFont.c_str();
+}
+
+const wchar_t* Renderer::TextLocaleName() const {
+    return textSettings_.textLocale.empty() ? SystemLocaleName()
+                                            : textSettings_.textLocale.c_str();
 }
 
 theme::TextRenderMode Renderer::TextRenderMode() const {
-    return hasRenderModeOverride_ ? renderModeOverride_ : theme::GetTextRenderMode();
+    return hasRenderModeOverride_ ? renderModeOverride_ : textSettings_.renderMode;
+}
+
+void Renderer::EnsureTextSettingsCurrent() {
+    const uint64_t gen = theme::TextSettingsGeneration();
+    if (gen == textSettingsGen_) return;
+    textSettings_    = theme::SnapshotTextSettings();
+    textSettingsGen_ = textSettings_.generation;
+    textFormatCache_.clear();
+    if (dwFactory_) RebuildFontFallback();
+    ApplyTextRenderMode();
 }
 
 void Renderer::SetDefaultFontFamily(const wchar_t* family) {
@@ -1019,6 +1411,11 @@ void Renderer::SetCjkFonts(const wchar_t* latin, const wchar_t* cjk) {
     cjkFontOverride_   = cjk   ? cjk   : L"";
     textFormatCache_.clear();
     RebuildFontFallback();
+}
+
+void Renderer::RefreshTextResources() {
+    textSettingsGen_ = 0;   // 强制下面重新取快照
+    EnsureTextSettingsCurrent();
 }
 
 void Renderer::SetTextRenderMode(theme::TextRenderMode mode) {
@@ -1160,6 +1557,58 @@ void Renderer::FillQuad(const D2D1_POINT_2F pts[4], const D2D1_COLOR_F& color) {
     if (brush) ctx_->FillGeometry(geom.Get(), brush.Get());
 }
 
+void Renderer::DrawPolyline(const D2D1_POINT_2F* pts, size_t count,
+                            const D2D1_COLOR_F& color, float width, bool closed, int dash) {
+    if (!pts || count < 2) return;
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->DrawPolyline(pts, count, color, width, closed, dash);
+    }
+    if (!ctx_ || !factory_) return;
+    ComPtr<ID2D1PathGeometry> geom;
+    if (FAILED(factory_->CreatePathGeometry(geom.GetAddressOf())) || !geom) return;
+    ComPtr<ID2D1GeometrySink> sink;
+    if (FAILED(geom->Open(sink.GetAddressOf())) || !sink) return;
+    /* HOLLOW: 只描边不填充, 自交的笔迹 (画个圈再穿过去) 不会被当成填充区域 */
+    sink->BeginFigure(pts[0], D2D1_FIGURE_BEGIN_HOLLOW);
+    sink->AddLines(pts + 1, (UINT32)(count - 1));
+    sink->EndFigure(closed ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
+    if (FAILED(sink->Close())) return;
+    auto brush = GetBrush(color);
+    /* 折线恒用圆头圆角 (round=true): 铅笔笔迹的转折必须圆滑, 虚线模式下
+     * 也只是在这个基础上加断点。 */
+    if (brush) ctx_->DrawGeometry(geom.Get(), brush.Get(), width, GetStrokeStyle(dash, true));
+}
+
+/* 外接矩形 → D2D 椭圆 (圆心 + 半轴)。负宽高的矩形交给调用方规范化, 这里
+ * 取绝对值只是别让半径变负导致 D2D 整个不画。 */
+static D2D1_ELLIPSE EllipseFromRect(const D2D1_RECT_F& rect) {
+    const float cx = (rect.left + rect.right) * 0.5f;
+    const float cy = (rect.top + rect.bottom) * 0.5f;
+    const float rx = std::fabs(rect.right - rect.left) * 0.5f;
+    const float ry = std::fabs(rect.bottom - rect.top) * 0.5f;
+    return D2D1::Ellipse(D2D1::Point2F(cx, cy), rx, ry);
+}
+
+void Renderer::FillEllipse(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->FillEllipse(rect, color);
+    }
+    if (!ctx_) return;
+    auto brush = GetBrush(color);
+    if (brush) ctx_->FillEllipse(EllipseFromRect(rect), brush.Get());
+}
+
+void Renderer::DrawEllipse(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color, float width,
+                           int dash) {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->DrawEllipse(rect, color, width, dash);
+    }
+    if (!ctx_) return;
+    auto brush = GetBrush(color);
+    if (brush) ctx_->DrawEllipse(EllipseFromRect(rect), brush.Get(), width,
+                                 GetStrokeStyle(dash, false));
+}
+
 void Renderer::FillRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, const D2D1_COLOR_F& color) {
     if (auto* recorder = ActiveDisplayListRecorder()) {
         recorder->FillRoundedRect(rect, rx, ry, color);
@@ -1232,12 +1681,13 @@ bool Renderer::DrawBlurredRoundedRect(const D2D1_RECT_F& rect, float rx, float r
     return true;
 }
 
-void Renderer::DrawRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color, float width) {
+void Renderer::DrawRect(const D2D1_RECT_F& rect, const D2D1_COLOR_F& color, float width,
+                        int dash) {
     if (auto* recorder = ActiveDisplayListRecorder()) {
-        recorder->DrawRect(rect, color, width);
+        recorder->DrawRect(rect, color, width, dash);
     }
     auto brush = GetBrush(color);
-    if (brush) ctx_->DrawRectangle(rect, brush.Get(), width);
+    if (brush) ctx_->DrawRectangle(rect, brush.Get(), width, GetStrokeStyle(dash, false));
 }
 
 void Renderer::DrawRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, const D2D1_COLOR_F& color, float width) {
@@ -1251,12 +1701,14 @@ void Renderer::DrawRoundedRect(const D2D1_RECT_F& rect, float rx, float ry, cons
     }
 }
 
-void Renderer::DrawLine(float x1, float y1, float x2, float y2, const D2D1_COLOR_F& color, float width) {
+void Renderer::DrawLine(float x1, float y1, float x2, float y2, const D2D1_COLOR_F& color,
+                        float width, int dash) {
     if (auto* recorder = ActiveDisplayListRecorder()) {
-        recorder->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(x2, y2), color, width);
+        recorder->DrawLine(D2D1::Point2F(x1, y1), D2D1::Point2F(x2, y2), color, width, dash);
     }
     auto brush = GetBrush(color);
-    if (brush) ctx_->DrawLine({x1, y1}, {x2, y2}, brush.Get(), width);
+    if (brush) ctx_->DrawLine({x1, y1}, {x2, y2}, brush.Get(), width,
+                              GetStrokeStyle(dash, false));
 }
 
 void Renderer::DrawText(const std::wstring& text, const D2D1_RECT_F& rect, const D2D1_COLOR_F& color,
@@ -1274,7 +1726,9 @@ void Renderer::DrawText(const std::wstring& text, const D2D1_RECT_F& rect, const
         recorder->DrawText(text, rect, style);
     }
     auto brush = GetBrush(color);
-    auto fmt = GetTextFormat(fontSize, (family && *family) ? family : theme::kFontFamily, weight);
+    /* build 314: 没指定字体走 DefaultFontFamily (窗口 > ui_theme_set_default_font),
+     * 以前写死 theme::kFontFamily, 设默认字体对默认文字无效。 */
+    auto fmt = GetTextFormat(fontSize, (family && *family) ? family : DefaultFontFamily(), weight);
     if (!brush || !fmt || !dwFactory_) return;
 
     float layoutW = rect.right - rect.left;
@@ -1320,7 +1774,7 @@ ComPtr<IDWriteTextLayout> Renderer::CreateTextLayout(const std::wstring& text,
                                                        DWRITE_FONT_WEIGHT weight) {
     ComPtr<IDWriteTextLayout> layout;
     if (!dwFactory_) return layout;
-    auto fmt = GetTextFormat(fontSize, theme::kFontFamily, weight);
+    auto fmt = GetTextFormat(fontSize, DefaultFontFamily(), weight);
     if (!fmt) return layout;
     HRESULT hr = dwFactory_->CreateTextLayout(
         text.c_str(), (UINT32)text.length(),
@@ -1358,7 +1812,7 @@ float Renderer::MeasureTextHeight(const std::wstring& text, float maxWidth, floa
                                    DWRITE_FONT_WEIGHT weight) {
     if (text.empty() || !dwFactory_) return fontSize + 4.0f;
 
-    auto fmt = GetTextFormat(fontSize, theme::kFontFamily, weight);
+    auto fmt = GetTextFormat(fontSize, DefaultFontFamily(), weight);
     if (!fmt) return fontSize + 4.0f;
 
     ComPtr<IDWriteTextLayout> layout;
@@ -2037,14 +2491,29 @@ ComPtr<ID2D1Bitmap> Renderer::GetCachedImageBitmap(ResourceKey key) {
 }
 
 void Renderer::DrawImageResource(ResourceKey key, const D2D1_RECT_F& destRect,
-                                 ImageSampling sampling, float opacity) {
-    RecordImage(key, destRect, sampling, opacity);
+                                 ImageSampling sampling, float opacity,
+                                 CompositeMode composite) {
+    if (composite == CompositeMode::SourceOver) {
+        RecordImage(key, destRect, sampling, opacity);
+    } else if (auto* recorder = ActiveDisplayListRecorder(); recorder && key.IsValid()) {
+        ImageRef image;
+        image.key = key;
+        if (auto res = GlobalResourceStore().Acquire(key)) {
+            image.width = res->width;
+            image.height = res->height;
+            image.stride = res->stride;
+            image.format = res->format;
+        }
+        recorder->DrawImage(image, destRect, sampling, opacity, composite);
+    }
     if (!ctx_) return;
 
     auto bitmap = GetCachedImageBitmap(key);
     if (!bitmap) return;
 
-    if (sampling == ImageSampling::HighQualityCubicClamp ||
+    if (composite != CompositeMode::SourceOver) {
+        DrawBitmapComposite(bitmap.Get(), destRect, sampling, composite);
+    } else if (sampling == ImageSampling::HighQualityCubicClamp ||
         sampling == ImageSampling::LinearClamp) {
         DrawBitmapClamped(bitmap.Get(), destRect, opacity,
                           sampling == ImageSampling::HighQualityCubicClamp
@@ -2059,6 +2528,35 @@ void Renderer::DrawImageResource(ResourceKey key, const D2D1_RECT_F& destRect,
             : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
         DrawBitmap(bitmap.Get(), destRect, opacity, interp);
     }
+}
+
+void Renderer::DrawBitmapComposite(ID2D1Bitmap* bitmap, const D2D1_RECT_F& destRect,
+                                   ImageSampling sampling, CompositeMode composite) {
+    if (!bitmap || !ctx_) return;
+    const D2D1_SIZE_F size = bitmap->GetSize();   // DIP, 跟 DrawImage 的单位一致
+    if (size.width <= 0.0f || size.height <= 0.0f) return;
+    const float sx = (destRect.right - destRect.left) / size.width;
+    const float sy = (destRect.bottom - destRect.top) / size.height;
+    if (sx == 0.0f || sy == 0.0f) return;
+
+    D2D1_INTERPOLATION_MODE interp = D2D1_INTERPOLATION_MODE_LINEAR;
+    if (sampling == ImageSampling::Nearest) {
+        interp = D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR;
+    } else if (sampling == ImageSampling::HighQualityCubic ||
+               sampling == ImageSampling::HighQualityCubicClamp) {
+        interp = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
+    }
+    const D2D1_COMPOSITE_MODE mode = composite == CompositeMode::DestinationOut
+                                         ? D2D1_COMPOSITE_MODE_DESTINATION_OUT
+                                         : D2D1_COMPOSITE_MODE_SOURCE_OVER;
+
+    D2D1_MATRIX_3X2_F saved = D2D1::Matrix3x2F::Identity();
+    ctx_->GetTransform(&saved);
+    ctx_->SetTransform(D2D1::Matrix3x2F::Scale(sx, sy) *
+                       D2D1::Matrix3x2F::Translation(destRect.left, destRect.top) * saved);
+    const D2D1_POINT_2F origin{0.0f, 0.0f};
+    ctx_->DrawImage(bitmap, &origin, nullptr, interp, mode);
+    ctx_->SetTransform(saved);
 }
 
 void Renderer::PruneImageBitmapCacheTo(const std::vector<ImageRef>& imageRefs) {
@@ -2401,6 +2899,32 @@ void Renderer::PopTransform() {
     transformStack_.pop_back();
 }
 
+void Renderer::PushLayer() {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->PushLayer();
+    }
+    if (!ctx_) return;
+    const D2D1_TEXT_ANTIALIAS_MODE aa = ctx_->GetTextAntialiasMode();
+    layerTextAaStack_.push_back(aa);
+    if (aa == D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE) {
+        ctx_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    }
+    /* layer 传 nullptr: Win8+ 的 DeviceContext 自己管中间层。参数用默认值 ——
+     * 无限边界、无几何遮罩、不透明度 1, 也**不能**带 INITIALIZE_FOR_CLEARTYPE:
+     * 那个选项会把底下的内容拷进层里, 挖洞后露出的是拷贝, 半透明底图会被叠两遍。 */
+    ctx_->PushLayer(D2D1::LayerParameters1(), nullptr);
+}
+
+void Renderer::PopLayer() {
+    if (auto* recorder = ActiveDisplayListRecorder()) {
+        recorder->PopLayer();
+    }
+    if (!ctx_ || layerTextAaStack_.empty()) return;
+    ctx_->PopLayer();
+    ctx_->SetTextAntialiasMode(layerTextAaStack_.back());
+    layerTextAaStack_.pop_back();
+}
+
 namespace svg_detail {
 static bool BuildGeometry(ID2D1Factory* factory, const std::vector<std::string>& pathDatas,
                           ID2D1PathGeometry** outGeometry);
@@ -2448,6 +2972,12 @@ void Renderer::ReplayDisplayList(const DisplayList& list) {
                 transformStack.pop_back();
             }
             break;
+        case DrawCommandType::PushLayer:
+            PushLayer();
+            break;
+        case DrawCommandType::PopLayer:
+            PopLayer();
+            break;
         case DrawCommandType::FillRect:
             FillRect(cmd.rect, cmd.color);
             break;
@@ -2456,7 +2986,13 @@ void Renderer::ReplayDisplayList(const DisplayList& list) {
                 FillQuad(list.quad_refs[cmd.quad_index].pts, cmd.color);
             break;
         case DrawCommandType::DrawRect:
-            DrawRect(cmd.rect, cmd.color, cmd.stroke_width);
+            DrawRect(cmd.rect, cmd.color, cmd.stroke_width, cmd.dash_style);
+            break;
+        case DrawCommandType::FillEllipse:
+            FillEllipse(cmd.rect, cmd.color);
+            break;
+        case DrawCommandType::DrawEllipse:
+            DrawEllipse(cmd.rect, cmd.color, cmd.stroke_width, cmd.dash_style);
             break;
         case DrawCommandType::FillRoundedRect:
             FillRoundedRect(cmd.rect, cmd.radius_x, cmd.radius_y, cmd.color);
@@ -2469,7 +3005,15 @@ void Renderer::ReplayDisplayList(const DisplayList& list) {
                                    cmd.blur_radius, cmd.color);
             break;
         case DrawCommandType::DrawLine:
-            DrawLine(cmd.p0.x, cmd.p0.y, cmd.p1.x, cmd.p1.y, cmd.color, cmd.stroke_width);
+            DrawLine(cmd.p0.x, cmd.p0.y, cmd.p1.x, cmd.p1.y, cmd.color, cmd.stroke_width,
+                     cmd.dash_style);
+            break;
+        case DrawCommandType::DrawPolyline:
+            if (cmd.polyline_index < list.polyline_refs.size()) {
+                const auto& poly = list.polyline_refs[cmd.polyline_index];
+                DrawPolyline(poly.pts.data(), poly.pts.size(), cmd.color,
+                             cmd.stroke_width, poly.closed, cmd.dash_style);
+            }
             break;
         case DrawCommandType::DrawText: {
             if (cmd.text_index >= list.text_pool.size()) break;
@@ -2487,7 +3031,7 @@ void Renderer::ReplayDisplayList(const DisplayList& list) {
         case DrawCommandType::DrawImage: {
             if (cmd.image_ref_index >= list.image_refs.size()) break;
             const auto& ref = list.image_refs[cmd.image_ref_index];
-            DrawImageResource(ref.key, cmd.rect, cmd.sampling, cmd.opacity);
+            DrawImageResource(ref.key, cmd.rect, cmd.sampling, cmd.opacity, cmd.composite);
             break;
         }
         case DrawCommandType::FillImagePattern: {
@@ -2696,20 +3240,35 @@ static bool IsIdentity(const D2D1_MATRIX_3X2_F& m) {
            m._31 == 0.0f && m._32 == 0.0f;
 }
 
+static void AppendDecoded(std::string& out, const std::string& src);   // 定义见下文
+
+/* L305: 属性值必须解 XML 实体。style 内联器把 CSS 的 `font-family:'A B'` 写成
+ * 属性时会转义成 font-family="&quot;A B&quot;" —— 不解码的话字体名就成了
+ * `&quot;A B&quot;`, 任何字体都匹配不上, 整份 CorelDRAW SVG 的文字全走系统兜底
+ * 字体 (bug-098)。同一个值随后由 buildPath 的 XmlAttrEscape 重新转义写回, 所以
+ * 这里解码正好构成一次完整的往返 (此前是"不解码但重转义", '&' 会被双重转义)。
+ * 值里没有 '&' 时直接返回, 热路径零额外开销。 */
 static std::string extractAttrFromTag(const std::string& tag, const char* attr) {
+    auto decode = [](std::string v) -> std::string {
+        if (v.find('&') == std::string::npos) return v;
+        std::string out;
+        out.reserve(v.size());
+        AppendDecoded(out, v);
+        return out;
+    };
     std::string needle1 = std::string(" ") + attr + "=\"";
     std::string needle2 = std::string(" ") + attr + "='";
     auto p = tag.find(needle1);
     if (p != std::string::npos) {
         auto s = p + needle1.size();
         auto e = tag.find("\"", s);
-        if (e != std::string::npos) return tag.substr(s, e - s);
+        if (e != std::string::npos) return decode(tag.substr(s, e - s));
     }
     p = tag.find(needle2);
     if (p != std::string::npos) {
         auto s = p + needle2.size();
         auto e = tag.find("'", s);
-        if (e != std::string::npos) return tag.substr(s, e - s);
+        if (e != std::string::npos) return decode(tag.substr(s, e - s));
     }
     return "";
 }
@@ -4147,6 +4706,60 @@ static bool RenderEmbeddedGlyphRun(const EmbeddedSvgFonts* fonts,
     return outPath && !outPath->empty();
 }
 
+static std::string WideToUtf8Ascii(const std::wstring& s) {
+    if (s.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(),
+                                      nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string out((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+/* L305: SVG 1.1 SVG Fonts (<font>/<glyph>) —— CorelDRAW 导出的 SVG 不内嵌
+ * WOFF2, 而是把用到的字形轮廓直接写进 <defs>, 用 `src:url("#FontID") format(svg)`
+ * 引用。上面的 WOFF2 通道只认 data: URL, 这类文件会整个漏掉, 回落到系统字体 ——
+ * 而段码 LCD 字体 ('@' 是"熄灭的 8") 根本没有可替代字体, 画出来必错 (bug-097)。
+ *
+ * 排在 RenderEmbeddedGlyphRun **之后**: SVG Font 的 family 不会出现在
+ * DirectWrite 的内存字体集合里, WOFF2 通道对它必然 miss, 放后面对既有行为零影响。
+ *
+ * 注意这里**不能**照抄 WOFF2 通道 "weight != NORMAL 就退出" 那条限制 ——
+ * CorelDRAW 把字重编进 family 名里 ("阿里巴巴普惠体 Medium" 是独立的一个
+ * <font>), 按名字匹配即可, 字重只在同名多字体时做次级筛选。 */
+static bool RenderSvgFontRun(const svgfont::FontSet& fonts,
+                             const std::wstring& txt, float fontSize,
+                             const std::vector<std::wstring>& families,
+                             DWRITE_FONT_WEIGHT weight, DWRITE_FONT_STYLE fstyle,
+                             float svgX, float svgY, int anchor, bool block,
+                             std::string* outPath, float* outAdv) {
+    if (fonts.Empty() || txt.empty() || families.empty() || fontSize <= 0.0f) return false;
+
+    std::u32string cps;                          // UTF-16 → UTF-32, 合并代理对
+    cps.reserve(txt.size());
+    for (size_t i = 0; i < txt.size(); ++i) {
+        const wchar_t c = txt[i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < txt.size() &&
+            txt[i + 1] >= 0xDC00 && txt[i + 1] <= 0xDFFF) {
+            cps.push_back((char32_t)(0x10000u + ((c - 0xD800u) << 10) + (txt[i + 1] - 0xDC00u)));
+            ++i;
+        } else {
+            cps.push_back((char32_t)c);
+        }
+    }
+
+    const bool italic = (fstyle != DWRITE_FONT_STYLE_NORMAL);
+    for (const std::wstring& fam : families) {
+        const svgfont::Font* f =
+            svgfont::Find(fonts, WideToUtf8Ascii(fam), (int)weight, italic);
+        if (!f) continue;
+        if (svgfont::LayoutToPath(*f, cps, fontSize, svgX, svgY, anchor, block,
+                                  outPath, outAdv))
+            return true;
+    }
+    return false;
+}
+
 } // namespace
 
 std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
@@ -4161,6 +4774,8 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
     using svg_detail::Utf8ToWide;
 
     auto embeddedFonts = BuildEmbeddedSvgFonts(dwFactory_, svg);
+    // L305: 整份文档解析一次 SVG Font; 文件里没有 <font> 时是空集合, 开销为零。
+    const svgfont::FontSet svgFonts = svgfont::Parse(svg);
     auto shouldSkipForeignObject = [&](const std::string& tag, size_t foStart, size_t foEnd) {
         auto isPercentLength = [](const std::string& v) {
             return v.find('%') != std::string::npos;
@@ -4270,6 +4885,12 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
         DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL; bool weightSet = false;
         DWRITE_FONT_STYLE  fstyle = DWRITE_FONT_STYLE_NORMAL;  bool styleSet  = false;  // L122: italic
         std::string fill; bool fillSet = false;                  // url()/#hex/named, "" = 未设
+        /* L305: baseline-shift。kind: +1 super / -1 sub / 0 无; user: 显式
+         * <length>/<percentage> 折算成的用户单位 (正 = 上移)。规范说它不继承,
+         * 但嵌套 tspan 的偏移是**相对父级已偏移的基线**叠加的, 所以随 GFont 一起
+         * 传下去正好是那个语义 (super 套 super 只算一层, 不追求)。 */
+        int   shiftKind = 0;
+        float shiftUser = 0.0f;
     };
     auto applyFont = [&](GFont& st, const std::string& tag, const std::string& style) {
         std::string s;
@@ -4293,6 +4914,25 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
                       :                                            DWRITE_FONT_STYLE_NORMAL;
             st.styleSet = true;
         }
+        /* L305: baseline-shift。CorelDRAW 的上标 (mg/m³ 的 3、O₂ 的 2) 就靠它 ——
+         * 字号不变, 只把基线抬起来, 不处理的话上标会掉回正文行内。放在最后解析,
+         * 因为 <percentage> 要按**本元素已生效的** font-size 折算。 */
+        if ((s = extractAttrFromTag(tag, "baseline-shift")).empty())
+            s = CssProp(style, "baseline-shift");
+        if (!s.empty()) {
+            const std::string v = LowerAscii(TrimAscii(s));
+            const float base = st.fontSize > 0.0f ? st.fontSize : 16.0f;
+            if (v == "super")      st.shiftKind = 1;
+            else if (v == "sub")   st.shiftKind = -1;
+            else if (v == "baseline" || v == "0") { st.shiftKind = 0; st.shiftUser = 0.0f; }
+            else if (v == "inherit") { /* 保持继承下来的值 */ }
+            else if (!v.empty() && v.back() == '%') {
+                // ParseSvgCssLength 不认 '%', 这里自己折算 (Chrome 对 SVG 也按字号算)
+                st.shiftUser += (float)atof(v.c_str()) / 100.0f * base;
+            } else {
+                st.shiftUser += ParseSvgCssLength(v, base, 0.0f);
+            }
+        }
     };
 
     /* 把一段文本渲染成 SVG path-data。svgX/svgY = SVG 用户坐标 (svgY 为 baseline),
@@ -4302,14 +4942,36 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
     auto renderRun = [&](const std::wstring& txt, float fontSize, const std::vector<std::wstring>& families,
                          DWRITE_FONT_WEIGHT weight, DWRITE_FONT_STYLE fstyle,
                          float svgX, float svgY, int anchor, bool block, float maxW,
-                         float* outAdv) -> std::string {
+                         float* outAdv,
+                         int shiftKind = 0, float shiftUser = 0.0f) -> std::string {
         if (outAdv) *outAdv = 0.0f;
         if (txt.empty()) return {};
+
+        /* L305: baseline-shift 只改基线, 在这里一次性折进 svgY, 下面 WOFF2 /
+         * SVG Font / DirectWrite 三条字形通道就都不用各自处理。
+         * super/sub 的幅度规范说是"父字体的上/下标基线", 实现自定。Blink 用字体的
+         * (ascent+descent)/2 —— 实测 Arial 0.559em / Times 0.554em / 雅黑 0.66em /
+         * Segoe UI 0.665em。这里取 0.6em 常数, 与之相差 ≤0.07em, 换来不必把字体
+         * 度量透传进三条通道。(跟下面 HTML <sup> 那条不是一回事: HTML 路径还会把
+         * 字号缩到 0.65, SVG 的 baseline-shift 不改字号。) */
+        if (shiftKind != 0 || shiftUser != 0.0f) {
+            float shift = shiftUser;
+            if (shiftKind > 0)      shift += fontSize * 0.6f;
+            else if (shiftKind < 0) shift -= fontSize * 0.6f;
+            svgY -= shift;                                  // SVG 的 y 向下, 上移 = 减
+        }
+
         std::string embeddedPath;
         if (RenderEmbeddedGlyphRun(embeddedFonts.get(), txt, fontSize, families,
                                    weight, fstyle, svgX, svgY, anchor, block,
                                    &embeddedPath, outAdv)) {
             return embeddedPath;
+        }
+        // L305: 文档自带的 SVG Font 字形轮廓 (CorelDRAW); miss 才继续走 DirectWrite。
+        std::string svgFontPath;
+        if (RenderSvgFontRun(svgFonts, txt, fontSize, families, weight, fstyle,
+                             svgX, svgY, anchor, block, &svgFontPath, outAdv)) {
+            return svgFontPath;
         }
         const std::wstring* embeddedPrimary = FirstEmbeddedAlias(embeddedFonts.get(), families);
         const wchar_t* fam = embeddedPrimary ? embeddedPrimary->c_str()
@@ -4320,12 +4982,12 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
                 ? embeddedFonts->collection.Get() : nullptr;
         ComPtr<IDWriteTextFormat> fmt;
         if (FAILED(dwFactory_->CreateTextFormat(fam, collection, weight, fstyle,
-                DWRITE_FONT_STRETCH_NORMAL, fontSize, ResolveLocaleName(),
+                DWRITE_FONT_STRETCH_NORMAL, fontSize, TextLocaleName(),
                 fmt.GetAddressOf())) || !fmt)
             return {};
         ComPtr<IDWriteFontFallback> embeddedFallback =
             embeddedFonts ? embeddedFonts->MakeFallback(dwFactory_, families, fontFallback_.Get(),
-                                                        ResolveLocaleName(), embeddedPrimary ? embeddedPrimary->c_str() : nullptr)
+                                                        TextLocaleName(), embeddedPrimary ? embeddedPrimary->c_str() : nullptr)
                           : nullptr;
         if (embeddedFallback || fontFallback_) {
             ComPtr<IDWriteTextFormat3> f3;
@@ -4626,11 +5288,11 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
         ComPtr<IDWriteTextFormat> fmt;
         if (FAILED(dwFactory_->CreateTextFormat(fam, collection, run.style.weight,
                 run.style.fstyle, DWRITE_FONT_STRETCH_NORMAL, run.style.fontSize,
-                ResolveLocaleName(), fmt.GetAddressOf())) || !fmt)
+                TextLocaleName(), fmt.GetAddressOf())) || !fmt)
             return false;
         ComPtr<IDWriteFontFallback> embeddedFallback =
             embeddedFonts ? embeddedFonts->MakeFallback(dwFactory_, run.style.families,
-                                                        fontFallback_.Get(), ResolveLocaleName(),
+                                                        fontFallback_.Get(), TextLocaleName(),
                                                         embeddedPrimary ? embeddedPrimary->c_str() : nullptr)
                           : nullptr;
         if (embeddedFallback || fontFallback_) {
@@ -4943,7 +5605,8 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
                                           : ExtractInnerText(svg, te + 1, contentEnd);
             if (text.empty()) continue;
             std::string d = renderRun(text, tFontSize, tFam, tWeight, tStyle,
-                                      tx, ty, anchor, block, maxW, nullptr);
+                                      tx, ty, anchor, block, maxW, nullptr,
+                                      ts.shiftKind, ts.shiftUser);
             if (d.empty()) continue;
             std::string replacement;
             if (isFO) replacement += buildRect(foX, foY, foW, foH, foBg, xfStr);
@@ -5007,7 +5670,8 @@ std::string Renderer::SvgInlineTextAsPaths(const std::string& svg) {
             anchorPending = false;
             float adv = 0.0f;
             std::string d = renderRun(txt, fs, fam, wt, st2, penX, penY,
-                                      runAnchor, false, 0, &adv);
+                                      runAnchor, false, 0, &adv,
+                                      st.shiftKind, st.shiftUser);
             if (!d.empty()) addD(fill, d);
             penX += adv;                                // 无下个显式 x 时接续
         };
@@ -5220,14 +5884,30 @@ void Renderer::DrawSvgTextRuns(const std::vector<SvgTextRun>& runs,
     ctx_->SetTransform(saved);
 }
 
-ID2D1StrokeStyle* Renderer::GetRoundStrokeStyle() {
-    if (roundStrokeStyle_) return roundStrokeStyle_.Get();
+ID2D1StrokeStyle* Renderer::GetStrokeStyle(int dash, bool round) {
+    if (dash < 0 || dash > 3) dash = 0;
+    /* 实线 + 默认线帽 = D2D 缺省行为, 传 nullptr 即可, 不必建对象 */
+    if (dash == 0 && !round) return nullptr;
+    auto& slot = strokeStyles_[dash][round ? 1 : 0];
+    if (slot) return slot.Get();
     if (!factory_) return nullptr;
+
+    static const D2D1_DASH_STYLE kDash[4] = {
+        D2D1_DASH_STYLE_SOLID, D2D1_DASH_STYLE_DASH,
+        D2D1_DASH_STYLE_DOT,   D2D1_DASH_STYLE_DASH_DOT,
+    };
+    const D2D1_CAP_STYLE cap = round ? D2D1_CAP_STYLE_ROUND : D2D1_CAP_STYLE_FLAT;
+    const D2D1_LINE_JOIN join = round ? D2D1_LINE_JOIN_ROUND : D2D1_LINE_JOIN_MITER;
+    /* dashCap 恒为 ROUND: D2D 的 DOT 图案是"零长度线段 + 间隔", 平头线帽下
+     * 零长段画不出任何东西 —— 点线会整条消失。圆头帽才让它成为圆点。 */
     D2D1_STROKE_STYLE_PROPERTIES props = D2D1::StrokeStyleProperties(
-        D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
-        D2D1_LINE_JOIN_ROUND, 10.0f, D2D1_DASH_STYLE_SOLID, 0.0f);
-    factory_->CreateStrokeStyle(props, nullptr, 0, roundStrokeStyle_.GetAddressOf());
-    return roundStrokeStyle_.Get();
+        cap, cap, D2D1_CAP_STYLE_ROUND, join, 10.0f, kDash[dash], 0.0f);
+    factory_->CreateStrokeStyle(props, nullptr, 0, slot.GetAddressOf());
+    return slot.Get();
+}
+
+ID2D1StrokeStyle* Renderer::GetRoundStrokeStyle() {
+    return GetStrokeStyle(0, true);
 }
 
 } // namespace ui

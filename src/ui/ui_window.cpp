@@ -1,14 +1,21 @@
 #include "ui_window.h"
 #include "ui_context.h"
+#include "frame_ticker.h"
 #include "controls.h"
 #include "image_view_plus.h"
 #include "gh_img_view.h"
 #include "ocr_img_view.h"
 #include "theme.h"
 #include "animation.h"
+#include "auto_height.h"
 #include "debug_trace.h"
+#include "drag_autoscroll.h"
+#include "dwm_probe.h"
+#include "layered_frame.h"
 #include "overlay_service.h"
 #include "render_thread.h"
+#include "test_isolation.h"
+#include "window_corner.h"
 #include <windowsx.h>
 #include <imm.h>       /* IME composition/candidate window positioning */
 #include <dwmapi.h>
@@ -83,6 +90,14 @@ static void StampDomMouseState(MouseEvent& e, int button = -1);
 namespace {
 constexpr UINT kMsgStartupReveal = WM_APP + 101;
 constexpr UINT kMsgRenderFrame = WM_APP + 130;
+/* FrameTicker 每个 vblank 投来的动画拍 (131 / 132 已被渲染线程占用)。 */
+constexpr UINT kMsgAnimFrame = WM_APP + 133;
+/* 悬停重绘合并: FrameTicker::PostAt 在下一次 vblank 前 kInputPaintLeadMs 投这条。
+ * 提前量 = UI 线程录制 (~0.4ms) + 渲染线程画 / Present (~0.8ms) + 余量, 赶在 DWM 合成前。 */
+constexpr UINT kMsgInputFrame = WM_APP + 134;
+constexpr int64_t kInputPaintLeadMs = 3;
+constexpr int64_t kInputPaintLostMs = 100;   // 约好的合并帧过点这么久还没到 = 投递丢了, 重新约
+constexpr int64_t kInputMoveNestedMs = 50;   // 一次鼠标移动处理超过这么久 = 钩子里跑着嵌套消息循环
 constexpr UINT kMsgRenderDeviceLost = kUiCoreRenderDeviceLostMessage;
 constexpr UINT_PTR kCaretBlinkTimerId = 0xCA11;
 
@@ -102,11 +117,8 @@ private:
     MeasureContext* previous_ = nullptr;
 };
 
-constexpr UINT_PTR kToggleAnimTimerId = 0xCA12;
-constexpr UINT_PTR kWindowOpenAnimTimerId = 0xCA13;
-constexpr UINT_PTR kWindowCloseAnimTimerId = 0xCA14;
-constexpr UINT kToggleAnimIntervalMs = 16;
-constexpr UINT kWindowAnimIntervalMs = 16;
+constexpr UINT_PTR kDragAutoScrollTimerId = 0xCA15;
+/* 0xCA13 / 0xCA14 曾是窗口开 / 关动画定时器, 现走 FrameTicker (kTickWindowAnim), 勿复用。 */
 
 constexpr float kPopPeakScale = 1.02f;       // 关闭动画微弹峰值
 constexpr float kClosePeakPhase = 0.18f;
@@ -183,7 +195,7 @@ static void ForEachWidget(Widget* w, const std::function<void(Widget*)>& fn) {
 UiWindowImpl::UiWindowImpl() = default;
 UiWindowImpl::~UiWindowImpl() {
     /* toast 叠加窗 owner = hwnd_, DestroyWindow(hwnd_) 会连带销毁它, 但仍要
-     * 显式 KillTimer + timeEndPeriod 配对 (DestroyToast 负责), 防泄漏时钟精度. */
+     * 显式退订动画心跳 + KillTimer (DestroyToast 负责), 防 HWND 复用后收到旧消息. */
     DestroyToast();
     UnregisterRenderWindow();
     if (hwnd_) DestroyWindow(hwnd_);
@@ -268,9 +280,14 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
     windowTargetX_ = winX;
     windowTargetY_ = winY;
 
-    /* 不需要开场动画时不加 WS_EX_LAYERED，避免首次 ShowWindow 500ms+ 延迟 */
-    if (!skipOpenAnimation_)
+    /* 不需要开场动画时不加 WS_EX_LAYERED，避免首次 ShowWindow 500ms+ 延迟。
+     * 分层画布窗口: 始终 WS_EX_LAYERED, 但永不 SetLayeredWindowAttributes
+     * (调过之后 UpdateLayeredWindow 就失败, 直到重设样式)。 */
+    if (layeredCanvas_) skipOpenAnimation_ = true;
+    if (!skipOpenAnimation_ || layeredCanvas_)
         exStyle |= WS_EX_LAYERED;
+    testIsolated_ = TestIsolationEnabled();
+    if (testIsolated_) exStyle |= WS_EX_NOACTIVATE;   // 测试窗口不抢用户前台
 
     hwnd_ = CreateWindowExW(exStyle, L"UiCore_Window", title_.c_str(), style,
                             winX, winY, physW, physH,
@@ -286,9 +303,29 @@ bool UiWindowImpl::Create(const wchar_t* title, int width, int height,
     BOOL disableTransitions = TRUE;
     DwmSetWindowAttribute(hwnd_, DWMWA_TRANSITIONS_FORCEDISABLED,
                           &disableTransitions, sizeof(disableTransitions));
+    ApplyCornerPreference();
 
     dpi_ = GetDpiForWindow(hwnd_);
     dpiScale_ = (float)dpi_ / 96.0f;
+
+    /* 上面 DIP→px 用的是主屏 system DPI (建窗前拿不到窗口, 只能用它)。窗口
+     * 落在别的缩放的屏上时那个换算是错的 —— 主屏 100% + 副屏 125% 时, 记忆
+     * 位置在副屏的窗口会按 100% 算出物理尺寸, 开出来小一圈。窗口已建好, 这里
+     * 能拿到**它实际所在屏**的 DPI, 差了就按真 DPI 重算一次。此刻窗口还是
+     * SW_HIDE, 改尺寸不可见, 无闪。 */
+    if (dpi_ != sysDpi && dpi_ != 0) {
+        const int fixW = MulDiv(width,  (int)dpi_, 96);
+        const int fixH = MulDiv(height, (int)dpi_, 96);
+        if (fixW != physW || fixH != physH) {
+            physW = fixW;
+            physH = fixH;
+            windowTargetWidth_  = (float)physW;
+            windowTargetHeight_ = (float)physH;
+            SetWindowPos(hwnd_, nullptr, 0, 0, physW, physH,
+                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
+        }
+    }
+
     RefreshClientSizeCache();
 
     if (borderless) {
@@ -309,7 +346,20 @@ void UiWindowImpl::RegisterRenderWindow(uint64_t id) {
     renderWindowId_ = RenderWindowId{id, hwndGeneration_};
     renderThreadPresentActive_ = false;
     RenderThread::Instance().Start();
-    RenderThread::Instance().RegisterWindow(renderWindowId_, hwnd_);
+    if (layeredCanvas_) {
+        /* 分层画布窗口: 从第一帧起就走渲染线程, UI 线程渲染器不建目标。 */
+        if (!layeredFrames_) layeredFrames_ = std::make_shared<LayeredFrameBuffer>();
+        RenderThread::Instance().RegisterWindow(renderWindowId_, hwnd_,
+                                                RenderSurfaceKind::HwndLayeredUlw,
+                                                layeredFrames_);
+        return;
+    }
+    /* 交换链类型在建窗时定死: 同一 HWND 用过 flip model 之后再换复制模式就不能
+     * 再换回, 所以不能按 canvas 模式动态切。 */
+    RenderThread::Instance().RegisterWindow(
+        renderWindowId_, hwnd_,
+        copySwapChain_ ? RenderSurfaceKind::HwndCopySwapChain
+                       : RenderSurfaceKind::HwndSwapChain);
 }
 
 void UiWindowImpl::UnregisterRenderWindow() {
@@ -383,6 +433,10 @@ static bool MaximizedWorkRect(HWND hwnd, RECT& out) {
 
 void UiWindowImpl::Show() {
     if (!hwnd_) return;
+    if (layeredCanvas_) {
+        ShowLayeredCanvas(true);
+        return;
+    }
 
     /* 外部可能先 ShowWindow(SW_MAXIMIZE) 了 —— 这里检测一次，
      * 如果已经是最大化，跳过 SetWindowPos 写死尺寸的路径 +
@@ -430,15 +484,23 @@ void UiWindowImpl::Show() {
             SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
+        /* build 323: 先透明地以最大化态上屏, 再画首帧 —— 渲染线程对隐藏窗口只画不
+         * Present, 旧顺序 (先画后 show) 上屏那一刻露系统浅灰底, 深色主题下白一下。
+         * 外部已 SW_MAXIMIZE (窗口已可见) 时首帧本来就能 Present, 不再透明一次。 */
+        const bool revealFromHidden = !IsWindowVisible(hwnd_);
+        if (revealFromHidden) {
+            SetLayeredWindowAttributes(hwnd_, 0, 0, LWA_ALPHA);
+            ShowWindow(hwnd_, SW_SHOWMAXIMIZED);
+        }
         RefreshClientSizeCache();
         LayoutRoot();
         SubmitRenderThreadFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
         ValidateRect(hwnd_, nullptr);
         /* 直接以最大化态显示，不走 slide 动画 */
         SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
-        ShowWindow(hwnd_, SW_SHOWMAXIMIZED);
+        if (!revealFromHidden) ShowWindow(hwnd_, SW_SHOWMAXIMIZED);
         ClearLayeredAfterAlpha(hwnd_);
-        if (!toolWindow_) SetForegroundWindow(hwnd_);
+        if (!toolWindow_ && !TestIsolationEnabled()) SetForegroundWindow(hwnd_);
         return;
     }
 
@@ -449,9 +511,8 @@ void UiWindowImpl::Show() {
     RefreshClientSizeCache();
 
     LayoutRoot();
-    SubmitRenderThreadFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
-    ValidateRect(hwnd_, nullptr);
-
+    /* 首帧在 StartWindowOpenAnimation 里 alpha 0 上屏之后才画 (build 323) —— 在这里
+     * 画, 窗口还隐藏, 渲染线程只画不 Present, 淡入拉起来的是系统浅灰底。 */
     StartWindowOpenAnimation();
 }
 
@@ -461,6 +522,17 @@ void UiWindowImpl::PrepareRT() {
     BOOL disableTransitions = TRUE;
     DwmSetWindowAttribute(hwnd_, DWMWA_TRANSITIONS_FORCEDISABLED,
                           &disableTransitions, sizeof(disableTransitions));
+
+    if (layeredCanvas_) {
+        /* 分层画布窗口不能摘 WS_EX_LAYERED, 也不走最大化预置; 只确立客户区 + 排版。 */
+        startMaximizedPending_ = false;
+        SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        framePrepared_ = true;
+        RefreshClientSizeCache();
+        LayoutRoot();
+        return;
+    }
 
     LONG_PTR exStyle = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
     if (exStyle & WS_EX_LAYERED)
@@ -514,6 +586,10 @@ void UiWindowImpl::PrepareRT() {
 
 void UiWindowImpl::ShowImmediate(bool activate) {
     if (!hwnd_) return;
+    if (layeredCanvas_) {
+        ShowLayeredCanvas(activate);
+        return;
+    }
 
     /* Build 105+ (L25): start_maximized hint 走 SW_SHOWMAXIMIZED, 首帧
      * 即最大化态. argv 启动 (文件关联) + 上次最大化关闭场景下用. */
@@ -526,23 +602,36 @@ void UiWindowImpl::ShowImmediate(bool activate) {
         SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
+    /* build 323: 常规尺寸也先 alpha 0 上屏再画首帧。渲染线程对隐藏窗口只画不
+     * Present (render_window.cpp), 旧顺序"先画后 show"让窗口上屏那一刻交换链里
+     * 没有已呈现的画面, DWM 合成出一片系统底色 (浅灰), 下一次 WM_PAINT 才出内容
+     * —— 深色主题下就是"打开白一下", 慢机器明显。改成与最大化路径 (PrepareRT)
+     * 同一套: shown + 透明 → 首帧真 Present → alpha 255 揭示。已可见的窗口
+     * 首帧本来就能 Present, 不再透明一次免得闪。
+     * SW_SHOWNA 显示但不激活 → 不触发 WM_ACTIVATE 的 DWM 首帧同步(部分机器 200-300ms)。 */
+    const bool revealFromHidden = !startMax && !IsWindowVisible(hwnd_);
+    if (revealFromHidden) {
+        EnsureLayeredForAlpha(hwnd_);
+        SetLayeredWindowAttributes(hwnd_, 0, 0, LWA_ALPHA);
+        ShowWindow(hwnd_, SW_SHOWNA);
+    }
     RefreshClientSizeCache();
 
     LayoutRoot();
     SubmitRenderThreadFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
     ValidateRect(hwnd_, nullptr);
 
-    if (startMax) {
-        /* L102/L103: 窗口已在 PrepareRT 真最大化 + WS_EX_LAYERED alpha 0(shown 但透明,
-         * client=工作区, rcNormalPosition=常规)。OnPaint 已把内容绘进 RT, 这里一次
-         * alpha→255 揭示 → 首帧即全屏 + 有内容, 无黑底/白边/先小后大闪。 */
+    if (startMax || revealFromHidden) {
+        /* L102/L103: 最大化时窗口已在 PrepareRT 真最大化 + WS_EX_LAYERED alpha 0
+         * (shown 但透明, client=工作区, rcNormalPosition=常规); 常规尺寸在上面同样
+         * 透明上屏。首帧已 Present, 这里一次 alpha→255 揭示 → 第一眼即有内容,
+         * 无系统底色/白边/先小后大闪。 */
         SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
         ClearLayeredAfterAlpha(hwnd_);
     } else {
-        /* SW_SHOWNA 显示但不激活 → 不触发 WM_ACTIVATE 的 DWM 首帧同步(部分机器 200-300ms)。 */
         ShowWindow(hwnd_, SW_SHOWNA);
     }
-    if (activate && !toolWindow_) {
+    if (activate && !toolWindow_ && !TestIsolationEnabled()) {
         BringWindowToTop(hwnd_);
         SetForegroundWindow(hwnd_);
     }
@@ -550,6 +639,60 @@ void UiWindowImpl::ShowImmediate(bool activate) {
 
 void UiWindowImpl::Hide() {
     ShowWindow(hwnd_, SW_HIDE);
+}
+
+void UiWindowImpl::ShowLayeredCanvas(bool activate) {
+    /* 分层窗口在第一次 ULW 之前不显示任何内容, 所以先画好、提交一帧再 show:
+     * 屏幕上第一眼就是完整画面, 没有空白/黑底帧。 */
+    startMaximizedPending_ = false;
+    if (!framePrepared_) {
+        SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        framePrepared_ = true;
+    }
+    RefreshClientSizeCache();
+    LayoutRoot();
+    SubmitRenderThreadFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
+    ValidateRect(hwnd_, nullptr);
+    RECT wr{};
+    GetWindowRect(hwnd_, &wr);
+    const POINT pos{wr.left, wr.top};
+    CommitLayeredFrame(&pos);
+    ShowWindow(hwnd_, SW_SHOWNA);
+    if (activate && !toolWindow_ && !TestIsolationEnabled()) {
+        BringWindowToTop(hwnd_);
+        SetForegroundWindow(hwnd_);
+    }
+}
+
+bool UiWindowImpl::CommitLayeredFrame(const POINT* screenPos) {
+    if (!hwnd_ || !layeredFrames_) return false;
+    layeredCommitting_ = true;
+    const bool ok = layeredFrames_->Commit(hwnd_, screenPos);
+    layeredCommitting_ = false;
+    return ok;
+}
+
+void UiWindowImpl::EndLayeredCanvasTransaction(bool resizeDirty, bool paintDirty) {
+    /* 分层画布的视觉事务: 新尺寸的帧在渲染线程画好并读回 (不提交), 再由这里一次
+     * UpdateLayeredWindow 带上新位置 —— 位置、尺寸、画面同一帧到达屏幕。
+     * 替代交换链窗口的 "DwmFlush → SetWindowPos → Present" (那三步之间 DWM 可以
+     * 插一次合成, 屏幕有动画时必然出错帧)。 */
+    if (!deferredVisualWindowRectPending_) {
+        /* 只有内容变化: 普通帧, 渲染线程发 "帧就绪", 收到后提交。 */
+        FlushVisualTransactionFrame(resizeDirty, paintDirty, false, false);
+        return;
+    }
+    const POINT pos{deferredVisualWindowXScreen_, deferredVisualWindowYScreen_};
+    deferredVisualWindowRectPending_ = false;
+    const bool prepared = FlushVisualTransactionFrame(true, true, false, true);
+    if (!prepared) {
+        TraceEvent("core_window", "layered_transaction_prepare_fallback",
+                   {TraceU64("frame_generation", deferredPresentGeneration_)});
+        SubmitRenderThreadFrameNow(FrameReason::Resize | FrameReason::Paint,
+                                   PresentPolicy::Immediate);
+    }
+    CommitLayeredFrame(&pos);
 }
 
 void UiWindowImpl::NotifyWidgetDestroyed(Widget* w) {
@@ -565,7 +708,7 @@ void UiWindowImpl::NotifyWidgetDestroyed(Widget* w) {
 }
 
 void UiWindowImpl::ActivateForMouseInput() {
-    if (!hwnd_ || toolWindow_) return;
+    if (!hwnd_ || toolWindow_ || TestIsolationEnabled()) return;
 
     BringWindowToTop(hwnd_);
     SetForegroundWindow(hwnd_);
@@ -578,6 +721,19 @@ void UiWindowImpl::Invalidate() {
     if (visualUpdateDepth_ > 0) {
         visualPaintDirty_ = true;
         return;
+    }
+    /* 鼠标移动处理中 (CSS :hover 刷新、控件 / 脚本钩子) 的重绘请求先记下, 由移动末尾的
+     * RequestInputPaint 统一决定立即画还是并到 vblank 前。一次移动正常不到 1ms; 超过
+     * kInputMoveNestedMs 说明钩子里跑着嵌套消息循环 (定时器回调 / 别的窗口的消息也会走到
+     * 这里, WndProc 那层挡不住), 照常画, 不然整个循环期间窗口不更新。 */
+    if (inputMoveDepth_ > 0) {
+        LARGE_INTEGER now, freq;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+        if (now.QuadPart - inputMoveStartQpc_ < freq.QuadPart * kInputMoveNestedMs / 1000) {
+            inputPaintDirty_ = true;
+            return;
+        }
     }
     if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) {
         if (IsTraceEnabled()) {
@@ -605,6 +761,47 @@ void UiWindowImpl::InvalidateNow() {
             FlushRenderFrameNow(FrameReason::Paint, PresentPolicy::Immediate);
         }
     }
+}
+
+/* 鼠标移动 (悬停与按住拖动) 引起的重绘。1000Hz 鼠标每秒上千条, 以前每条都画一帧, 屏幕
+ * 却只刷新 60 次。空闲后第一条立即画; 一个周期内画过就并到下一次 vblank 前一起画
+ * (PlanInputPaint), 期间的移动只记脏。 */
+void UiWindowImpl::RequestInputPaint() {
+    if (!hwnd_) return;
+    if (visualUpdateDepth_ > 0 || windowAnimating_ || !IsWindowVisible(hwnd_) || IsIconic(hwnd_)) {
+        Invalidate();
+        return;
+    }
+    inputPaintDirty_ = true;
+
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    if (inputPaintPending_) {
+        // 已约好 vblank 前那一帧。过点很久还没到 = 投递丢了 (以前动画退订心跳时会连带丢掉),
+        // 重新约, 否则之后每条移动都只记脏, 一直等到松手才画。
+        if (now.QuadPart - inputPaintDeadline_ < freq.QuadPart * kInputPaintLostMs / 1000) return;
+        TraceEvent("core_window", "input_paint_lost");
+        inputPaintPending_ = false;
+    }
+    int64_t vblank = 0, period = 0;
+    if (!FrameTicker::Instance().VBlankTiming(vblank, period)) period = 0;
+    const auto plan = frameticker::PlanInputPaint(now.QuadPart, lastSubmitQpc_, vblank, period,
+                                                  freq.QuadPart * kInputPaintLeadMs / 1000);
+    TraceEvent("core_window", "input_paint_plan",
+               {TraceBool("now", plan.now),
+                TraceF64("since_last_ms", lastSubmitQpc_
+                             ? (double)(now.QuadPart - lastSubmitQpc_) * 1000.0 / (double)freq.QuadPart
+                             : -1.0),
+                TraceF64("deadline_in_ms", plan.now ? 0.0
+                             : (double)(plan.deadline - now.QuadPart) * 1000.0 / (double)freq.QuadPart)});
+    if (plan.now) {
+        InvalidateNow();
+        return;
+    }
+    inputPaintPending_ = true;
+    inputPaintDeadline_ = plan.deadline;
+    FrameTicker::Instance().PostAt(hwnd_, kMsgInputFrame, plan.deadline);
 }
 
 bool UiWindowImpl::HasPendingPaint() const {
@@ -828,6 +1025,10 @@ void UiWindowImpl::EndCanvasVisualTransaction() {
                 TraceBool("resize_dirty", resizeDirty)});
     visualPaintDirty_ = false;
     visualResizeDirty_ = false;
+    if (layeredCanvas_ && hwnd_ && (needPaint || deferredVisualWindowRectPending_)) {
+        EndLayeredCanvasTransaction(resizeDirty, paintDirty);
+        return;
+    }
     if (!needPaint || !hwnd_) return;
 
     const bool deferPresent = deferredVisualWindowRectPending_ && resizeDirty;
@@ -856,8 +1057,15 @@ void UiWindowImpl::EndCanvasVisualTransaction() {
 
 void UiWindowImpl::SetWindowRect(int xScreen, int yScreen, int wDip, int hDip) {
     if (!hwnd_) return;
-    int pw = MulDiv(wDip, dpi_, 96);
-    int ph = MulDiv(hDip, dpi_, 96);
+    SetWindowRectPx(xScreen, yScreen, MulDiv(wDip, dpi_, 96), MulDiv(hDip, dpi_, 96));
+}
+
+void UiWindowImpl::SetWindowRectPx(int xScreen, int yScreen, int pw, int ph) {
+    if (!hwnd_) return;
+    pw = (std::max)(1, pw);
+    ph = (std::max)(1, ph);
+    const int wDip = MulDiv(pw, 96, (int)dpi_);
+    const int hDip = MulDiv(ph, 96, (int)dpi_);
     {
         TraceEvent("core_window", "set_window_rect_before",
                    {TraceI64("x", xScreen),
@@ -873,6 +1081,13 @@ void UiWindowImpl::SetWindowRect(int xScreen, int yScreen, int wDip, int hDip) {
         visualPaintDirty_ = true;
         PrepareDeferredVisualWindowRect(xScreen, yScreen, wDip, hDip, pw, ph);
         ValidateRect(hwnd_, nullptr);
+        return;
+    }
+    if (layeredCanvas_) {
+        /* 分层画布: 单独的改矩形也走事务, 新尺寸画好后一次 ULW 提交。 */
+        BeginCanvasVisualTransaction();
+        SetWindowRectPx(xScreen, yScreen, pw, ph);
+        EndCanvasVisualTransaction();
         return;
     }
     /* SWP_NOCOPYBITS 防止 Windows 把旧客户区内容整块位移。 */
@@ -945,6 +1160,7 @@ void UiWindowImpl::SetFrameless(bool frameless) {
 
     SetWindowLongPtrW(hwnd_, GWL_STYLE, style);
     borderless_ = frameless;
+    ApplyCornerPreference();
 
     // Force the non-client area to be recalculated; same flags used by Microsoft
     // docs for dynamic style changes.
@@ -970,10 +1186,18 @@ void UiWindowImpl::SetResizable(bool resizable) {
     }
 
     SetWindowLongPtrW(hwnd_, GWL_STYLE, style);
+    ApplyCornerPreference();
     SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
                  SWP_NOACTIVATE | SWP_FRAMECHANGED);
     Invalidate();
+}
+
+void UiWindowImpl::ApplyCornerPreference() {
+    if (!hwnd_) return;
+    /* Win10 返回 E_INVALIDARG, 忽略即可 (窗口保持直角)。 */
+    const int pref = CornerPreferenceFor(borderless_, resizable_);
+    DwmSetWindowAttribute(hwnd_, kDwmWindowCornerPreference, &pref, sizeof(pref));
 }
 
 void UiWindowImpl::EnableCanvasMode(bool enable) {
@@ -1009,7 +1233,8 @@ void UiWindowImpl::EnableCanvasMode(bool enable) {
 static void UpdateMaxButtonIcon(Widget* w, bool maximized);
 
 void UiWindowImpl::UpdateDwmFrameMargins() {
-    if (!borderless_) return;
+    /* 分层窗口不走 DWM 边框扩展 (它的画面整块来自 ULW), 也省一次 DWM 调用。 */
+    if (!borderless_ || layeredCanvas_) return;
     MARGINS margins = maximized_ ? MARGINS{0, 0, 0, 0} : MARGINS{0, 0, 1, 0};
     DwmExtendFrameIntoClientArea(hwnd_, &margins);
 }
@@ -1023,6 +1248,16 @@ static void UpdateMaxButtonIcon(Widget* w, bool maximized) {
         return;
     }
     for (auto& c : w->Children()) UpdateMaxButtonIcon(c.get(), maximized);
+}
+
+// 沿 root 找第一个 TitleBarWidget（双击标题最大化的判据用它的 MaxBtn 可见性）。
+static TitleBarWidget* FindTitleBar(Widget* w) {
+    if (!w) return nullptr;
+    if (auto* tb = dynamic_cast<TitleBarWidget*>(w)) return tb;
+    for (auto& c : w->Children()) {
+        if (auto* tb = FindTitleBar(c.get())) return tb;
+    }
+    return nullptr;
 }
 
 static void WireTitleBar(Widget* w, HWND hwnd) {
@@ -1085,21 +1320,17 @@ void UiWindowImpl::StartWindowOpenAnimation() {
     SetLayeredWindowAttributes(hwnd_, 0, 0, LWA_ALPHA);
 
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+    /* 已上屏且全透明: 现在画首帧才会真 Present, 淡入的第一步就是真实画面 (build 323)。
+     * OnPaint 在 windowAnimating_ 期间返回空列表 ("DWM 缩放已有内容"), 而"已有内容"
+     * 正是这一帧 —— 以前它在隐藏时画、被渲染线程跳过 Present, 整个淡入拉起来的都是
+     * 系统浅灰底, 动画结束才出内容。这一帧要绕开那条跳过; 开头的 SetWindowPos 仍在
+     * windowAnimating_ 下 (WM_SIZE 不重排)。放在起计时之前, 首帧耗时不吃掉淡入时长。 */
+    windowAnimating_ = false;
+    SubmitRenderThreadFrameNow(FrameReason::Startup, PresentPolicy::Immediate);
+    windowAnimating_ = true;
+    ValidateRect(hwnd_, nullptr);
     QueryPerformanceCounter(&windowAnimStartTick_);
-    KillTimer(hwnd_, kWindowOpenAnimTimerId);
-    if (!SetTimer(hwnd_, kWindowOpenAnimTimerId, kWindowAnimIntervalMs, nullptr)) {
-        windowAnimating_ = false;
-        SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
-        SetWindowPos(hwnd_, nullptr, windowTargetX_, windowTargetY_,
-                     (int)windowTargetWidth_, (int)windowTargetHeight_,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-        ClearLayeredAfterAlpha(hwnd_);
-        ShowOwnedPopups(hwnd_, TRUE);
-        if (!toolWindow_) SetForegroundWindow(hwnd_);
-        return;
-    }
-
-    PostMessageW(hwnd_, WM_TIMER, kWindowOpenAnimTimerId, 0);
+    SetTickReason(kTickWindowAnim, true);   // 每次刷新走一步, 见 StepWindowOpenAnimation
 }
 
 void UiWindowImpl::StartWindowCloseAnimation() {
@@ -1119,81 +1350,110 @@ void UiWindowImpl::StartWindowCloseAnimation() {
     windowCloseStartY_ = rect.top;
 
     QueryPerformanceCounter(&windowAnimStartTick_);
-    KillTimer(hwnd_, kWindowCloseAnimTimerId);
-    if (!SetTimer(hwnd_, kWindowCloseAnimTimerId, kWindowAnimIntervalMs, nullptr)) {
-        windowClosing_ = false;
+    SetTickReason(kTickWindowAnim, true);   // 每次刷新走一步, 见 StepWindowCloseAnimation
+}
+
+static float ElapsedMsSince(const LARGE_INTEGER& start) {
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    return static_cast<float>(now.QuadPart - start.QuadPart) * 1000.0f /
+           static_cast<float>(freq.QuadPart);
+}
+
+void UiWindowImpl::StepWindowOpenAnimation() {
+    windowAnimProgress_ = ElapsedMsSince(windowAnimStartTick_) / kWindowOpenAnimDurationMs;
+    if (windowAnimProgress_ >= 1.0f) {
+        windowAnimProgress_ = 1.0f;
         windowAnimating_ = false;
-        DestroyWindow(hwnd_);
+        SetTickReason(kTickWindowAnim, false);
     }
+
+    TraceEvent("core_window", "window_anim_step",
+               {TraceF64("progress", windowAnimProgress_),
+                TraceBool("done", !windowAnimating_)});
+    float t = EaseOutCubic(windowAnimProgress_);
+
+    // 透明度：0 → 255
+    BYTE alpha = static_cast<BYTE>(255.0f * t);
+    SetLayeredWindowAttributes(hwnd_, 0, alpha, LWA_ALPHA);
+
+    // Y 偏移：kOpenSlideOffset → 0（上滑入位），窗口尺寸不变
+    int offsetY = static_cast<int>(kOpenSlideOffset * (1.0f - t));
+    SetWindowPos(hwnd_, nullptr,
+                 windowTargetX_, windowTargetY_ + offsetY,
+                 (int)windowTargetWidth_, (int)windowTargetHeight_,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+
+    if (!windowAnimating_) {
+        ClearLayeredAfterAlpha(hwnd_);
+        ShowOwnedPopups(hwnd_, TRUE);
+        if (!toolWindow_ && !TestIsolationEnabled()) SetForegroundWindow(hwnd_);
+        Invalidate();
+    }
+}
+
+void UiWindowImpl::StepWindowCloseAnimation() {
+    windowAnimProgress_ = ElapsedMsSince(windowAnimStartTick_) / kWindowCloseAnimDurationMs;
+    if (windowAnimProgress_ >= 1.0f) {
+        SetTickReason(kTickWindowAnim, false);
+        windowAnimating_ = false;
+        windowClosing_ = false;
+        DestroyWindow(hwnd_);
+        return;
+    }
+
+    float t = windowAnimProgress_;
+    float scale = 1.0f;
+    if (t < kClosePeakPhase) {
+        float local = EaseOutCubic(t / kClosePeakPhase);
+        scale = 1.0f + (kPopPeakScale - 1.0f) * local;
+    } else {
+        float local = EaseInCubic((t - kClosePeakPhase) / (1.0f - kClosePeakPhase));
+        scale = kPopPeakScale + (kCloseEndScale - kPopPeakScale) * local;
+    }
+
+    float fadeP = Clamp01((t - kCloseFadeStart) / (1.0f - kCloseFadeStart));
+    BYTE alpha = (BYTE)(255.0f * (1.0f - fadeP));
+    SetLayeredWindowAttributes(hwnd_, 0, alpha, LWA_ALPHA);
+
+    float centerX = windowCloseStartX_ + windowTargetWidth_ / 2.0f;
+    float centerY = windowCloseStartY_ + windowTargetHeight_ / 2.0f;
+    SetWindowScaleAtCenter(hwnd_, centerX, centerY, windowTargetWidth_, windowTargetHeight_, scale);
 }
 
 bool UiWindowImpl::HasAnimationFrameWork() const {
     return !animationHost_.Empty() || propertyAnimations_.HasActive();
 }
 
+void UiWindowImpl::SetTickReason(uint32_t reason, bool on) {
+    if (!hwnd_) return;
+    const uint32_t next = on ? (tickReasons_ | reason) : (tickReasons_ & ~reason);
+    if (next == tickReasons_) return;
+    if (tickReasons_ == 0) FrameTicker::Instance().Subscribe(hwnd_, kMsgAnimFrame);
+    else if (next == 0) FrameTicker::Instance().Unsubscribe(hwnd_);
+    tickReasons_ = next;
+}
+
 void UiWindowImpl::EnsureAnimationTimer() {
-    if (!hwnd_ || toggleAnimTimerRunning_ || !HasAnimationFrameWork()) return;
-    if (SetTimer(hwnd_, kToggleAnimTimerId, kToggleAnimIntervalMs, nullptr) != 0) {
-        toggleAnimTimerRunning_ = true;
-    }
+    if (!HasAnimationFrameWork()) return;
+    SetTickReason(kTickWidgets, true);
 }
 
 void UiWindowImpl::StopAnimationTimer() {
-    if (!hwnd_ || !toggleAnimTimerRunning_) return;
-    KillTimer(hwnd_, kToggleAnimTimerId);
-    toggleAnimTimerRunning_ = false;
+    SetTickReason(kTickWidgets, false);
 }
 
 void UiWindowImpl::UpdateToggleAnimTimer() {
     if (!hwnd_) return;
+    TraceEvent("core_window", "anim_rescan", {});   // 全树扫描: 测试用来数次数
 
     animationHost_.Clear();
     if (root_) {
         ForEachWidget(root_.get(), [&](Widget* w) {
-            bool needsWidgetTimer = false;
-            AnimationInvalidation invalidation = AnimationInvalidation::Paint;
-
-            auto* tw = dynamic_cast<ToggleWidget*>(w);
-            if (tw && tw->animating_) {
-                needsWidgetTimer = true;
-            }
-            auto* cb = dynamic_cast<CheckBoxWidget*>(w);
-            if (cb && cb->animating_) {
-                needsWidgetTimer = true;
-            }
-            auto* rb = dynamic_cast<RadioButtonWidget*>(w);
-            if (rb && rb->animating_) {
-                needsWidgetTimer = true;
-            }
-            auto* pb = dynamic_cast<ProgressBarWidget*>(w);
-            if (pb && (pb->animating_ || pb->IsIndeterminate())) {
-                needsWidgetTimer = true;
-            }
-            auto* sl = dynamic_cast<SliderWidget*>(w);
-            if (sl && sl->ThumbAnimating()) {
-                needsWidgetTimer = true;
-            }
-            auto* sv = dynamic_cast<SplitViewWidget*>(w);
-            if (sv && sv->animating_) {
-                needsWidgetTimer = true;
-                invalidation |= AnimationInvalidation::Layout;
-                invalidation |= AnimationInvalidation::HitTest;
-            }
-            auto* ex = dynamic_cast<ExpanderWidget*>(w);
-            if (ex && ex->animating_) {
-                needsWidgetTimer = true;
-                invalidation |= AnimationInvalidation::Layout;
-                invalidation |= AnimationInvalidation::HitTest;
-            }
-            auto* iv = dynamic_cast<ImageViewWidget*>(w);
-            if (iv && iv->IsLoading()) {
-                needsWidgetTimer = true;
-            }
-            auto* ov = dynamic_cast<OverlayWidget*>(w);
-            if (ov && ov->IsActive() && ov->ShowSpinner()) {
-                needsWidgetTimer = true;
-            }
-            if (needsWidgetTimer) animationHost_.RegisterWidget(w, invalidation);
+            /* 每次重建都先 Clear: 控件自己报还在动, 漏报会让在飞的动画停在半路。 */
+            if (w->AnimationActive())
+                animationHost_.RegisterWidget(w, w->AnimationInvalidationFlags());
         });
     }
 
@@ -1263,6 +1523,8 @@ void UiWindowImpl::LayoutRoot() {
         RefreshClientSizeCache();
     }
     TraceScope scope("core_window", "layout_root_duration");
+    ActiveMeasureContextScope measureScope(measureContext_, renderer_);
+    if (autoHeight_) ApplyAutoHeight();
     D2D1_SIZE_F size = CachedClientSizeDip();
     if (size.width <= 0.0f || size.height <= 0.0f) return;
     TraceEvent("core_window", "layout_root_begin",
@@ -1270,8 +1532,59 @@ void UiWindowImpl::LayoutRoot() {
                 TraceF64("client_h", size.height)});
     root_->rect = {0, 0, size.width, size.height};
     Viewport() = root_->rect;
-    ActiveMeasureContextScope measureScope(measureContext_, renderer_);
     root_->DoLayout();
+}
+
+/* 把客户区高度定成内容在当前宽度下需要的高度; 改了尺寸返回 true。
+ * 调用方 (LayoutRoot) 已激活测量上下文 —— 按钮 / 文字宽度要靠它量准, 宽度
+ * 量错折行就错, 高度跟着错。SetWindowPos 会同步递归进 WM_SIZE → LayoutRoot,
+ * 那一趟被 autoHeightApplying_ 挡住只排版; 回来后客户区缓存已是新尺寸。
+ * 最大化 / 动画中 / ULW 提交中不动尺寸, 免得和那几条路径的尺寸管理打架。 */
+bool UiWindowImpl::ApplyAutoHeight() {
+    if (!root_ || !hwnd_ || autoHeightApplying_ || maximized_ ||
+        windowAnimating_ || layeredCommitting_ || visualUpdateDepth_ > 0)
+        return false;
+    if (clientWidthPx_ == 0 || clientHeightPx_ == 0) RefreshClientSizeCache();
+    const float widthDip = CachedClientSizeDip().width;
+    if (widthDip <= 0.0f) return false;
+
+    const float s = dpiScale_ > 0.0f ? dpiScale_ : 1.0f;
+    int workDip = 0;
+    MONITORINFO mi = {sizeof(mi)};
+    if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi))
+        workDip = static_cast<int>((mi.rcWork.bottom - mi.rcWork.top) / s);
+
+    RECT wr{}, cr{};
+    GetWindowRect(hwnd_, &wr);
+    GetClientRect(hwnd_, &cr);
+    const int nonClientH = (wr.bottom - wr.top) - (cr.bottom - cr.top);
+    /* 工作区上限按整窗算: 系统边框窗口要扣掉非客户区。 */
+    if (workDip > 0) workDip -= static_cast<int>(std::ceil(nonClientH / s));
+
+    const float contentH = root_->HeightForWidth(widthDip);
+    const int targetDip = AutoHeightTargetDip(contentH, minHOverride_, workDip);
+    const UINT targetPx = static_cast<UINT>(std::ceil(targetDip * s - 0.01f));
+    if (targetPx == clientHeightPx_) return false;
+
+    TraceEvent("core_window", "auto_height_apply",
+               {TraceF64("content_h", contentH),
+                TraceI64("target_dip", targetDip),
+                TraceU64("old_client_h_px", clientHeightPx_),
+                TraceU64("new_client_h_px", targetPx)});
+    autoHeightApplying_ = true;
+    SetWindowPos(hwnd_, nullptr, 0, 0, wr.right - wr.left,
+                 static_cast<int>(targetPx) + nonClientH,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    autoHeightApplying_ = false;
+    RefreshClientSizeCache();
+    return true;
+}
+
+/* on=true 每次调用都立即按当前内容定一次高 (重复调用 = "现在就量"), 宿主改完
+ * 文字、show 前算居中时用。 */
+void UiWindowImpl::SetAutoHeight(bool on) {
+    autoHeight_ = on;
+    if (on) LayoutRoot();
 }
 
 // ---- WndProc ----
@@ -1285,6 +1598,25 @@ LRESULT CALLBACK UiWindowImpl::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         self->hwnd_ = hwnd;
     } else {
         self = reinterpret_cast<UiWindowImpl*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    }
+    if (IsMouseInputMessage(msg)) {
+        if (wParam & kSimInputMark) {
+            wParam &= ~kSimInputMark;   // 模拟投递的鼠标消息 (见 test_isolation.h): 去标记后照常处理
+        } else if (self && self->testIsolated_) {
+            return 0;   // 测试隔离: 用户的真实鼠标不进测试窗口 (光标路过 / 误点都不影响结果)
+        }
+    }
+    if (self && self->inputMoveDepth_ > 0) {
+        /* 鼠标移动处理中途又进来消息 = 钩子里跑了嵌套消息循环 (拖出到别的程序的
+         * DoDragDrop、模态框) 或同步 SendMessage。这些消息里的重绘照常画, 否则只记脏,
+         * 整个嵌套循环期间窗口不更新。 */
+        const int depth = self->inputMoveDepth_;
+        const int64_t start = self->inputMoveStartQpc_;
+        self->inputMoveDepth_ = 0;
+        const LRESULT r = self->HandleMessage(msg, wParam, lParam);
+        self->inputMoveDepth_ = depth;
+        self->inputMoveStartQpc_ = start;
+        return r;
     }
     if (self) return self->HandleMessage(msg, wParam, lParam);
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -1341,9 +1673,13 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
          * 实际拖的 size, image 永远严格填满 widget = window. */
         if (aspectLockW_ > 0 && aspectLockH_ > 0) {
             RECT* r = reinterpret_cast<RECT*>(lParam);
+            /* build 321: 有缩放边框内缩时, 比例锁的是内缩后的内容矩形 —
+             * 先把 RECT 收进去算, 算完再放回来。 */
+            const int ins = static_cast<int>(std::lround(resizeInset_ * dpiScale_));
+            InflateRect(r, -ins, -ins);
             int w = r->right - r->left;
             int h = r->bottom - r->top;
-            if (w <= 0 || h <= 0) return TRUE;
+            if (w <= 0 || h <= 0) { InflateRect(r, ins, ins); return TRUE; }
             const double aspect = (double)aspectLockW_ / (double)aspectLockH_;
             switch (wParam) {
                 case WMSZ_LEFT:
@@ -1381,6 +1717,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 default:
                     break;
             }
+            InflateRect(r, ins, ins);
             return TRUE;
         }
         break;
@@ -1401,7 +1738,46 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         break;
     }
 
+    case WM_WINDOWPOSCHANGED: {
+        /* 闪屏探针 (dwm_probe.h): 矩形变化时记 DWM 合成计数。不拦截, 照常
+         * 交给 DefWindowProc 派生 WM_SIZE / WM_MOVE。
+         * 分层画布提交 (ULW) 进行中不记: 这条消息是 ULW 内部同步发来的, 此刻窗口
+         * 尺寸已生效而位置 / 画面还没, 处理越久 DWM 越可能合成出半成品帧。 */
+        const auto* wp = reinterpret_cast<const WINDOWPOS*>(lParam);
+        if (wp && IsTraceEnabled() && !layeredCommitting_ &&
+            (wp->flags & (SWP_NOSIZE | SWP_NOMOVE)) != (SWP_NOSIZE | SWP_NOMOVE)) {
+            const DwmFrameStamp stamp = QueryDwmFrameStamp();
+            RECT cr{};
+            GetClientRect(hwnd_, &cr);
+            TraceEvent("core_window", "dwm_probe_rect",
+                       {TraceU64("hwnd", reinterpret_cast<uintptr_t>(hwnd_)),
+                        TraceI64("x", wp->x),
+                        TraceI64("y", wp->y),
+                        TraceI64("w_px", wp->cx),
+                        TraceI64("h_px", wp->cy),
+                        TraceI64("client_w_px", cr.right - cr.left),
+                        TraceI64("client_h_px", cr.bottom - cr.top),
+                        TraceBool("size_changed", (wp->flags & SWP_NOSIZE) == 0),
+                        TraceBool("pos_changed", (wp->flags & SWP_NOMOVE) == 0),
+                        TraceI64("depth", visualUpdateDepth_),
+                        TraceU64("refresh", stamp.refresh),
+                        TraceU64("frame", stamp.frame),
+                        TraceBool("stamp_ok", stamp.ok)});
+        }
+        break;
+    }
+
     case WM_SIZE: {
+        if (layeredCommitting_) {
+            /* ULW 提交途中同步收到的尺寸变化: 客户区缓存 / 排版 / resize 回调都已在
+             * 准备这一帧时做过 (PrepareDeferredVisualWindowRect), 画面就是这个尺寸。
+             * 必须立刻返回 —— ULW 此时尺寸已生效、位置和画面还没, 这里每多耗一点
+             * (排版、DwmExtendFrameIntoClientArea) DWM 就多一分机会合成出
+             * "新尺寸 + 旧位置 + 旧画面" (frame-probe 在有屏幕动画时实测到)。 */
+            preparedVisualResizeNotified_ = false;
+            ValidateRect(hwnd_, nullptr);
+            return 0;
+        }
         TraceScope wmSizeScope("core_window", "wm_size_duration");
         {
             TraceEvent("core_window", "wm_size",
@@ -1413,6 +1789,16 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         // 动画期间跳过 resize/layout/repaint，DWM 会自动缩放已有内容
         if (windowAnimating_) {
             maximized_ = (wParam == SIZE_MAXIMIZED);
+            return 0;
+        }
+        /* 跨屏最大化兜底: 最大化后的窗口矩形以实际结果为准再校一次。
+         * OnGetMinMaxInfo 已经按当前屏工作区写 ptMaxSize/ptMaxTrackSize, 但
+         * 那条消息的时序 (以及 canvas 模式放开的 track size) 不足以保证结果一定
+         * 对 —— 主屏 100% 拖到副屏 125% 再最大化, 窗口会比副屏大。这里现取窗口
+         * 所在屏的工作区比对, 超出就 SetWindowPos 纠回; 纠正会同步递归回本
+         * WM_SIZE (带正确尺寸) 做真正的 layout, 所以这一趟直接返回。 */
+        if (wParam == SIZE_MAXIMIZED && ClampMaximizedRectToWorkArea()) {
+            ValidateRect(hwnd_, nullptr);
             return 0;
         }
         const UINT sizeW = LOWORD(lParam);
@@ -1453,6 +1839,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         OnGetMinMaxInfo(reinterpret_cast<MINMAXINFO*>(lParam)); return 0;
 
     case WM_MOUSEACTIVATE:
+        if (TestIsolationEnabled()) return MA_NOACTIVATE;   // 用户点到测试窗口也不切前台
         if (!toolWindow_) {
             ActivateForMouseInput();
             return MA_ACTIVATE;
@@ -1494,10 +1881,20 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 ReleaseCapture();
                 /* intercept 此刻已被宿主在 exit_fullscreen 里关掉 → 这次 NCLBUTTONDOWN
                  * 不再被拦截, 进系统移动循环, 窗口跟随光标直到松手。 */
-                SendMessageW(hwnd_, WM_NCLBUTTONDOWN, HTCAPTION,
+                SendMessageW(hwnd_, WM_NCLBUTTONDOWN, HTCAPTION | kSimInputMark,   // 库内转发, 不受隔离过滤
                              MAKELPARAM(cur.x, cur.y));
             }
             return 0;
+        }
+        /* build 308: 松开丢在窗口外。没抓 capture 的控件 (TextArea / TextInput /
+         * ChipsInput / 可选 label / ui_custom ...) 按下后移出窗口松开, 窗口收不到
+         * WM_LBUTTONUP, pressedWidget_ 一直挂着 —— 不点击移回来, 每次移动都还在
+         * 拖选。真鼠标消息里左键已不在按下态 → 按"取消"复位 (不算点击, 坐标落在
+         * 所有控件之外, 复选框之类不会误翻)。抓着 capture 的控件松开必收得到
+         * WM_LBUTTONUP, 走不到这里。注入的按下不适用, 见 pressFromSim_。 */
+        if (pressedWidget_ && !pressFromSim_ && !(wParam & MK_LBUTTON)) {
+            CancelMouseCapture();
+            if (GetCapture() == hwnd_) ReleaseCapture();
         }
         OnMouseMove((float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam)); return 0;
     case WM_MOUSELEAVE:
@@ -1512,6 +1909,7 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         tooltipVisible_ = false; tooltipWidget_ = nullptr;
         InvalidateNow(); return 0;
     case WM_LBUTTONDOWN:
+        pressFromSim_ = false;
         OnMouseDown((float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam)); return 0;
     case WM_LBUTTONUP:
         if (canvasDragTracking_) {
@@ -1542,10 +1940,15 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         // single click) then the double-click hooks for any widget that
         // wants both. Mirrors browser semantics where a dblclick is two
         // click events plus a dblclick.
+        pressFromSim_ = false;
         OnMouseDown       ((float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam));
         OnMouseDoubleClick((float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam));
         return 0;
     case WM_TIMER:
+        if (wParam == kDragAutoScrollTimerId) {
+            TickDragAutoScroll();
+            return 0;
+        }
         if (wParam == kTooltipTimerId) {
             KillTimer(hwnd_, kTooltipTimerId);
             tooltipTimerId_ = 0;
@@ -1567,82 +1970,6 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             } else {
                 UpdateCaretBlinkTimer();
             }
-            return 0;
-        }
-        if (wParam == kToggleAnimTimerId) {
-            if (HasAnimationFrameWork()) {
-                Invalidate();
-            } else {
-                StopAnimationTimer();
-            }
-            return 0;
-        }
-        if (wParam == kWindowOpenAnimTimerId && windowAnimating_ && !windowClosing_) {
-            LARGE_INTEGER now, freq;
-            QueryPerformanceCounter(&now);
-            QueryPerformanceFrequency(&freq);
-            float elapsedMs = static_cast<float>(now.QuadPart - windowAnimStartTick_.QuadPart)
-                              * 1000.0f / static_cast<float>(freq.QuadPart);
-            windowAnimProgress_ = elapsedMs / kWindowOpenAnimDurationMs;
-            if (windowAnimProgress_ >= 1.0f) {
-                windowAnimProgress_ = 1.0f;
-                windowAnimating_ = false;
-                KillTimer(hwnd_, kWindowOpenAnimTimerId);
-            }
-
-            float t = EaseOutCubic(windowAnimProgress_);
-
-            // 透明度：0 → 255
-            BYTE alpha = static_cast<BYTE>(255.0f * t);
-            SetLayeredWindowAttributes(hwnd_, 0, alpha, LWA_ALPHA);
-
-            // Y 偏移：kOpenSlideOffset → 0（上滑入位），窗口尺寸不变
-            int offsetY = static_cast<int>(kOpenSlideOffset * (1.0f - t));
-            SetWindowPos(hwnd_, nullptr,
-                         windowTargetX_, windowTargetY_ + offsetY,
-                         (int)windowTargetWidth_, (int)windowTargetHeight_,
-                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
-
-            if (!windowAnimating_) {
-                ClearLayeredAfterAlpha(hwnd_);
-                ShowOwnedPopups(hwnd_, TRUE);
-                if (!toolWindow_) SetForegroundWindow(hwnd_);
-                Invalidate();
-            }
-            return 0;
-        }
-        if (wParam == kWindowCloseAnimTimerId && windowAnimating_ && windowClosing_) {
-            LARGE_INTEGER now, freq;
-            QueryPerformanceCounter(&now);
-            QueryPerformanceFrequency(&freq);
-            float elapsedMs = static_cast<float>(now.QuadPart - windowAnimStartTick_.QuadPart)
-                              * 1000.0f / static_cast<float>(freq.QuadPart);
-            windowAnimProgress_ = elapsedMs / kWindowCloseAnimDurationMs;
-            if (windowAnimProgress_ >= 1.0f) {
-                KillTimer(hwnd_, kWindowCloseAnimTimerId);
-                windowAnimating_ = false;
-                windowClosing_ = false;
-                DestroyWindow(hwnd_);
-                return 0;
-            }
-
-            float t = windowAnimProgress_;
-            float scale = 1.0f;
-            if (t < kClosePeakPhase) {
-                float local = EaseOutCubic(t / kClosePeakPhase);
-                scale = 1.0f + (kPopPeakScale - 1.0f) * local;
-            } else {
-                float local = EaseInCubic((t - kClosePeakPhase) / (1.0f - kClosePeakPhase));
-                scale = kPopPeakScale + (kCloseEndScale - kPopPeakScale) * local;
-            }
-
-            float fadeP = Clamp01((t - kCloseFadeStart) / (1.0f - kCloseFadeStart));
-            BYTE alpha = (BYTE)(255.0f * (1.0f - fadeP));
-            SetLayeredWindowAttributes(hwnd_, 0, alpha, LWA_ALPHA);
-
-            float centerX = windowCloseStartX_ + windowTargetWidth_ / 2.0f;
-            float centerY = windowCloseStartY_ + windowTargetHeight_ / 2.0f;
-            SetWindowScaleAtCenter(hwnd_, centerX, centerY, windowTargetWidth_, windowTargetHeight_, scale);
             return 0;
         }
         break;
@@ -1673,13 +2000,15 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         ScreenToClient(hwnd_, &pt);
         float hdx = (float)pt.x / dpiScale_, hdy = (float)pt.y / dpiScale_;
         if (root_) {
-            Widget* hit = root_->HitTest(hdx, hdy);
-            if (hit && hit->onMouseWheelHook) {
+            // Bubbles to the nearest @wheel listener, same as vertical wheel.
+            for (Widget* w = root_->HitTest(hdx, hdy); w; w = w->Parent()) {
+                if (!w->onMouseWheelHook) continue;
                 MouseEvent e{hdx, hdy};
                 StampDomMouseState(e, -1);
                 e.deltaX = (float)GET_WHEEL_DELTA_WPARAM(wParam);
-                hit->onMouseWheelHook(e);
+                w->onMouseWheelHook(e);
                 InvalidateNow();
+                break;
             }
         }
         return 0;
@@ -1691,6 +2020,24 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         if (onRightClick) onRightClick(dx, dy);
         InvalidateNow();
         return 0;
+    }
+    case WM_MBUTTONDOWN:
+    case WM_XBUTTONDOWN: {
+        /* L297: 中键 / 侧键 (X1 = 后退, X2 = 前进) → 窗口级 onMouseButton。
+         * lib 内部对这三个键没有任何默认行为, 也不进 widget 分发 (MouseEvent
+         * 只有 leftBtn/rightBtn), 所以直接转给宿主, 用 Win32 VK 码表示。
+         * 左键有完整的 widget 分发, 右键有 onRightClick, 都不走这里。 */
+        if (onMouseButton) {
+            const int vk = (msg == WM_MBUTTONDOWN)
+                               ? VK_MBUTTON
+                               : ((GET_XBUTTON_WPARAM(wParam) == XBUTTON2) ? VK_XBUTTON2
+                                                                           : VK_XBUTTON1);
+            onMouseButton(vk, (float)GET_X_LPARAM(lParam) / dpiScale_,
+                          (float)GET_Y_LPARAM(lParam) / dpiScale_);
+            InvalidateNow();
+        }
+        /* WM_XBUTTONDOWN 约定返回 TRUE (MSDN); WM_MBUTTONDOWN 返回 0。 */
+        return (msg == WM_XBUTTONDOWN) ? TRUE : 0;
     }
 
     case WM_IME_STARTCOMPOSITION:
@@ -1913,7 +2260,11 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         // Menu item clicked. LPARAM = heap MenuClickInfo* (id + 全部属性), 读完 delete.
         auto* info = reinterpret_cast<MenuClickInfo*>(lParam);
         activeMenu_ = nullptr;  // menu already closed itself
-        if (onMenuItemClick && info) onMenuItemClick(info);
+        /* 声明式 @click (build 303 起随载荷带过来, 已绑定该行迭代变量) 由页面
+         * JS 消费; 没写 @click 的项才交给宿主 ui_window_on_menu。以前页面的
+         * 分派包在 onMenuItemClick 里, 宿主一调 ui_window_on_menu 就被覆盖。 */
+        if (info && info->action) info->action();
+        else if (onMenuItemClick && info) onMenuItemClick(info);
         delete info;
         Invalidate();
         return 0;
@@ -1924,6 +2275,46 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         if (req && req->fn) req->fn(req->ud);
         return 0;
     }
+    case kMsgAnimFrame: {
+        FrameTicker::Instance().Ack(hwnd_);
+        if (IsTraceEnabled()) {
+            LARGE_INTEGER qNow, qFreq;
+            QueryPerformanceCounter(&qNow);
+            QueryPerformanceFrequency(&qFreq);
+            TraceEvent("core_window", "anim_tick",
+                       {TraceF64("queue_latency_ms",
+                                 static_cast<double>(qNow.QuadPart - static_cast<int64_t>(lParam)) *
+                                     1000.0 / static_cast<double>(qFreq.QuadPart)),
+                        TraceI64("skipped_beats", static_cast<int64_t>(wParam))});
+        }
+        /* 窗口开关动画: 每拍走一步。期间 OnPaint 返回空列表 (DWM 拉伸的是已有首帧),
+         * 控件动画这一拍不提交帧, 但保留订阅, 淡入结束后接着画。 */
+        if (tickReasons_ & kTickWindowAnim) {
+            if (windowClosing_) StepWindowCloseAnimation();
+            else StepWindowOpenAnimation();
+            if (!hwnd_) return 0;   // 关闭动画走完已 DestroyWindow
+        }
+        if (windowAnimating_ || !(tickReasons_ & kTickWidgets)) return 0;
+        /* 不可见时退订: 动画在绘制里推进, 隐藏窗口画不出来, 继续收拍只是空转。
+         * 恢复显示时 WM_PAINT → BeginAnimationFrame 会重新订阅。 */
+        if (!HasAnimationFrameWork() || !IsWindowVisible(hwnd_) || IsIconic(hwnd_)) {
+            StopAnimationTimer();
+            return 0;
+        }
+        /* 直接画这一帧, 不绕 Invalidate → WM_PAINT (队列里优先级最低, 会被输入消息挤后)。 */
+        animFrameFromTimer_ = true;
+        RequestRenderFrame(FrameReason::Animation, PresentPolicy::Immediate);
+        if (visualUpdateDepth_ > 0) {
+            visualPaintDirty_ = true;
+            return 0;
+        }
+        FlushRenderFrameNow(FrameReason::None, PresentPolicy::Immediate);
+        return 0;
+    }
+    case kMsgInputFrame:
+        inputPaintPending_ = false;
+        if (inputPaintDirty_) InvalidateNow();   // 期间别的帧已画过最新状态就不再画
+        return 0;
     case kMsgRenderFrame: {
         renderFramePosted_ = false;
         if (!frameScheduler_.HasPending()) {
@@ -1937,6 +2328,12 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         PaintAndValidate();
+        return 0;
+    }
+    case kUiCoreLayeredFrameReadyMessage: {
+        /* 渲染线程读回好一帧 (尺寸不变的普通刷新)。事务进行中不提交 —— 事务收尾会
+         * 带位置提交最新帧。前台帧总是最新的, 旧消息到达时会跳过已提交的帧。 */
+        if (layeredCanvas_ && visualUpdateDepth_ == 0) CommitLayeredFrame(nullptr);
         return 0;
     }
     case kMsgRenderDeviceLost: {
@@ -1994,9 +2391,14 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd_, kCaretBlinkTimerId);
             caretBlinkTimerRunning_ = false;
         }
-        /* 主窗销毁前先收掉 toast 叠加窗 + 其 timer + timeEndPeriod 配对
+        /* 主窗销毁前先收掉 toast 叠加窗 + 其心跳订阅 / timer
          * (this 在 RemoveWindow 后失效, 不能拖到那之后). */
         DestroyToast();
+        /* 同步退订 (不管还剩哪些原因, 连同未到点的悬停合并帧), 之后心跳线程不会再往
+         * 这个 HWND 投消息。 */
+        FrameTicker::Instance().Forget(hwnd_);
+        tickReasons_ = 0;
+        inputPaintPending_ = false;
         UnregisterRenderWindow();
         HWND oldHwnd = hwnd_;
         hwnd_ = nullptr;
@@ -2057,9 +2459,26 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         case WM_NCLBUTTONDBLCLK:
             if (wParam == HTCAPTION) {
+                /* build 323: 画布模式整窗返回 HTCAPTION 只是为了拖窗, 没有标题栏
+                 * 可双击 —— 吞掉, 否则可调尺寸的画布窗被回退判据直接最大化
+                 * (GuoheView 无边框模式双击铺满屏幕)。 */
+                if (canvasMode_) return 0;
+                /* 没有最大化按钮的窗口不该支持双击标题最大化。判据: 自绘标题栏
+                 * 的 MaxBtn 可见 → 允许; 按钮被 SetShowMax(false) 隐藏 → 禁止;
+                 * 找不到自绘标题栏时回退到 resizable_ (保持旧行为)。 */
+                TitleBarWidget* tb = root_ ? FindTitleBar(root_.get()) : nullptr;
+                bool canMaximize = tb ? (tb->MaxBtn() && tb->MaxBtn()->visible)
+                                      : resizable_;
+                if (!canMaximize) return 0;
                 ShowWindow(hwnd_, maximized_ ? SW_RESTORE : SW_MAXIMIZE);
                 return 0;
             }
+            break;
+        case WM_SYSCOMMAND:
+            /* build 323: 画布模式窗口同样不接受系统最大化 (Win+Up / 系统菜单 /
+             * Alt+Space X), 理由同上。宿主自己 ShowWindow(SW_MAXIMIZE) 不走这里,
+             * 不受影响。低 4 位是系统保留, 按文档先掩掉。 */
+            if (canvasMode_ && (wParam & 0xFFF0) == SC_MAXIMIZE) return 0;
             break;
         case WM_NCRBUTTONUP:
             /* L53: HTCAPTION 区域右键 → 走 onRightClick (widget tree
@@ -2094,11 +2513,18 @@ LRESULT UiWindowImpl::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 void UiWindowImpl::BeginAnimationFrame() {
     if (animationHost_.Empty()) return;
 
-    uint64_t frameTick = GetTickCount64();
+    /* 帧间隔用 QPC 量: GetTickCount64 只有 15.6ms 粒度, 量出来只会是 0/16/31。 */
+    LARGE_INTEGER qpcNow, qpcFreq;
+    QueryPerformanceCounter(&qpcNow);
+    QueryPerformanceFrequency(&qpcFreq);
+    const uint64_t frameTick = static_cast<uint64_t>(qpcNow.QuadPart);
     double frameIntervalMs = lastAnimationFrameTick_ != 0
-        ? static_cast<double>(frameTick - lastAnimationFrameTick_)
+        ? static_cast<double>(frameTick - lastAnimationFrameTick_) * 1000.0 /
+              static_cast<double>(qpcFreq.QuadPart)
         : 0.0;
     lastAnimationFrameTick_ = frameTick;
+    const bool fromTimer = animFrameFromTimer_;
+    animFrameFromTimer_ = false;
 
     TraceScope frameScope("core_window", "animation_frame_duration");
     bool anyAnimating = false;
@@ -2112,63 +2538,9 @@ void UiWindowImpl::BeginAnimationFrame() {
     for (const AnimationTarget& target : activeTargets) {
         Widget* w = target.widget;
         if (!w) continue;
-        bool keep = false;
-        bool ticked = false;
-
-        auto* tw = dynamic_cast<ToggleWidget*>(w);
-        if (tw && tw->animating_) {
-            tw->UpdateAnimation();
-            ticked = true;
-        }
-        if (tw && tw->animating_) keep = true;
-
-        auto* cb = dynamic_cast<CheckBoxWidget*>(w);
-        if (cb && cb->animating_) {
-            cb->UpdateAnimation();
-            ticked = true;
-            if (cb->animating_) keep = true;
-        }
-        auto* rb = dynamic_cast<RadioButtonWidget*>(w);
-        if (rb && rb->animating_) {
-            rb->UpdateAnimation();
-            ticked = true;
-            if (rb->animating_) keep = true;
-        }
-        auto* pb = dynamic_cast<ProgressBarWidget*>(w);
-        if (pb && pb->animating_) {
-            pb->UpdateAnimation();
-            ticked = true;
-            if (pb->animating_) keep = true;
-        }
-        if (pb && pb->IsIndeterminate()) {
-            keep = true;
-        }
-        auto* sl = dynamic_cast<SliderWidget*>(w);
-        if (sl) {
-            sl->UpdateThumbAnimation();
-            ticked = true;
-            if (sl->ThumbAnimating()) keep = true;
-        }
-        auto* sv = dynamic_cast<SplitViewWidget*>(w);
-        if (sv && sv->animating_) {
-            sv->UpdateAnimation();
-            ticked = true;
-            if (sv->animating_) keep = true;
-        }
-        auto* ex = dynamic_cast<ExpanderWidget*>(w);
-        if (ex && ex->animating_) {
-            ex->UpdateAnimation();
-            ticked = true;
-            if (ex->animating_) keep = true;
-        }
-        auto* iv = dynamic_cast<ImageViewWidget*>(w);
-        if (iv && iv->IsLoading()) {
-            keep = true;
-        }
-        auto* ov = dynamic_cast<OverlayWidget*>(w);
-        if (ov && ov->IsActive() && ov->ShowSpinner()) {
-            keep = true;
-        }
+        const Widget::AnimTick tick = w->TickAnimation();
+        const bool keep = tick.keep;
+        const bool ticked = tick.ticked;
 
         if (keep) {
             anyAnimating = true;
@@ -2194,6 +2566,7 @@ void UiWindowImpl::BeginAnimationFrame() {
                     TraceBool("any_animating", anyAnimating),
                     TraceBool("needs_layout", needsLayout),
                     TraceF64("frame_interval_ms", frameIntervalMs),
+                    TraceBool("from_timer", fromTimer),
                     TraceBool("dropped_frame_estimate", frameIntervalMs > 25.0)});
     }
 
@@ -2201,12 +2574,28 @@ void UiWindowImpl::BeginAnimationFrame() {
         animationHost_.Clear();
         lastAnimationFrameTick_ = 0;
         StopAnimationTimer();
+    } else {
+        EnsureAnimationTimer();   // 窗口隐藏时退订过, 恢复后第一帧在这里接上心跳
     }
 }
 
 void UiWindowImpl::PaintAndValidate() {
     if (!hwnd_) return;
+    /* 窗口开 / 关动画期间 OnPaint 只返回空列表 (DWM 拉伸的是已有首帧): 不开帧不提交,
+     * 请求留着, 动画收尾的 Invalidate 一次画出最新状态。光标停在窗口弹出处时, 窗口每步
+     * 挪动都会补发 WM_MOUSEMOVE, 以前每次都提交一个空帧。 */
+    if (windowAnimating_) {
+        ValidateRect(hwnd_, nullptr);
+        return;
+    }
     auto frame = frameScheduler_.BeginFrame();
+    if (frame.generation != 0) {
+        /* 这一帧画的是此刻的最新状态: 合并中的悬停重绘不用再画; 记下提交时刻供合并判断。 */
+        inputPaintDirty_ = false;
+        LARGE_INTEGER submitAt;
+        QueryPerformanceCounter(&submitAt);
+        lastSubmitQpc_ = submitAt.QuadPart;
+    }
     TraceEvent("core_window", "paint_and_validate",
                {TraceI64("frame_reasons", static_cast<int64_t>(frame.reasons)),
                 TraceI64("present_policy", static_cast<int64_t>(frame.policy)),
@@ -2255,9 +2644,12 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
 
     // Consume any pending layout request from dynamic widget mutations
     // (v-if mount, v-for re-key, etc.) before drawing the new state.
-    if (ui::LayoutDirtyFlag()) {
+    // build 306: 旗标只有一个, 先画的窗口会把它清掉; 按请求代号判断本窗口是否
+    // 还欠一次排版, 多窗口时每个窗口都能重排到。
+    if (ui::LayoutDirtyFlag() || layoutGenSeen_ != ui::LayoutGeneration()) {
         TraceScope scope("core_window", "paint_dirty_layout_duration");
         ui::LayoutDirtyFlag() = false;
+        layoutGenSeen_ = ui::LayoutGeneration();
         LayoutRoot();
     }
 
@@ -2274,9 +2666,10 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
                     TraceI64("remaining_count", (int64_t)propertyAnimations_.Count()),
                     TraceBool("any_animating", animsRunning)});
     }
-    if (ui::LayoutDirtyFlag()) {
+    if (ui::LayoutDirtyFlag() || layoutGenSeen_ != ui::LayoutGeneration()) {
         TraceScope scope("core_window", "paint_post_animation_layout_duration");
         ui::LayoutDirtyFlag() = false;
+        layoutGenSeen_ = ui::LayoutGeneration();
         LayoutRoot();
     }
     if (animsRunning) EnsureAnimationTimer();
@@ -2296,7 +2689,9 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
         renderer_.SetDisplayListRecorder(&recorder);
     }
 
-    if (bgMode_ == 0) {
+    /* 分层画布窗口默认不透明: alpha=0 的像素会让鼠标点穿到下面的窗口。
+     * 宿主显式要透明底 (build 321, 四周画阴影) 时才清成透明。 */
+    if (layeredCanvas_ ? !layeredTransparent_ : bgMode_ == 0) {
         renderer_.Clear(theme::kWindowBg());
     } else {
         renderer_.Clear({0, 0, 0, 0});
@@ -2342,26 +2737,10 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
         float fontSize = theme::kFontSizeSmall;
         float padH = 8.0f, padV = 4.0f;
         float textW = fontSize * 0.65f * static_cast<float>(ghost.size());
-        {
-            IDWriteFactory* dwf = renderer_.DWFactory();
-            IDWriteTextFormat* fmt = nullptr;
-            if (dwf) {
-                dwf->CreateTextFormat(theme::kFontFamily, nullptr,
-                    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL, fontSize, L"", &fmt);
-                if (fmt) {
-                    IDWriteTextLayout* layout = nullptr;
-                    dwf->CreateTextLayout(ghost.c_str(), (UINT32)ghost.size(),
-                        fmt, 1000.0f, 100.0f, &layout);
-                    if (layout) {
-                        DWRITE_TEXT_METRICS metrics = {};
-                        layout->GetMetrics(&metrics);
-                        textW = metrics.width;
-                        layout->Release();
-                    }
-                    fmt->Release();
-                }
-            }
+        /* build 314: 走 Renderer 的测量 (当前默认字体 + 回退字体链 + 排版区域),
+         * 跟实际绘制一致; 以前裸建 Segoe UI 格式, CJK 文字宽度算不准。 */
+        if (const float measured = renderer_.MeasureTextWidth(ghost, fontSize); measured > 0.0f) {
+            textW = measured;
         }
         float gw = textW + padH * 2, gh = fontSize + padV * 2 + 4.0f;
         // Centered on the cursor — matches how the user "holds" the item.
@@ -2395,27 +2774,10 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
 
         /* 在 BeginDraw 之外测量文字宽度（避免 RT 状态影响） */
         float textW = fontSize * 0.65f * static_cast<float>(text.size());  /* 估算 */
-        /* 用 DWrite 精确测量 */
-        {
-            IDWriteFactory* dwf = renderer_.DWFactory();
-            IDWriteTextFormat* fmt = nullptr;
-            if (dwf) {
-                dwf->CreateTextFormat(theme::kFontFamily, nullptr,
-                    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL, fontSize, L"", &fmt);
-                if (fmt) {
-                    IDWriteTextLayout* layout = nullptr;
-                    dwf->CreateTextLayout(text.c_str(), (UINT32)text.size(),
-                        fmt, 1000.0f, 100.0f, &layout);
-                    if (layout) {
-                        DWRITE_TEXT_METRICS metrics = {};
-                        layout->GetMetrics(&metrics);
-                        textW = metrics.width;
-                        layout->Release();
-                    }
-                    fmt->Release();
-                }
-            }
+        /* 用 DWrite 精确测量。build 314: 走 Renderer (当前默认字体 + 回退链 +
+         * 排版区域), 跟实际绘制一致, 换 CJK 字体后宽度也对。 */
+        if (const float measured = renderer_.MeasureTextWidth(text, fontSize); measured > 0.0f) {
+            textW = measured;
         }
 
         float tipW = textW + padH * 2;
@@ -2452,7 +2814,7 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
                            DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
-    if (borderless_ && !maximized_) {
+    if (borderless_ && !maximized_ && !layeredCanvas_) {
         D2D1_SIZE_F size = CachedClientSizeDip();
         D2D1_RECT_F border = {0, 0, size.width, size.height};
         renderer_.DrawRect(border, theme::kWindowBorder(), theme::kBorderWidth);
@@ -2462,18 +2824,6 @@ DisplayList UiWindowImpl::OnPaint(uint64_t frameGeneration) {
 
     if (recordDisplayList) {
         renderer_.SetDisplayListRecorder(previousRecorder);
-    }
-
-    /* loading spinner 持续动画：检查是否有 ImageView 处于 loading 状态 */
-    if (root_) {
-        bool anyLoading = false;
-        ForEachWidget(root_.get(), [&](Widget* w) {
-            auto* iv = dynamic_cast<ImageViewWidget*>(w);
-            if (iv && iv->IsLoading()) anyLoading = true;
-        });
-        if (anyLoading) {
-            InvalidateRect(hwnd_, nullptr, FALSE);
-        }
     }
 
     if (startupRevealPending_ && !startupRevealPosted_) {
@@ -2541,9 +2891,25 @@ void UiWindowImpl::NotifyResizeCallback(UINT width, UINT height) {
 void UiWindowImpl::OnDpiChanged(UINT dpi, const RECT* suggested) {
     dpi_ = dpi;
     dpiScale_ = (float)dpi / 96.0f;
+    if (layeredCanvas_) {
+        /* 跨屏换 DPI: 新尺寸按新 DPI 画好再一次 ULW 提交, 不先 SetWindowPos 露旧画面。 */
+        const int wPx = suggested->right - suggested->left;
+        const int hPx = suggested->bottom - suggested->top;
+        BeginCanvasVisualTransaction();
+        visualResizeDirty_ = true;
+        visualPaintDirty_ = true;
+        PrepareDeferredVisualWindowRect(suggested->left, suggested->top,
+                                        (int)(wPx / dpiScale_ + 0.5f), (int)(hPx / dpiScale_ + 0.5f),
+                                        wPx, hPx);
+        EndCanvasVisualTransaction();
+        return;
+    }
     SetWindowPos(hwnd_, nullptr, suggested->left, suggested->top,
                  suggested->right - suggested->left, suggested->bottom - suggested->top,
                  SWP_NOZORDER | SWP_NOACTIVATE);
+    /* 最大化态下改屏幕缩放 (设置里调 125%) 时, 系统给的建议矩形是按比例放大的
+     * 旧矩形, 不是新工作区 → 会比屏幕大。最大化态一律以工作区为准。 */
+    if (maximized_) ClampMaximizedRectToWorkArea();
     RefreshClientSizeCache();
 }
 
@@ -2579,9 +2945,11 @@ static void StampDomMouseState(MouseEvent& e, int button) {
 }
 
 void UiWindowImpl::OnMouseMove(float x, float y) {
+    TraceScope moveScope("core_window", "mouse_move_duration");
     ActiveMeasureContextScope measureScope(measureContext_, renderer_);
     float dx = x / dpiScale_, dy = y / dpiScale_;
     bool repaintNow = false;
+    bool hoverChanged = false;
 
     // If a popup menu is open, clicking in the main window should close it
     // (the popup's WM_ACTIVATE handler closes it when focus shifts)
@@ -2589,6 +2957,7 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
     if (pressedWidget_) {
         MouseEvent e{dx, dy, 0, true};
         StampDomMouseState(e);
+        BeginInputMove();   // 到 RequestInputPaint 之前: 拖放 / 钩子 / 控件里的 Invalidate 只记脏
 
         // Drag & drop state machine (armed in OnMouseDown).
         if (dragSource_) {
@@ -2597,15 +2966,14 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
                 if (mdx * mdx + mdy * mdy >=
                     kDragThresholdDip * kDragThresholdDip) {
                     dragActive_ = true;
-                    SetCapture(hwnd_);
+                    CaptureForPress();
                     dragPayload_ = dragSource_->dragData;
                     // Ghost pill shows what the user grabbed: the source
                     // label's visible (possibly localized) text. The raw
                     // drag-data key is a machine payload — only fall back to
                     // it when the source has no display text.
-                    dragGhostText_.clear();
-                    if (auto* lb = dynamic_cast<LabelWidget*>(dragSource_))
-                        dragGhostText_ = lb->Text();
+                    // build 306: 源是容器 (图标 + 文字的行) 时取其内第一段文字。
+                    dragGhostText_ = DragGhostText(dragSource_);
                     if (dragGhostText_.empty()) dragGhostText_ = dragPayload_;
                     if (dragSource_->onDragStartHook)
                         dragSource_->onDragStartHook(e, dragPayload_);
@@ -2614,7 +2982,7 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
             if (dragActive_) {
                 dragX_ = dx; dragY_ = dy;
                 UpdateDragOverTarget(e);
-                InvalidateNow();  // ghost follows the cursor
+                UpdateDragAutoScroll();
             }
         }
 
@@ -2626,21 +2994,23 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
         // DoDragDrop 内部 SetCapture 夺走 capture → WM_CAPTURECHANGED 同步派发
         // → CancelMouseCapture() 清空 pressedWidget_. 返回后必须重查, 否则
         // 下一行空指针崩溃 (GuoheView 拖出图片到其他窗口即触发).
-        if (!pressedWidget_) { Invalidate(); return; }
-        const bool handled = pressedWidget_->OnMouseMove(e);
-        // Captured drags can produce a continuous stream of WM_MOUSEMOVE. If
-        // we only invalidate, WM_PAINT may not run until the mouse stops, so
-        // the visual state jumps to the final position. Keep this generic for
-        // all pressed widgets that explicitly handle drag moves.
-        if (handled) InvalidateNow();
-        else Invalidate();
+        if (!pressedWidget_) { --inputMoveDepth_; Invalidate(); return; }
+        pressedWidget_->OnMouseMove(e);
+        --inputMoveDepth_;
+        /* 按住拖动 (滑块 / 平移图片 / 拖放幽灵) 每条移动都要求重绘, 但按刷新率合并:
+         * 空闲后第一条立即画, 之后每个周期画一帧最新状态 (以前 1000Hz 鼠标每秒画上千帧)。
+         * 不能退回只 Invalidate: 连续的 WM_MOUSEMOVE 会让 WM_PAINT 一直等到鼠标停下。 */
+        RequestInputPaint();
         return;
     }
+
+    BeginInputMove();   // 到 RequestInputPaint 之前: 期间的 Invalidate 只记脏 (这一段没有提前 return)
 
     if (root_) {
         auto* hit = root_->HitTest(dx, dy);
         if (hoveredWidget_ != hit) {
             repaintNow = true;
+            hoverChanged = true;
             // Hover propagation: every widget in the new hit's ancestor chain
             // is "hovered", every widget in the old chain that's no longer in
             // the new chain leaves hover. Mirrors CSS :hover semantics so a
@@ -2717,10 +3087,16 @@ void UiWindowImpl::OnMouseMove(float x, float y) {
             }
         });
     }
-    if (repaintNow || HasPendingPaint()) InvalidateNow();
-    else Invalidate();
-    UpdateToggleAnimTimer();  // start timer if Slider thumb needs animation
+    /* 全树扫描只在悬停链变化时做 (CSS :hover 过渡等靠它接上心跳)。悬停里会起动画的
+     * 控件 (Slider 圆点、Toggle、图片缩放、加载转圈…) 都自己登记, 同一控件里移动不用扫。 */
+    if (hoverChanged) UpdateToggleAnimTimer();
+    --inputMoveDepth_;
+    (void)repaintNow;   // 不论有无变化都请求一帧 (有的控件改了内部状态却返回 false), 但合并
+    RequestInputPaint();
 
+    /* 模拟移动不登记离开跟踪: 真实光标不在窗口上时系统会立刻发 WM_MOUSELEAVE,
+     * 把刚模拟出来的悬停清掉, 悬停相关的自动化验证就看光标停在哪碰运气。 */
+    if (moveFromSim_) return;
     TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd_, 0};
     TrackMouseEvent(&tme);
 }
@@ -2826,7 +3202,7 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
             if (sv->OnMouseDown(e)) {
                 handledByScrollbar = true;
                 pressedWidget_ = sv;
-                SetCapture(hwnd_);
+                CaptureForPress();
             }
         });
 
@@ -2849,7 +3225,7 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
                 MouseEvent e{dx, dy, 0, true};
                 if (sp->OnMouseDown(e)) {
                     pressedWidget_ = sp;
-                    SetCapture(hwnd_);
+                    CaptureForPress();
                     InvalidateNow();
                     return;
                 }
@@ -2881,7 +3257,7 @@ void UiWindowImpl::OnMouseDown(float x, float y) {
             dynamic_cast<ImageViewWidget*>(hit) ||
             dynamic_cast<ImageViewPlusWidget*>(hit) ||
             dynamic_cast<GhImgViewWidget*>(hit)) {
-            SetCapture(hwnd_);
+            CaptureForPress();
         }
 
         MouseEvent e{dx, dy, 0, true};
@@ -2911,10 +3287,13 @@ void UiWindowImpl::CancelMouseCapture() {
     pressedWidget_ = nullptr;
     w->pressed = false;
     w->RefreshCssState();
-    // 让 widget 复位自身 drag 态 (gh_img_view dragging_ / slider / scrollview 等).
-    // 走到这里的 pressedWidget_ 必是 SetCapture 过的拖拽类 widget, 其 OnMouseUp
-    // 无 onClick 自触发语义, 安全. 坐标无意义 (拖拽类 OnMouseUp 不读坐标).
-    MouseEvent e{0.0f, 0.0f, 0, false};
+    // 让 widget 复位自身 drag 态 (gh_img_view dragging_ / slider / scrollview /
+    // TextArea 拖选等)。build 308 起这里也接"松开丢在窗口外", 来的可能是任何控件
+    // (按钮 / 复选框 / 开关 ...), 它们的 OnMouseUp 按坐标判"松在自己身上"才点击 /
+    // 翻转 —— 所以坐标给一个必落在所有控件之外的值 (原来是 0,0, 左上角恰好有控件
+    // 时会误触发)。
+    constexpr float kOutside = -1.0e9f;
+    MouseEvent e{kOutside, kOutside, 0, false};
     if (w->onMouseUpHook) w->onMouseUpHook(e);
     w->OnMouseUp(e);
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
@@ -2934,9 +3313,18 @@ void UiWindowImpl::OnMouseDoubleClick(float x, float y) {
     if (!hit) return;
     MouseEvent e{dx, dy, 0, true};
     StampDomMouseState(e, 0);
-    // Fire @dblclick hook on the hit widget before bubbling — see
-    // OnMouseMove for the rationale (subclasses don't all forward).
-    if (hit->onMouseDblClickHook) hit->onMouseDblClickHook(e);
+    // Fire @dblclick on the nearest widget (hit or ancestor) that listens —
+    // same rule as @click in OnMouseUp. build 306: 以前只看命中的那个控件,
+    // 行 <div @dblclick> 里双击落在文字 label 上就没反应 (HTML 里 dblclick 冒泡)。
+    // Keep the listener alive through its handler (it may rebuild a v-for).
+    {
+        Widget* target = hit;
+        while (target && !target->onMouseDblClickHook) target = target->Parent();
+        if (target) {
+            WidgetPtr keepAlive = target->shared_from_this();
+            target->onMouseDblClickHook(e);
+        }
+    }
     // Walk up to the first widget that consumes the dblclick, mirroring
     // how onClick bubbles through wrapper layouts.
     for (Widget* w = hit; w; w = w->Parent()) {
@@ -2984,7 +3372,7 @@ void UiWindowImpl::OnMouseUp(float x, float y) {
         const bool wasDrag = dragActive_;
         if (dragActive_) {
             FinishDrag(true, e);
-            ReleaseCapture();  // drag start SetCapture'd for any source type
+            if (GetCapture() == hwnd_) ReleaseCapture();  // 真实拖动起拖时拿了捕获; 模拟拖动没拿
         }
         dragSource_ = nullptr;
 
@@ -3008,7 +3396,7 @@ void UiWindowImpl::OnMouseUp(float x, float y) {
             dynamic_cast<ImageViewPlusWidget*>(w) ||
             dynamic_cast<GhImgViewWidget*>(w) ||
             dynamic_cast<SplitterWidget*>(w)) {
-            ReleaseCapture();
+            if (GetCapture() == hwnd_) ReleaseCapture();   // 模拟按下没拿捕获
             SetCursor(LoadCursor(nullptr, IDC_ARROW));
         }
         // keepAlive falls out of scope here; if the handler removed w from
@@ -3017,6 +3405,32 @@ void UiWindowImpl::OnMouseUp(float x, float y) {
 
     UpdateToggleAnimTimer();
     InvalidateNow();
+}
+
+// Built-in wheel behaviour of the scrolling / zooming widgets. Returns true
+// when the widget consumed the wheel (ends @wheel bubbling).
+static bool BuiltinWheelScroll(Widget* w, const MouseEvent& e) {
+    if (auto* ta = dynamic_cast<TextAreaWidget*>(w)) {
+        return ta->visible && ta->NeedsScrollbar() && ta->OnMouseWheel(e);
+    }
+    if (auto* iv = dynamic_cast<ImageViewWidget*>(w)) {
+        return iv->visible && iv->OnMouseWheel(e);
+    }
+    if (auto* ivp = dynamic_cast<ImageViewPlusWidget*>(w)) {
+        return ivp->visible && ivp->OnMouseWheel(e);
+    }
+    if (auto* gv = dynamic_cast<GhImgViewWidget*>(w)) {
+        return gv->visible && gv->OnMouseWheel(e);
+    }
+    if (auto* ov = dynamic_cast<OcrImgViewWidget*>(w)) {
+        return ov->visible && ov->OnMouseWheel(e);
+    }
+    if (auto* sv = dynamic_cast<ScrollViewWidget*>(w)) {
+        if (!sv->visible || !sv->OnMouseWheel(e)) return false;
+        sv->DoLayout();
+        return true;
+    }
+    return false;
 }
 
 void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
@@ -3043,50 +3457,24 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
             return;
         }
 
-        // HitTest to find deepest widget, then bubble up looking for scroll handler
+        // @wheel — DOM semantics: walk up from the deepest hit widget. The
+        // nearest ancestor with a listener fires (once); a built-in scroller
+        // that actually scrolls ends the walk, so listeners above it stay
+        // quiet. Scrollers that decline (content fits, wheel zoom disabled)
+        // let the event keep bubbling.
         Widget* hit = root_->HitTest(dx, dy);
         bool handled = false;
         bool hookFired = false;
-
-        // Fire @wheel hook on the hit widget (subclass overrides may not
-        // forward to Widget::OnMouseWheel).
-        if (hit && hit->onMouseWheelHook) {
-            hookFired = true;
-            hit->onMouseWheelHook(e);
-        }
-
         for (Widget* w = hit; w && !handled; w = w->Parent()) {
-            if (auto* ta = dynamic_cast<TextAreaWidget*>(w)) {
-                if (ta->visible && ta->NeedsScrollbar()) {
-                    handled = ta->OnMouseWheel(e);
-                }
+            if (!hookFired && w->onMouseWheelHook) {
+                hookFired = true;
+                w->onMouseWheelHook(e);
             }
-            else if (auto* iv = dynamic_cast<ImageViewWidget*>(w)) {
-                if (iv->visible) {
-                    handled = iv->OnMouseWheel(e);
-                }
-            }
-            else if (auto* ivp = dynamic_cast<ImageViewPlusWidget*>(w)) {
-                if (ivp->visible) {
-                    handled = ivp->OnMouseWheel(e);
-                }
-            }
-            else if (auto* gv = dynamic_cast<GhImgViewWidget*>(w)) {
-                if (gv->visible) {
-                    handled = gv->OnMouseWheel(e);
-                }
-            }
-            else if (auto* ov = dynamic_cast<OcrImgViewWidget*>(w)) {
-                if (ov->visible) {
-                    handled = ov->OnMouseWheel(e);
-                }
-            }
-            else if (auto* sv = dynamic_cast<ScrollViewWidget*>(w)) {
-                if (sv->visible) {
-                    handled = sv->OnMouseWheel(e);
-                    if (handled) sv->DoLayout();
-                }
-            }
+            /* build 323: ScrollView 滚动后会重跑子树布局, 必须带测量上下文 ——
+             * 否则 label 退回字符估算宽度、折行高度量不出来按单行算, 折行文字
+             * 和下一行叠在一起 (GuoheView 设置页俄语说明滚动后重叠)。 */
+            ActiveMeasureContextScope measureScope(measureContext_, renderer_);
+            handled = BuiltinWheelScroll(w, e);
         }
         if (handled || hookFired) {
             // Wheel handlers can produce a continuous stream of state changes
@@ -3101,9 +3489,12 @@ void UiWindowImpl::OnMouseWheel(float x, float y, int delta) {
 // ---- Debug simulation (DIP coords → pixel → existing private handlers) ----
 
 void UiWindowImpl::SimMouseMove(float dipX, float dipY) {
+    moveFromSim_ = true;
     OnMouseMove(dipX * dpiScale_, dipY * dpiScale_);
+    moveFromSim_ = false;
 }
 void UiWindowImpl::SimMouseDown(float dipX, float dipY) {
+    pressFromSim_ = true;   // 见 WM_MOUSEMOVE 的"松开丢失"兜底
     OnMouseDown(dipX * dpiScale_, dipY * dpiScale_);
 }
 void UiWindowImpl::SimMouseUp(float dipX, float dipY) {
@@ -3119,6 +3510,9 @@ void UiWindowImpl::SimMouseDoubleClick(float dipX, float dipY) {
     OnMouseMove(px, py);
     OnMouseDown(px, py);
     OnMouseUp(px, py);
+    /* 跟 WM_LBUTTONDBLCLK 分支一样: 先走一遍按下, 再分发双击。以前少了这次按下,
+     * 模拟双击只有一次完整 click, 测"双击切换几次"之类的会假通过。 */
+    OnMouseDown(px, py);
     OnMouseDoubleClick(px, py);
     OnMouseUp(px, py);
 }
@@ -3176,6 +3570,7 @@ void UiWindowImpl::UpdateDragOverTarget(const MouseEvent& e) {
 // `dropped`), dragend on the source, and clears all drag state. Also used by
 // CancelMouseCapture with dropped=false.
 void UiWindowImpl::FinishDrag(bool dropped, const MouseEvent& e) {
+    StopDragAutoScroll();
     Widget* target = dragOverTarget_;
     Widget* source = dragSource_;
     dragOverTarget_ = nullptr;
@@ -3194,6 +3589,53 @@ void UiWindowImpl::FinishDrag(bool dropped, const MouseEvent& e) {
     dragPayload_.clear();
     dragGhostText_.clear();
     InvalidateNow();
+}
+
+// 光标下由内到外找第一个"在这个位置该滚"的 ScrollView (嵌套时内层滚到头
+// 才轮到外层, 同浏览器)。返回步长, 0 = 没有要滚的。
+static float FindDragAutoScroll(Widget* root, float x, float y, ScrollViewWidget** out) {
+    *out = nullptr;
+    if (!root) return 0.0f;
+    for (Widget* w = root->HitTest(x, y); w; w = w->Parent()) {
+        auto* sv = dynamic_cast<ScrollViewWidget*>(w);
+        if (!sv) continue;
+        float step = dragscroll::Step(y, sv->rect.top, sv->rect.bottom,
+                                      sv->ScrollY(), sv->MaxScrollY());
+        if (step != 0.0f) { *out = sv; return step; }
+    }
+    return 0.0f;
+}
+
+void UiWindowImpl::UpdateDragAutoScroll() {
+    ScrollViewWidget* sv = nullptr;
+    if (!dragActive_ || FindDragAutoScroll(root_.get(), dragX_, dragY_, &sv) == 0.0f) {
+        StopDragAutoScroll();
+        return;
+    }
+    if (!dragAutoScrollTimer_ && hwnd_ &&
+        SetTimer(hwnd_, kDragAutoScrollTimerId, dragscroll::kTickMs, nullptr) != 0) {
+        dragAutoScrollTimer_ = true;
+    }
+}
+
+void UiWindowImpl::TickDragAutoScroll() {
+    ScrollViewWidget* sv = nullptr;
+    float step = dragActive_ ? FindDragAutoScroll(root_.get(), dragX_, dragY_, &sv) : 0.0f;
+    if (!sv) { StopDragAutoScroll(); return; }
+    ActiveMeasureContextScope measureScope(measureContext_, renderer_);
+    sv->SetScrollY(sv->ScrollY() + step);
+    /* 内容在光标底下挪了, 落点跟着变: 重走一遍 dragover (同浏览器滚动时
+     * 持续派发 dragover)。 */
+    MouseEvent e{dragX_, dragY_, 0, true};
+    StampDomMouseState(e);
+    UpdateDragOverTarget(e);
+    InvalidateNow();
+}
+
+void UiWindowImpl::StopDragAutoScroll() {
+    if (!dragAutoScrollTimer_) return;
+    if (hwnd_) KillTimer(hwnd_, kDragAutoScrollTimerId);
+    dragAutoScrollTimer_ = false;
 }
 
 void UiWindowImpl::UpdateImeCompositionPos() {
@@ -3402,7 +3844,25 @@ LRESULT UiWindowImpl::OnNcHitTest(int sx, int sy) {
     float w = size.width, h = size.height;
     float border = theme::kResizeBorder;
 
-    if (!maximized_ && resizable_ && w > 0.0f && h > 0.0f) {
+    /* build 321: 缩放边框内缩 — 感应带跨在内容矩形边缘 (外侧最多 border, 内侧
+     * border); 边距里感应带以外的部分 (阴影) 不响应, 也不拖窗。 */
+    if (resizeInset_ > 0.0f && !maximized_ && w > 0.0f && h > 0.0f) {
+        const float ins = resizeInset_;
+        const float out = std::min(ins, border);
+        if (x < ins - out || x >= w - ins + out || y < ins - out || y >= h - ins + out) {
+            return HTNOWHERE;
+        }
+        if (resizable_) {
+            const bool l = x < ins + border, r = x >= w - ins - border;
+            const bool t = y < ins + border, b = y >= h - ins - border;
+            if (t && l) return HTTOPLEFT;    if (t && r) return HTTOPRIGHT;
+            if (b && l) return HTBOTTOMLEFT; if (b && r) return HTBOTTOMRIGHT;
+            if (t) return HTTOP;
+            if (l) return HTLEFT;
+            if (r) return HTRIGHT;
+            if (b) return HTBOTTOM;
+        }
+    } else if (!maximized_ && resizable_ && w > 0.0f && h > 0.0f) {
         bool l = x < border, r = x >= w - border, t = y < border, b = y >= h - border;
 
         // 四角和顶部/左右边缘始终优先 resize
@@ -3460,6 +3920,12 @@ LRESULT UiWindowImpl::OnNcHitTest(int sx, int sy) {
     return HTCLIENT;
 }
 
+void UiWindowImpl::SetLayeredTransparent(bool on) {
+    if (layeredTransparent_ == on) return;
+    layeredTransparent_ = on;
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
 bool UiWindowImpl::IsCanvasDragHit(int sx, int sy) const {
     if (!canvasMode_ || !root_ || !hwnd_) return false;
 
@@ -3496,11 +3962,20 @@ void UiWindowImpl::OnGetMinMaxInfo(MINMAXINFO* mmi) {
     }
     if (minHOverride_ > 0) {
         minH = minHOverride_;
+    } else if (autoHeight_) {
+        /* 高度跟随内容: 主题默认 360 的下限会让 SetWindowPos 缩不下去。 */
+        minH = 1;
     } else {
         minH = (configHeight_ > 0 && configHeight_ < theme::kMinHeight) ? configHeight_ : theme::kMinHeight;
     }
-    mmi->ptMinTrackSize.x = (LONG)(minW * dpiScale_);
-    mmi->ptMinTrackSize.y = (LONG)(minH * dpiScale_);
+    /* DPI 现取, 不用缓存的 dpiScale_ —— dpi_/dpiScale_ 只在建窗和 WM_DPICHANGED
+     * 时更新, 而 WM_GETMINMAXINFO 在跨屏(不同缩放)最大化时可能先于 DPI 更新到达,
+     * 那会儿 dpiScale_ 还是上一块屏的值。GetDpiForWindow 返的是窗口**当前所在屏**
+     * 的 DPI, 时序上始终是新的。 */
+    UINT dpi = hwnd_ ? GetDpiForWindow(hwnd_) : dpi_;
+    if (dpi == 0) dpi = dpi_ ? dpi_ : 96;
+    mmi->ptMinTrackSize.x = (LONG)MulDiv(minW, (int)dpi, 96);
+    mmi->ptMinTrackSize.y = (LONG)MulDiv(minH, (int)dpi, 96);
 
     /* 无边框窗口：限制最大化尺寸到工作区（扣除任务栏）。
      * 这样 WM_NCCALCSIZE 的 orig rect 就已经是工作区大小。 */
@@ -3513,6 +3988,9 @@ void UiWindowImpl::OnGetMinMaxInfo(MINMAXINFO* mmi) {
             mmi->ptMaxSize.x = mi.rcWork.right - mi.rcWork.left;
             mmi->ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top;
             if (canvasMode_) {
+                /* canvas 模式的窗口可以主动放大到超过显示器 (看图器放大到
+                 * 超屏), track size 必须放开, 最大化超屏由 WM_SIZE 里的
+                 * ClampMaximizedRectToWorkArea 兜底。 */
                 LONG virtualW = (LONG)GetSystemMetrics(SM_CXVIRTUALSCREEN);
                 LONG virtualH = (LONG)GetSystemMetrics(SM_CYVIRTUALSCREEN);
                 mmi->ptMaxTrackSize.x = std::max({mmi->ptMaxTrackSize.x,
@@ -3524,8 +4002,66 @@ void UiWindowImpl::OnGetMinMaxInfo(MINMAXINFO* mmi) {
                                                   virtualH,
                                                   kCanvasMaxTrackPx});
             }
+            /* 注意: 不要拿 ptMaxTrackSize 去夹非 canvas 窗口。track size 同时约束
+             * DefWindowProc 对 WM_WINDOWPOSCHANGING 的处理 —— 夹到工作区后, 宿主
+             * 在最大化态下 SetWindowPos 到整块屏 (GuoheView 的全屏就是这么做的)
+             * 会被系统截回工作区, 全屏直接失效。最大化超屏交给 WM_SIZE 里的
+             * ClampMaximizedRectToWorkArea, 它只纠正真正错了的那一次。 */
+            TraceEvent("core_window", "get_min_max_info",
+                       {TraceI64("dpi", (int64_t)dpi),
+                        TraceI64("cached_dpi", (int64_t)dpi_),
+                        TraceI64("work_l", mi.rcWork.left),
+                        TraceI64("work_t", mi.rcWork.top),
+                        TraceI64("work_r", mi.rcWork.right),
+                        TraceI64("work_b", mi.rcWork.bottom),
+                        TraceI64("max_w", mmi->ptMaxSize.x),
+                        TraceI64("max_h", mmi->ptMaxSize.y),
+                        TraceI64("max_track_w", mmi->ptMaxTrackSize.x),
+                        TraceI64("max_track_h", mmi->ptMaxTrackSize.y),
+                        TraceBool("canvas_mode", canvasMode_)});
         }
     }
+}
+
+bool UiWindowImpl::ClampMaximizedRectToWorkArea() {
+    if (!hwnd_ || clampingMaximizedRect_) return false;
+
+    RECT wr{};
+    if (!GetWindowRect(hwnd_, &wr)) return false;
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi))
+        return false;
+
+    const RECT& work = mi.rcWork;
+    /* 只管"超出工作区"这一种错。比工作区小不碰 —— 宿主 SetWindowPos 的过渡态
+     * 和动画中间帧都可能暂时小于工作区, 抢过来会打架。 */
+    if (wr.left >= work.left && wr.top >= work.top &&
+        wr.right <= work.right && wr.bottom <= work.bottom) {
+        return false;
+    }
+    /* 宿主自己做的全屏 (窗口矩形正好 == 整块屏 rcMonitor) 放过 —— 那是有意
+     * 盖住任务栏, 不是最大化算错。GuoheView 的全屏就是不清 WS_MAXIMIZE 直接
+     * SetWindowPos 到 rcMonitor, 此时 WM_SIZE 仍报 SIZE_MAXIMIZED, 不放过会
+     * 被这里拽回工作区 = 全屏失效。 */
+    if (wr.left == mi.rcMonitor.left && wr.top == mi.rcMonitor.top &&
+        wr.right == mi.rcMonitor.right && wr.bottom == mi.rcMonitor.bottom) {
+        return false;
+    }
+
+    TraceEvent("core_window", "clamp_maximized_rect",
+               {TraceI64("win_l", wr.left), TraceI64("win_t", wr.top),
+                TraceI64("win_r", wr.right), TraceI64("win_b", wr.bottom),
+                TraceI64("work_l", work.left), TraceI64("work_t", work.top),
+                TraceI64("work_r", work.right), TraceI64("work_b", work.bottom),
+                TraceI64("dpi", (int64_t)(hwnd_ ? GetDpiForWindow(hwnd_) : dpi_)),
+                TraceI64("cached_dpi", (int64_t)dpi_)});
+
+    clampingMaximizedRect_ = true;
+    SetWindowPos(hwnd_, nullptr, work.left, work.top,
+                 work.right - work.left, work.bottom - work.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+    clampingMaximizedRect_ = false;
+    return true;
 }
 
 bool UiWindowImpl::HasFocusedTextInput() const {

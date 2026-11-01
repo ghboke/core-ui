@@ -217,6 +217,20 @@ static VOID CALLBACK OnPoll(HWND, UINT, UINT_PTR, DWORD) {
     }
     ApplyEventsMenuMaterial();
 
+    // 打开动画开关 / 慢放倍数是进程全局的, 每次轮询直接转发 (都是写个原子量)。
+    if (char* j = ui_page_get_json(g_page, "menuOpenAnim")) {
+        ui_menu_set_open_animation(JsonBool(j, 1));
+        ui_page_free(j);
+    }
+    if (char* j = ui_page_get_json(g_page, "menuSlowmo")) {
+        ui_debug_set_menu_anim_slowmo((float)ClampInt(JsonInt(j, 1), 1, 10));
+        ui_page_free(j);
+    }
+    if (char* j = ui_page_get_json(g_page, "widgetSlowmo")) {
+        ui_debug_set_widget_anim_slowmo((float)ClampInt(JsonInt(j, 1), 1, 10));
+        ui_page_free(j);
+    }
+
     InitOverlayGhImageIfNeeded();
 }
 

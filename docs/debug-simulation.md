@@ -68,6 +68,7 @@
 | Context Menu | `ui_debug_menu_click_index/id` | `menu_click <idx>` / `menu_click_id <id>` | 对当前已打开菜单 |
 | Context Menu | `ui_debug_menu_close` | `menu_close` | |
 | Context Menu | `ui_debug_screenshot_menu` | `screenshot_menu <path>` | 截 popup RT, 验证 icon / submenu 实际渲染 |
+| Toast | `ui_debug_toast_info` / `ui_debug_screenshot_toast` | `toast_info` / `screenshot_toast <path>` | toast 在独立分层窗口上, tree / screenshot 看不到; 先等之前的 toast 请求处理完, 刚弹就查也拿得到（自 build 330） |
 | ImageView | `ui_image_set_zoom/pan/rotation` | `zoom/pan/rotate <id> ...` | |
 | OcrImgView | `ui_debug_drag_to` / `ui_debug_double_click_at` / `ui_debug_key_mod` | `drag_to` / `dbl_click_at` / `key ctrl+c` | 划词=在文本 quad 上拖；**单击是清选区**（PDF 惯例），要选中某块用 `dbl_click_at`，三击选整行=`dbl_click_at` 后紧跟一次 `click_at`。坐标换算用 `ui_ocr_img_view_image_to_screen`。回归见 `test/scripts/ocr_demo_test.ps1`（62 项，五场景 + 四个旋转角），demo 为 `ocr-demo` target。**选择粒度是字**，所以拖动端点要用 `word_edge <i> <0\|1>`（块的左/右缘）而非 `word_center`，后者只落在块中间某个字上 |
 | NavItem | `ui_debug_click` | `click nav_home` | 点击即切换 |
@@ -219,6 +220,8 @@ int  ui_debug_widget_is_visible(UiWidget w);
 | `screenshot <path>` | `screenshot out.png` | 保存 PNG（UTF-8 路径） |
 | `screenshot_widget <id> <path>` | `screenshot_widget nav_home nav.png` | 单 widget 截图，按 widget rect 裁剪 |
 | `screenshot_menu <path>` | `screenshot_menu menu.png` | 截当前打开的 popup 菜单 RT（自 build 27）；用来验证 menu icon / submenu / 颜色实际渲染 |
+| `toast_info` | `toast_info` | 当前 toast：`visible` / `text` / `icon` / `alpha` / `x` `y` `width` `height`（相对客户区, 物理 px, 当前帧）/ `text_clipped`（超宽文字自 build 331 起自动折行，超过 4 行才截断并为 true）（自 build 330） |
+| `screenshot_toast <path>` | `screenshot_toast toast.png` | 当前 toast 位图存 PNG（带透明、满不透明度）；没 toast 报错（自 build 330） |
 | `invalidate` | — | 重绘窗口 |
 | `pump` | — | 处理 PostMessage 队列 |
 | `nav <0-8>` | `nav 3` | 切到某页（0=home, 1=button, 2=check, 3=input, 4=range, 5=status, 6=layout, 7=crop, 8=settings） |
