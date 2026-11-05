@@ -204,9 +204,10 @@ Tags inside `.uix` templates map directly to native widgets:
 
 | Category | Tags |
 |---|---|
-| **Containers** | `div` (Flexbox: `flex-direction` / `flex` / `gap` / `padding`) |
+| **Containers** | `div` (Flexbox: `flex-direction` / `flex` / `gap` / `padding`), `Stack`, `SplitView` |
 | **Text** | `label` (multi-line, auto-wrap) |
 | **Buttons** | `button` |
+| **Navigation** | `NavItem` |
 | **Input** | `input` (type=`text` / `password` / `checkbox` / `radio` / `range` / `number`), `textarea` |
 | **Selection** | `toggle`, `select` |
 | **Status** | `progressbar` |
